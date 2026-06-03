@@ -1,0 +1,209 @@
+version: "2"
+
+# Lint scope covers what a linter can catch: generic Go correctness, security,
+# errors, performance, formatting — plus one architectural invariant (vz isolation)
+# that depguard can enforce mechanically.
+#
+# Prescriptive style rules that need human judgement (declaration order, YAGNI,
+# interface usage, goroutine scoping) live in docs/coding-style.md.
+
+linters:
+  enable:
+    # Correctness
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - bodyclose
+    - nilerr
+    - nilnil
+    - forcetypeassert
+    - contextcheck
+    - containedctx
+    - unparam
+    - wastedassign
+    - exhaustive
+
+    # Errors
+    - errorlint
+    - wrapcheck
+
+    # Architecture
+    - depguard
+
+    # Style
+    - misspell
+    - whitespace
+    - nolintlint
+    - revive
+    - unconvert
+    - predeclared
+    - usestdlibvars
+    - dupword
+    - goconst
+    - tagliatelle      # snake_case for JSON tags (config.json, runner socket protocol)
+
+    # Quality
+    - gocritic
+
+    # Security
+    - gosec
+
+    # Performance
+    - prealloc
+    - perfsprint
+    - intrange
+
+  settings:
+    errcheck:
+      # check-blank stays false: `_ = x.Close()` is the project idiom for
+      # best-effort cleanup. Every error is either handled or EXPLICITLY
+      # discarded with `_ =` — bare unchecked calls are flagged.
+      check-blank: false
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment  # too noisy, marginal benefit
+    depguard:
+      rules:
+        # Backend-neutral public API: Code-Hex/vz may only be imported by
+        # internal/backend/vz. See ARCHITECTURE.md §6 and docs/adr/0002.
+        vz-isolation:
+          list-mode: lax
+          files:
+            - "!**/internal/backend/vz/**"
+            - "!**/spike/**"
+          deny:
+            - pkg: github.com/Code-Hex/vz
+              desc: vz is only allowed in internal/backend/vz (backend-neutral API invariant)
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: if-return
+        - name: increment-decrement
+        - name: var-declaration
+        - name: range
+        - name: time-naming
+        - name: indent-error-flow
+        - name: empty-block
+        - name: superfluous-else
+        - name: unreachable-code
+        - name: redefines-builtin-id
+    gosec:
+      excludes:
+        - G104  # unhandled errors — errcheck handles this
+        - G304  # file path from variable — VM/image paths come from our own store
+        - G204  # subprocess with variable — CLI execs ssh/scp by design
+        - G702  # command injection taint — same as G204, ssh/scp args are the CLI's job
+        - G106  # InsecureIgnoreHostKey — ephemeral test VMs, host keys are meaningless
+        - G107  # HTTP request with variable URL — image download from user-supplied URL by design
+        - G404  # weak random — crypto/rand overkill for retry jitter
+        - G115  # integer overflow — safe in size/count conversions here
+        - G301  # directory permissions — 0755 for dirs is fine
+        - G302  # file permissions — 0644 for regular files is fine
+        - G306  # file permissions — preserve original permissions
+    staticcheck:
+      checks:
+        - all
+        - -ST1000  # package comments — required only on the public packages, not internal
+    # exhaustive: default-signifies-exhaustive intentionally not set: switches must
+    # list every enum case or carry a //nolint:exhaustive with a one-line reason.
+    errorlint:
+      errorf: true
+      errorf-multi: true
+      asserts: true
+      comparison: true
+    nilnil:
+      checked-types:
+        - ptr
+        - func
+        - iface
+        - map
+        - chan
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - hugeParam     # noisy for structs with many fields
+        - rangeValCopy  # often false positives with small structs
+        - ifElseChain   # switch preference is stylistic
+    wrapcheck:
+      ignore-sigs:
+        - .Errorf(
+        - errors.New(
+        - errors.Join(
+      # Every error crossing a function boundary is wrapped with call-site
+      # context — including calls into our own internal packages.
+    tagliatelle:
+      case:
+        rules:
+          json: snake
+    perfsprint:
+      int-conversion: true
+      err-error: true
+      errorf: true
+      sprintf1: true
+
+  exclusions:
+    paths:
+      - spike  # throwaway prototype, own go.mod
+      - bin
+    generated: lax
+    rules:
+      # Tests: relax conventions that don't apply to test scaffolding.
+      - linters: [gosec]
+        path: _test\.go
+      - linters: [dupword]
+        path: _test\.go
+      - linters: [errcheck]
+        path: _test\.go
+        source: "Close\\(\\)"
+      - linters: [bodyclose]
+        path: _test\.go
+      - linters: [wrapcheck]
+        path: _test\.go
+      - linters: [containedctx]
+        path: _test\.go
+      - linters: [goconst]
+        path: _test\.go
+
+      # Idiomatic Go patterns
+      - linters: [errcheck]
+        source: "defer .+\\.Close\\("
+      - linters: [govet]
+        text: 'shadow: declaration of "err" shadows'
+
+      # Unused params in interface implementations
+      - linters: [unparam]
+        source: "^func \\(.+\\) .+\\(.*\\) .+ \\{$"
+
+      # ctx.Err() returns a canonical sentinel; wrapping obscures errors.Is checks.
+      - linters: [wrapcheck]
+        source: "ctx\\.Err\\(\\)"
+
+formatters:
+  enable:
+    - gofumpt
+    - gci
+    - golines
+  settings:
+    gofumpt:
+      module-path: github.com/pilat/fleetbox
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/pilat/fleetbox)
+    golines:
+      max-len: 120
+  exclusions:
+    paths:
+      - spike
+      - bin
