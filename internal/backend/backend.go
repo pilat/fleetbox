@@ -18,6 +18,20 @@ type Config struct {
 	SerialOut   io.Writer
 }
 
+// Network is an opaque handle to a backend network that VMs attach to.
+// VMs sharing one Network can reach each other; pass the same Network to
+// several Create calls to build an interconnected cluster. The concrete type
+// lives in the backend implementation — no hypervisor types appear here
+// (ADR-0002). See ADR-0008 for the vmnet SharedMode network behind it.
+type Network interface {
+	// Close releases the network. It is reserved for explicit whole-cluster
+	// teardown: a Network shared by several running VMs must not be closed
+	// while any of them is still alive. Backends may release the network via
+	// GC once every VM referencing it is unreferenced, in which case Close is
+	// a no-op.
+	Close() error
+}
+
 // VM represents a running virtual machine.
 type VM interface {
 	// Start boots the VM.
@@ -75,8 +89,13 @@ func (s State) String() string {
 
 // Backend creates VMs for a specific platform.
 type Backend interface {
-	// Create creates a new VM with the given configuration.
-	Create(cfg Config) (VM, error)
+	// CreateNetwork creates a network for VMs to attach to. VMs created on the
+	// same Network can reach one another; reuse one Network across Create calls
+	// to build a cluster.
+	CreateNetwork() (Network, error)
+
+	// Create creates a new VM with the given configuration, attached to net.
+	Create(cfg Config, net Network) (VM, error)
 
 	// NestedVirtSupported returns true if nested virtualization is available.
 	NestedVirtSupported() bool

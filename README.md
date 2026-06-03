@@ -57,7 +57,7 @@ and sane defaults.
 
 ## Requirements
 
-- **macOS 15** (Sequoia) or newer
+- **macOS 26** (Tahoe) or newer — networking uses vmnet SharedMode, which is macOS 26+
 - **Apple Silicon**, M3 or newer — nested virtualization (`/dev/kvm` in the guest) needs it
 - **Go 1.24+**
 
@@ -158,15 +158,19 @@ The CLI wraps the same library for manual work:
 make build                                   # compiles + signs ./bin/fleetbox
 
 ./bin/fleetbox up web                        # create & boot a VM
-./bin/fleetbox up node -n 3                  # node-1, node-2, node-3
-./bin/fleetbox ssh web                       # interactive shell
+./bin/fleetbox up node -n 3                  # interconnected cluster: node-1, node-2, node-3
+./bin/fleetbox ssh node-2                     # address a cluster member by name
+./bin/fleetbox ssh node-1 -- ping -c1 node-2 # nodes reach each other by IP
 ./bin/fleetbox ssh web -- systemctl status   # …or run a command
 ./bin/fleetbox cp ./mybinary web:/usr/local/bin/
 ./bin/fleetbox ls                            # NAME  IP  STATE  CPUS  MEM  DISK  AGE
 ./bin/fleetbox ssh-config >> ~/.ssh/config   # then plain `ssh web` works
-./bin/fleetbox down web                      # stop, keep the disk
-./bin/fleetbox rm web                        # destroy
+./bin/fleetbox down node-1                    # stop one member; the rest keep running
+./bin/fleetbox rm node                        # destroy the whole cluster (prefix match)
 ```
+
+A cluster runs in one holder process sharing one vmnet network, so its VMs reach each
+other by IP; `down`/`ssh`/`rm` still address each member by name.
 
 ## Images
 
@@ -189,27 +193,29 @@ paths.
 ## How it works
 
 `Start` runs a short, boring pipeline: ensure the SSH key → download and cache the image →
-generate a cloud-init seed ISO → boot via EFI with a NAT NIC → find the VM's IP in
-`/var/db/dhcpd_leases` by hostname → wait for SSH. No daemon: in library mode the test
-process owns its VMs; the CLI re-execs a tiny holder process per VM so they outlive the
-command.
+generate a cloud-init seed ISO → boot via EFI on a vmnet SharedMode NIC → find the VM's IP
+in `/var/db/dhcpd_leases` by hostname → wait for SSH. No daemon: in library mode the test
+process owns its VMs; the CLI re-execs a tiny holder process per `up` group (a single VM,
+or a whole cluster sharing one network) so they outlive the command.
 
 For the full picture, read [ARCHITECTURE.md](ARCHITECTURE.md); for *why* it's built this
 way, the decision log lives in [docs/adr/](docs/adr/).
 
 ## Limitations
 
-v0 boots and SSHes into single VMs. Mind the sharp edges:
+Both the library (`StartN`) and the CLI (`up -n N`) boot interconnected clusters whose
+VMs reach each other by IP. Mind the sharp edges:
 
 - **No mounts, and library file transfer is SSH-only.** From a test you run commands with
   `vm.SSH`; there's no copy or mount in the library yet (the CLI has `cp` over scp). Getting
   a large build artifact into a VM from Go isn't ergonomic today — mounts are the planned
   fix.
-- **VM-to-VM networking doesn't work.** Virtualization.framework's NAT isolates guests from
-  one another — they reach the host and the internet, but not their neighbours. So v0 is for
-  single-VM testing, not clusters.
-- **Apple Silicon M3+ only.** Nested virtualization requires it; older chips and Intel Macs
-  are out of scope.
+- **A CLI cluster shares one holder process.** All members of a cluster live in one process
+  to share one vmnet network, so a holder crash takes the whole cluster down (a single VM is
+  unaffected). Members started by separate `up` commands have separate networks and can't be
+  merged into one cluster afterwards — bring a cluster up together.
+- **macOS 26+ and Apple Silicon M3+ only.** Networking needs macOS 26 (vmnet SharedMode);
+  nested virtualization needs M3+. Older macOS, older chips, and Intel Macs are out of scope.
 - **v0 API.** Expect breaking changes until it stabilizes.
 
 CI note: GitHub-hosted macOS runners can't nest virtualization, so VM-boot tests run
@@ -221,11 +227,11 @@ Roughly in priority order:
 
 - **Mounts (virtiofs).** Share a host directory straight into the guest — the intended way
   to hand a VM your build output or fixtures, no copying around.
-- **Real cluster testing.** The whole point of fixing VM-to-VM networking: boot N VMs that
-  genuinely talk to each other and test an actual cluster — kubeadm, etcd, a Raft group — on
-  real nodes over a real network, not mocks or a single-host simulation. VZ NAT isolates
-  guests today; the fix is bridged or vmnet-socket networking.
 - **Programmatic file copy** for the cases a mount doesn't fit.
+
+Done recently: VM-to-VM networking over a real network (vmnet SharedMode), and CLI
+clustering (`fleetbox up node -n 3`) — boot an actual cluster (kubeadm, etcd, a Raft group)
+on real interconnected nodes, not mocks or a single-host simulation.
 
 ## License
 

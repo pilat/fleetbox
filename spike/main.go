@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Code-Hex/vz/v3"
+	"github.com/Code-Hex/vz/v3/vmnet"
 	cloudiso "github.com/pilat/cloudiso"
 	"golang.org/x/crypto/ssh"
 )
@@ -90,15 +92,30 @@ func run() error {
 	}
 	fmt.Printf("[OK] Image ready: %s\n", imagePath)
 
-	// Create VMs
+	// Create a shared vmnet network (macOS 26+, SharedMode = host + VM<->VM + internet, no root).
+	netCfg, err := vmnet.NewNetworkConfiguration(vmnet.SharedMode)
+	if err != nil {
+		return fmt.Errorf("create vmnet config: %w", err)
+	}
+	if err := netCfg.SetIPv4Subnet(netip.MustParsePrefix("192.168.77.0/24")); err != nil {
+		return fmt.Errorf("set vmnet subnet: %w", err)
+	}
+	network, err := vmnet.NewNetwork(netCfg)
+	if err != nil {
+		return fmt.Errorf("create vmnet network: %w", err)
+	}
+	if sn, err := network.IPv4Subnet(); err == nil {
+		fmt.Printf("[OK] vmnet SharedMode network ready (subnet %s)\n", sn)
+	}
+
+	// Create VMs on the shared network
 	var vms []*vmInstance
 	for i := 1; i <= *count; i++ {
 		vmName := *name
 		if *count > 1 {
 			vmName = fmt.Sprintf("%s-%d", *name, i)
 		}
-
-		vm, err := createVM(vmName, vmsPath, imagePath, sshKeyPath, pubKey, *cpus, uint64(*memGB)*1024*1024*1024, uint64(*diskGB)*1024*1024*1024)
+		vm, err := createVM(vmName, vmsPath, imagePath, sshKeyPath, pubKey, *cpus, uint64(*memGB)*1024*1024*1024, uint64(*diskGB)*1024*1024*1024, network)
 		if err != nil {
 			return fmt.Errorf("create VM %s: %w", vmName, err)
 		}
@@ -114,7 +131,7 @@ func run() error {
 		fmt.Printf("[OK] VM booted: %s\n", vm.name)
 	}
 
-	// Wait for IP addresses
+	// Discover IPs via dhcpd_leases by hostname (vmnet SharedMode uses bootpd on the bridge, like NAT).
 	fmt.Println("\nWaiting for VMs to get IP addresses...")
 	for _, vm := range vms {
 		ip, err := waitForIP(vm.mac, vm.name, 120*time.Second)
@@ -151,21 +168,21 @@ func run() error {
 		fmt.Printf("[OK] Nested virt works on %s: %s", vm.name, out)
 	}
 
-	// Test VM-to-VM connectivity if multiple VMs
+	// Test VM-to-VM connectivity over the shared vmnet network.
 	if len(vms) > 1 {
-		fmt.Println("\nTesting VM-to-VM connectivity...")
-		fmt.Println("[KNOWN LIMITATION] VZ NAT does not support VM-to-VM connectivity.")
-		fmt.Println("    VMs can reach the host and internet, but not each other.")
-		fmt.Println("    For VM-to-VM, need bridged networking (requires com.apple.vm.networking entitlement)")
-		fmt.Println("    or FileHandleNetworkDeviceAttachment with socket_vmnet.")
-		fmt.Println("[SKIP] VM-to-VM test skipped - requires networking architecture decision")
+		fmt.Println("\n=== Testing VM-to-VM connectivity (vmnet SharedMode) ===")
+		src, dst := vms[0], vms[1]
+		out, err := runSSHCommand(src.ip, privKey, fmt.Sprintf("ping -c 3 -W 2 %s", dst.ip))
+		fmt.Printf("--- %s: ping %s ---\n%s\n", src.name, dst.ip, out)
+		if err != nil {
+			return fmt.Errorf("VM-to-VM ping FAILED (%s -> %s): %w", src.name, dst.ip, err)
+		}
+		fmt.Printf("[OK] VM-to-VM works: %s reached %s over vmnet (no root, no com.apple.vm.networking)\n", src.name, dst.ip)
 	}
 
 	fmt.Println("\n=== ALL CHECKS PASSED ===")
-	fmt.Println("\nVMs are still running. Press Ctrl+C to stop them.")
-
-	// Keep running until interrupted
-	select {}
+	fmt.Println("Spike done — tearing down VMs and exiting.")
+	return nil
 }
 
 type vmInstance struct {
@@ -197,7 +214,7 @@ func (v *vmInstance) boot() error {
 	return fmt.Errorf("timeout waiting for vm to start")
 }
 
-func createVM(name, vmsPath, imagePath, sshKeyPath, pubKey string, cpus int, memBytes, diskBytes uint64) (*vmInstance, error) {
+func createVM(name, vmsPath, imagePath, sshKeyPath, pubKey string, cpus int, memBytes, diskBytes uint64, network *vmnet.Network) (*vmInstance, error) {
 	vmDir := filepath.Join(vmsPath, name)
 	if err := os.MkdirAll(vmDir, 0755); err != nil {
 		return nil, fmt.Errorf("create vm dir: %w", err)
@@ -317,13 +334,13 @@ func createVM(name, vmsPath, imagePath, sshKeyPath, pubKey string, cpus int, mem
 
 	vmConfig.SetStorageDevicesVirtualMachineConfiguration([]vz.StorageDeviceConfiguration{diskConfig, seedConfig})
 
-	// Network
-	natAttachment, err := vz.NewNATNetworkDeviceAttachment()
+	// Network: vmnet SharedMode attachment on the shared logical network.
+	vmnetAttachment, err := vz.NewVmnetNetworkDeviceAttachment(network)
 	if err != nil {
 		serialLog.Close()
-		return nil, fmt.Errorf("create nat attachment: %w", err)
+		return nil, fmt.Errorf("create vmnet attachment: %w", err)
 	}
-	netConfig, err := vz.NewVirtioNetworkDeviceConfiguration(natAttachment)
+	netConfig, err := vz.NewVirtioNetworkDeviceConfiguration(vmnetAttachment)
 	if err != nil {
 		serialLog.Close()
 		return nil, fmt.Errorf("create net config: %w", err)

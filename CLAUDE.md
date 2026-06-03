@@ -80,16 +80,29 @@ at the caller. Every exported symbol gets a doc comment — this is a library.
 
 ## Known deviations from spec
 
-- **VM-to-VM connectivity does NOT work with VZNATNetworkDeviceAttachment.** The spec
-  claimed "VM→VM" works, but VZ NAT isolates VMs from each other. VMs can reach the
-  host and internet, but not other VMs on the same NAT. Options for v1:
-  - Bridged networking (requires `com.apple.vm.networking` entitlement = Developer ID)
-  - FileHandleNetworkDeviceAttachment with socket_vmnet
-  For v0, single-VM testing is the target; multi-node cluster testing is deferred.
+- **VM↔VM connectivity works via vmnet SharedMode (macOS 26+), not VZ NAT.** VZ NAT
+  (`VZNATNetworkDeviceAttachment`) isolated VMs from each other, so the spec's "VM→VM"
+  claim was initially false. As of macOS 26, fleetbox uses
+  `VZVmnetNetworkDeviceAttachment` (vmnet SharedMode) instead: VMs on a shared network
+  reach the host, the internet, **and each other**, on one NIC, with no root and no
+  `com.apple.vm.networking` entitlement. `StartN` boots interconnected clusters. This
+  raised the platform floor to macOS 26 and removed the NAT path entirely. See
+  `docs/adr/0008` (and `0004`, which it partially supersedes). Both `StartN` and the CLI
+  (`fleetbox up <prefix> -n N`) boot interconnected clusters.
+
+- **CLI clusters run in one holder process (not one runner per VM).** ADR-0006's
+  "one runner per VM" became "one holder per `up` group": a CLI cluster's VMs share one
+  in-process `vmnet.Network` (the same object the library `StartN` uses), so the XPC /
+  `CopySerialization` cross-process path ADR-0008 sketched for "Phase 2" was not needed.
+  The holder serves a per-member socket+pidfile, so `ls`/`ssh`/`down`/`rm` address each
+  member by name; `up`-ing a stopped member re-joins the live cluster via an `addmember`
+  socket command. Tradeoff: a holder crash takes the whole cluster down. See
+  `docs/adr/0009`.
 
 - **IP discovery uses hostname, not MAC.** VZ uses DUID-based identifiers in
   dhcpd_leases (hw_address=ff,...) instead of traditional MAC format. cloud-init sets
-  the hostname via DHCP, so we look up by hostname instead.
+  the hostname via DHCP, so we look up by hostname instead. Retained unchanged under
+  vmnet SharedMode — it rides the same bootpd/bridge machinery as NAT did (ADR-0007).
 
 ## Related projects (same author, reuse experience)
 

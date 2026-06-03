@@ -66,8 +66,11 @@ linters:
         - fieldalignment  # too noisy, marginal benefit
     depguard:
       rules:
-        # Backend-neutral public API: Code-Hex/vz may only be imported by
-        # internal/backend/vz. See ARCHITECTURE.md §6 and docs/adr/0002.
+        # Backend-neutral public API: Code-Hex/vz and its subpackages (.../vmnet,
+        # .../xpc) may only be imported by internal/backend/vz. The file exemption
+        # below lets that one package import the whole vz module family — including
+        # the vmnet SharedMode networking glue — while the deny prefix keeps every
+        # other package out. See ARCHITECTURE.md §6 and docs/adr/0002, docs/adr/0008.
         vz-isolation:
           list-mode: lax
           files:
@@ -75,7 +78,7 @@ linters:
             - "!**/spike/**"
           deny:
             - pkg: github.com/Code-Hex/vz
-              desc: vz is only allowed in internal/backend/vz (backend-neutral API invariant)
+              desc: vz (incl. vmnet/xpc) is only allowed in internal/backend/vz (backend-neutral API invariant)
     revive:
       rules:
         - name: blank-imports
@@ -154,6 +157,7 @@ linters:
   exclusions:
     paths:
       - spike  # throwaway prototype, own go.mod
+      - third_party  # vendored Code-Hex/vz PR #205, own go.mod (docs/adr/0008)
       - bin
     generated: lax
     rules:
@@ -206,4 +210,5 @@ formatters:
   exclusions:
     paths:
       - spike
+      - third_party
       - bin

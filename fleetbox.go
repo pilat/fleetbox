@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/pilat/fleetbox/internal/backend"
@@ -53,8 +55,34 @@ type VM struct {
 	store     *store.Store
 	sshMgr    *sshkey.Manager
 	backend   backend.VM
+	network   backend.Network
 	config    *store.VM
 	serialLog *os.File
+}
+
+// startDeps holds the once-per-call handles shared by every VM in a Start or
+// StartN. They are resolved a single time (resolveStartDeps) and reused for
+// each VM, so a StartN cluster does not redo store/key/image setup per node.
+type startDeps struct {
+	options   *Options
+	store     *store.Store
+	sshMgr    *sshkey.Manager
+	pubKey    string
+	imagePath string
+	backend   backend.Backend
+}
+
+// Cluster is a set of VMs sharing one vmnet SharedMode network, so every member
+// reaches the others by IP (ADR-0008). The shared network is an in-process
+// object tied to the Cluster's lifetime — it is never persisted, so a Cluster is
+// a runtime handle, not on-disk state. Members can be added after creation,
+// which is what lets a CLI holder process grow a live cluster without recreating
+// its network.
+type Cluster struct {
+	mu      sync.Mutex
+	deps    *startDeps
+	network backend.Network
+	vms     []*VM
 }
 
 // Options configures VM creation.
@@ -91,6 +119,27 @@ func WithDiskGB(n int) Option {
 // Start creates and boots a new VM with the given name.
 // If the VM already exists, it boots the existing VM.
 func Start(ctx context.Context, name string, opts ...Option) (*VM, error) {
+	deps, err := resolveStartDeps(opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	// One vmnet SharedMode network for this VM. A single Start yields a
+	// one-member network; the macOS-26 requirement surfaces here, propagated
+	// from the backend (ADR-0008).
+	nw, err := deps.backend.CreateNetwork()
+	if err != nil {
+		return nil, fmt.Errorf("create network: %w", err)
+	}
+
+	return startOnNetwork(ctx, name, nw, deps)
+}
+
+// resolveStartDeps performs the once-per-call setup shared by every VM in a
+// Start or StartN: it applies options over defaults, opens the store, ensures
+// the per-installation SSH key, ensures the image is cached, and constructs the
+// backend. It does not touch any individual VM.
+func resolveStartDeps(opts ...Option) (*startDeps, error) {
 	options := &Options{
 		Image:  defaultImage,
 		CPUs:   defaultCPUs,
@@ -101,32 +150,49 @@ func Start(ctx context.Context, name string, opts ...Option) (*VM, error) {
 		opt(options)
 	}
 
-	// Initialize store
 	st, err := store.New()
 	if err != nil {
 		return nil, fmt.Errorf("init store: %w", err)
 	}
 
-	// Ensure SSH key
 	sshMgr := sshkey.NewManager(st.SSHKeyPath())
 	pubKey, err := sshMgr.EnsureKey()
 	if err != nil {
 		return nil, fmt.Errorf("ensure ssh key: %w", err)
 	}
 
-	// Ensure image
 	imagePath, err := image.Ensure(st.ImagesDir(), options.Image)
 	if err != nil {
 		return nil, fmt.Errorf("ensure image: %w", err)
 	}
 
+	return &startDeps{
+		options:   options,
+		store:     st,
+		sshMgr:    sshMgr,
+		pubKey:    pubKey,
+		imagePath: imagePath,
+		backend:   newBackend(),
+	}, nil
+}
+
+// startOnNetwork performs the per-VM work — store config load/create, disk copy,
+// seed ISO, backend create+boot, IP and SSH readiness — attaching the VM to the
+// already-created network nw. Shared setup is done once by resolveStartDeps and
+// passed in via deps. The returned VM retains nw so the network is not released
+// by GC while the VM lives (ADR-0008, R3).
+func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *startDeps) (*VM, error) {
+	st := deps.store
+	options := deps.options
+
 	var vmConfig *store.VM
 	if st.Exists(name) {
 		// Load existing VM config
-		vmConfig, err = st.Load(name)
+		loaded, err := st.Load(name)
 		if err != nil {
 			return nil, fmt.Errorf("load vm config: %w", err)
 		}
+		vmConfig = loaded
 	} else {
 		// Create new VM
 		vmConfig = &store.VM{
@@ -145,7 +211,7 @@ func Start(ctx context.Context, name string, opts ...Option) (*VM, error) {
 		// Copy disk image
 		diskPath := st.DiskPath(name)
 		diskSize := int64(options.DiskGB) * 1024 * 1024 * 1024
-		if err := image.CopyDisk(imagePath, diskPath, diskSize); err != nil {
+		if err := image.CopyDisk(deps.imagePath, diskPath, diskSize); err != nil {
 			return nil, fmt.Errorf("copy disk: %w", err)
 		}
 
@@ -154,7 +220,7 @@ func Start(ctx context.Context, name string, opts ...Option) (*VM, error) {
 		seedCfg := seed.Config{
 			Hostname: name,
 			User:     defaultUser,
-			SSHKey:   pubKey,
+			SSHKey:   deps.pubKey,
 		}
 		if err := seed.Create(seedPath, seedCfg); err != nil {
 			return nil, fmt.Errorf("create seed: %w", err)
@@ -167,8 +233,7 @@ func Start(ctx context.Context, name string, opts ...Option) (*VM, error) {
 		return nil, fmt.Errorf("open serial log: %w", err)
 	}
 
-	// Create backend VM
-	vzBackend := newBackend()
+	// Create backend VM on the shared network
 	backendCfg := backend.Config{
 		Name:        name,
 		DiskPath:    st.DiskPath(name),
@@ -179,21 +244,24 @@ func Start(ctx context.Context, name string, opts ...Option) (*VM, error) {
 		MemoryBytes: uint64(vmConfig.MemoryMB) * 1024 * 1024,
 		SerialOut:   serialLog,
 	}
-	backendVM, err := vzBackend.Create(backendCfg)
+	backendVM, err := deps.backend.Create(backendCfg, nw)
 	if err != nil {
+		_ = serialLog.Close()
 		return nil, fmt.Errorf("create backend vm: %w", err)
 	}
 
 	// Boot the VM
 	if err := backendVM.Start(ctx); err != nil {
+		_ = serialLog.Close()
 		return nil, fmt.Errorf("start vm: %w", err)
 	}
 
 	vm := &VM{
 		name:      name,
 		store:     st,
-		sshMgr:    sshMgr,
+		sshMgr:    deps.sshMgr,
 		backend:   backendVM,
+		network:   nw,
 		config:    vmConfig,
 		serialLog: serialLog,
 	}
@@ -202,6 +270,7 @@ func Start(ctx context.Context, name string, opts ...Option) (*VM, error) {
 	ip, err := vm.waitForIP(ctx, 2*time.Minute)
 	if err != nil {
 		_ = backendVM.Stop(ctx)
+		_ = serialLog.Close()
 		return nil, fmt.Errorf("wait for ip: %w", err)
 	}
 	vm.ip = ip
@@ -209,6 +278,7 @@ func Start(ctx context.Context, name string, opts ...Option) (*VM, error) {
 	// Wait for SSH
 	if err := vm.waitForSSH(ctx, 2*time.Minute); err != nil {
 		_ = backendVM.Stop(ctx)
+		_ = serialLog.Close()
 		return nil, fmt.Errorf("wait for ssh: %w", err)
 	}
 
@@ -318,21 +388,82 @@ func (v *VM) waitForSSH(ctx context.Context, timeout time.Duration) error {
 }
 
 // StartN creates and boots N VMs with the given prefix (prefix-1, prefix-2, ...).
+// All N VMs share ONE vmnet SharedMode network, so they reach each other by IP —
+// the cluster is interconnected (ADR-0008). It is a thin wrapper over
+// StartCluster with generated names.
 func StartN(ctx context.Context, prefix string, n int, opts ...Option) ([]*VM, error) {
-	vms := make([]*VM, 0, n)
+	names := make([]string, n)
 	for i := 1; i <= n; i++ {
-		name := fmt.Sprintf("%s-%d", prefix, i)
-		vm, err := Start(ctx, name, opts...)
-		if err != nil {
-			// Clean up already started VMs
-			for _, started := range vms {
-				_ = started.Destroy(ctx)
+		names[i-1] = fmt.Sprintf("%s-%d", prefix, i)
+	}
+	c, err := StartCluster(ctx, names, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return c.VMs(), nil
+}
+
+// NewCluster creates a cluster's shared vmnet network but boots no VMs. Use Add
+// to bring members up on it. Shared setup (store, SSH key, image, backend) runs
+// once here and is reused for every Add. The macOS-26 requirement surfaces here,
+// propagated from the backend (ADR-0008).
+func NewCluster(opts ...Option) (*Cluster, error) {
+	deps, err := resolveStartDeps(opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	nw, err := deps.backend.CreateNetwork()
+	if err != nil {
+		return nil, fmt.Errorf("create network: %w", err)
+	}
+
+	return &Cluster{deps: deps, network: nw}, nil
+}
+
+// StartCluster boots the named VMs on one shared network and returns the
+// Cluster. On any member's failure it destroys the members already started and
+// returns the error (all-or-nothing, like StartN). The network is not released
+// explicitly — GC reaps it once every referencing VM is unreferenced (R3).
+func StartCluster(ctx context.Context, names []string, opts ...Option) (*Cluster, error) {
+	c, err := NewCluster(opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, name := range names {
+		if _, err := c.Add(ctx, name); err != nil {
+			for _, vm := range c.VMs() {
+				_ = vm.Destroy(ctx)
 			}
 			return nil, fmt.Errorf("start %s: %w", name, err)
 		}
-		vms = append(vms, vm)
 	}
-	return vms, nil
+	return c, nil
+}
+
+// Add boots an additional VM on the cluster's shared network and registers it as
+// a member. The new VM reaches every existing member by IP. Adding to a live
+// cluster is what lets a CLI holder re-join a previously stopped node without
+// recreating the network.
+func (c *Cluster) Add(ctx context.Context, name string) (*VM, error) {
+	vm, err := startOnNetwork(ctx, name, c.network, c.deps)
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	c.vms = append(c.vms, vm)
+	c.mu.Unlock()
+	return vm, nil
+}
+
+// VMs returns a snapshot of the cluster's current members in the order they were
+// added.
+func (c *Cluster) VMs() []*VM {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.vms)
 }
 
 // NestedVirtSupported returns true if nested virtualization is available.

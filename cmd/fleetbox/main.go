@@ -86,21 +86,32 @@ Commands:
   ssh-config Print SSH config for all VMs
   rm         Destroy VM(s) completely
 
+Clusters (interconnected, VMs reach each other by IP):
+  fleetbox up web -n 3      boots web-1, web-2, web-3 on one shared network
+  fleetbox up db cache      boots db and cache on one shared network
+  down/ssh/rm address each member by name (e.g. fleetbox ssh web-2)
+
 Defaults: image=debian-12, cpus=2, mem=4, disk=20`)
 }
 
 func cmdUp(args []string) error {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
-	count := fs.Int("n", 1, "number of VMs to create")
+	count := fs.Int("n", 1, "cluster size (boots <name>-1 .. <name>-N, interconnected)")
 	cpus := fs.Int("cpus", 2, "number of CPUs")
 	mem := fs.Int("mem", 4, "memory in GB")
 	disk := fs.Int("disk", 20, "disk size in GB")
 	image := fs.String("image", "debian-12", "image alias or URL")
-	_ = fs.Parse(args)
 
-	names := fs.Args()
-	if len(names) == 0 {
-		names = []string{"default"}
+	// Go's flag package stops at the first positional arg, so `up test1 -n 2`
+	// would treat `-n 2` as names. Parse flags and positionals interspersed.
+	names, err := parseInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
+
+	members, err := clusterMembers(names, *count)
+	if err != nil {
+		return err
 	}
 
 	st, err := store.New()
@@ -115,41 +126,138 @@ func cmdUp(args []string) error {
 		fleetbox.WithDiskGB(*disk),
 	}
 
-	for _, name := range names {
-		if *count > 1 {
-			for i := 1; i <= *count; i++ {
-				vmName := fmt.Sprintf("%s-%d", name, i)
-				if err := startVM(st, vmName, opts); err != nil {
-					return err
-				}
-			}
+	return upMembers(st, members, opts)
+}
+
+// parseInterspersed parses fs allowing flags and positional args in any order
+// (the stdlib flag package otherwise stops at the first positional). It returns
+// the collected positional args.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positional []string
+	rest := args
+	for len(rest) > 0 {
+		if err := fs.Parse(rest); err != nil {
+			return nil, fmt.Errorf("parse flags: %w", err)
+		}
+		rest = fs.Args()
+		if len(rest) == 0 {
+			break
+		}
+		positional = append(positional, rest[0])
+		rest = rest[1:]
+	}
+	return positional, nil
+}
+
+// clusterMembers resolves CLI args into the concrete member names to bring up:
+//
+//	up <name>          -> [name]                  (single VM)
+//	up <prefix> -n N   -> [prefix-1 .. prefix-N]  (interconnected cluster)
+//	up a b c           -> [a, b, c]               (interconnected cluster)
+func clusterMembers(names []string, count int) ([]string, error) {
+	switch {
+	case count < 1:
+		return nil, errors.New("-n must be at least 1")
+	case count > 1:
+		if len(names) != 1 {
+			return nil, errors.New("with -n, give exactly one name to use as the cluster prefix")
+		}
+		members := make([]string, count)
+		for i := 1; i <= count; i++ {
+			members[i-1] = fmt.Sprintf("%s-%d", names[0], i)
+		}
+		return members, nil
+	case len(names) == 0:
+		return []string{"default"}, nil
+	default:
+		return names, nil
+	}
+}
+
+// upMembers brings the requested members up as one interconnected cluster: a
+// fresh holder process when none is running, or — when some members already run
+// in one holder — adding the missing members to that live network so a re-upped
+// node re-joins the cluster instead of getting an isolated network of its own.
+func upMembers(st *store.Store, members []string, opts []fleetbox.Option) error {
+	var running, missing []string
+	for _, m := range members {
+		if runner.IsRunning(st, m) {
+			running = append(running, m)
 		} else {
-			if err := startVM(st, name, opts); err != nil {
-				return err
-			}
+			missing = append(missing, m)
 		}
 	}
 
+	if len(missing) == 0 {
+		printMembers(st, members)
+		return nil
+	}
+
+	if len(running) == 0 {
+		fmt.Printf("Starting %s...\n", strings.Join(missing, ", "))
+		if _, err := runner.Spawn(st, missing, opts); err != nil {
+			return fmt.Errorf("start cluster: %w", err)
+		}
+		printMembers(st, members)
+		return nil
+	}
+
+	// Some members already run. They must share one holder for the added
+	// members to land on the same network.
+	sibling, err := soleHolder(st, running)
+	if err != nil {
+		return err
+	}
+	for _, m := range missing {
+		fmt.Printf("Adding %s to the cluster...\n", m)
+		if err := runner.AddMember(st, sibling, m); err != nil {
+			return fmt.Errorf("add %s: %w", m, err)
+		}
+	}
+	printMembers(st, members)
 	return nil
 }
 
-func startVM(st *store.Store, name string, opts []fleetbox.Option) error {
-	fmt.Printf("Starting %s...\n", name)
-
-	status, err := runner.Spawn(st, name, opts)
-	if err != nil {
-		return fmt.Errorf("start %s: %w", name, err)
+// soleHolder returns a running member whose holder owns all the others, or an
+// error if the running members are split across processes (their separate
+// networks cannot be merged).
+func soleHolder(st *store.Store, running []string) (string, error) {
+	pid := -1
+	for _, m := range running {
+		status, err := runner.GetStatus(st, m)
+		if err != nil {
+			return "", fmt.Errorf("status %s: %w", m, err)
+		}
+		if pid == -1 {
+			pid = status.PID
+		} else if status.PID != pid {
+			return "", errors.New(
+				"requested members are running in separate processes and can't be " +
+					"joined into one network; rm them and bring the cluster up together",
+			)
+		}
 	}
+	return running[0], nil
+}
 
-	fmt.Printf("  IP: %s\n", status.IP)
-	fmt.Printf("  SSH: ssh fleetbox@%s\n", status.IP)
-	return nil
+func printMembers(st *store.Store, members []string) {
+	for _, m := range members {
+		status, err := runner.GetStatus(st, m)
+		if err != nil || status.IP == "" {
+			fmt.Printf("  %s: (no IP)\n", m)
+			continue
+		}
+		fmt.Printf("  %s  IP: %s  SSH: ssh fleetbox@%s\n", m, status.IP, status.IP)
+	}
 }
 
 func cmdDown(args []string) error {
 	fs := flag.NewFlagSet("down", flag.ExitOnError)
 	all := fs.Bool("all", false, "stop all VMs")
-	_ = fs.Parse(args)
+	positional, err := parseInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
 
 	st, err := store.New()
 	if err != nil {
@@ -163,7 +271,7 @@ func cmdDown(args []string) error {
 			return fmt.Errorf("list vms: %w", err)
 		}
 	} else {
-		names = fs.Args()
+		names = positional
 	}
 
 	if len(names) == 0 {
@@ -379,7 +487,10 @@ func cmdRemove(args []string) error {
 	fs := flag.NewFlagSet("rm", flag.ExitOnError)
 	all := fs.Bool("all", false, "remove all VMs")
 	force := fs.Bool("f", false, "force removal without confirmation")
-	_ = fs.Parse(args)
+	positional, err := parseInterspersed(fs, args)
+	if err != nil {
+		return err
+	}
 
 	st, err := store.New()
 	if err != nil {
@@ -393,7 +504,7 @@ func cmdRemove(args []string) error {
 			return fmt.Errorf("list vms: %w", err)
 		}
 	} else {
-		names = fs.Args()
+		names = positional
 	}
 
 	if len(names) == 0 {

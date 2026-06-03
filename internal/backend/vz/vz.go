@@ -9,17 +9,33 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Code-Hex/vz/v3"
+	"github.com/Code-Hex/vz/v3/vmnet"
 
 	"github.com/pilat/fleetbox/internal/backend"
 )
 
-var _ backend.Backend = (*Backend)(nil)
+// reservedSubnets records every /24 handed out by detectFreeIPv4Subnet in this
+// process. The host bridge interface for a vmnet network does not appear until
+// a VM boots on it, so two networks created back-to-back cannot be told apart
+// by scanning net.Interfaces() alone — the reservation set closes that race.
+var (
+	reservedSubnetsMu sync.Mutex
+	reservedSubnets   = map[netip.Prefix]struct{}{}
+)
+
+var (
+	_ backend.Backend = (*Backend)(nil)
+	_ backend.Network = (*vzNetwork)(nil)
+)
 
 // Backend implements the VZ backend.
 type Backend struct{}
@@ -34,8 +50,111 @@ func (b *Backend) NestedVirtSupported() bool {
 	return vz.IsNestedVirtualizationSupported()
 }
 
-// Create creates a new VM with the given configuration.
-func (b *Backend) Create(cfg backend.Config) (backend.VM, error) {
+// CreateNetwork creates a vmnet SharedMode logical network. Every VM attached
+// to it reaches the host, the internet (via NAT44), and the other VMs on the
+// same network — VM↔VM connectivity that VZ NAT did not provide (ADR-0008).
+// It requires macOS 26 or newer; on older releases the underlying vmnet API
+// returns an error, wrapped here as the single canonical message.
+func (b *Backend) CreateNetwork() (backend.Network, error) {
+	cfg, err := vmnet.NewNetworkConfiguration(vmnet.SharedMode)
+	if err != nil {
+		return nil, fmt.Errorf("create vmnet configuration (fleetbox networking requires macOS 26+): %w", err)
+	}
+
+	subnet, err := detectFreeIPv4Subnet()
+	if err != nil {
+		return nil, fmt.Errorf("detect free subnet: %w", err)
+	}
+	if err := cfg.SetIPv4Subnet(subnet); err != nil {
+		return nil, fmt.Errorf("set vmnet subnet %s: %w", subnet, err)
+	}
+
+	network, err := vmnet.NewNetwork(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create vmnet network: %w", err)
+	}
+
+	return &vzNetwork{network: network}, nil
+}
+
+// vzNetwork wraps a vmnet logical network as an opaque backend.Network.
+type vzNetwork struct {
+	network *vmnet.Network
+}
+
+// Close is a no-op. The vmnet network is released by the Go runtime
+// (runtime.AddCleanup inside the vmnet package) once every VM holding a
+// reference to it is unreferenced. Phase 1 never calls Close — releasing a
+// network that a cluster's other VMs still share would break them (ADR-0008,
+// R3). It exists for explicit whole-cluster teardown / Phase 2.
+func (n *vzNetwork) Close() error {
+	return nil
+}
+
+// detectFreeIPv4Subnet returns a /24 inside 192.168.0.0/16 that overlaps no
+// host interface and has not already been handed out in this process. The
+// chosen subnet is reserved (see reservedSubnets) so a later call picks a
+// different one even before this network's host bridge interface appears.
+func detectFreeIPv4Subnet() (netip.Prefix, error) {
+	occupied, err := occupiedPrivatePrefixes()
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+
+	reservedSubnetsMu.Lock()
+	defer reservedSubnetsMu.Unlock()
+
+	for octet := range 256 {
+		candidate := netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 168, byte(octet), 0}), 24)
+		if _, taken := reservedSubnets[candidate]; taken {
+			continue
+		}
+		if slices.ContainsFunc(occupied, candidate.Overlaps) {
+			continue
+		}
+		reservedSubnets[candidate] = struct{}{}
+		return candidate, nil
+	}
+
+	return netip.Prefix{}, errors.New("no free /24 subnet available in 192.168.0.0/16")
+}
+
+// occupiedPrivatePrefixes returns the host interface prefixes that fall within
+// 192.168.0.0/16.
+func occupiedPrivatePrefixes() ([]netip.Prefix, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("list interfaces: %w", err)
+	}
+
+	target := netip.MustParsePrefix("192.168.0.0/16")
+	var occupied []netip.Prefix
+	for i := range ifaces {
+		addrs, err := ifaces[i].Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			prefix, err := netip.ParsePrefix(ipNet.String())
+			if err != nil {
+				continue
+			}
+			if target.Overlaps(prefix) {
+				occupied = append(occupied, prefix)
+			}
+		}
+	}
+
+	return occupied, nil
+}
+
+// Create creates a new VM with the given configuration, attached to nw.
+// nw must be a Network returned by this backend's CreateNetwork.
+func (b *Backend) Create(cfg backend.Config, nw backend.Network) (backend.VM, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -128,12 +247,17 @@ func (b *Backend) Create(cfg backend.Config) (backend.VM, error) {
 
 	vmConfig.SetStorageDevicesVirtualMachineConfiguration([]vz.StorageDeviceConfiguration{diskConfig, seedConfig})
 
-	// Network
-	natAttachment, err := vz.NewNATNetworkDeviceAttachment()
-	if err != nil {
-		return nil, fmt.Errorf("create nat attachment: %w", err)
+	// Network: attach to the shared vmnet SharedMode logical network (ADR-0008).
+	vzNet, ok := nw.(*vzNetwork)
+	if !ok {
+		return nil, fmt.Errorf("network is not a vz network: %T", nw)
 	}
-	netConfig, err := vz.NewVirtioNetworkDeviceConfiguration(natAttachment)
+	vm.network = vzNet // retain for the VM's lifetime so GC keeps the network (R3)
+	vmnetAttachment, err := vz.NewVmnetNetworkDeviceAttachment(vzNet.network)
+	if err != nil {
+		return nil, fmt.Errorf("create vmnet attachment: %w", err)
+	}
+	netConfig, err := vz.NewVirtioNetworkDeviceConfiguration(vmnetAttachment)
 	if err != nil {
 		return nil, fmt.Errorf("create net config: %w", err)
 	}
@@ -200,8 +324,12 @@ func validateConfig(cfg backend.Config) error {
 
 // VM represents a VZ virtual machine.
 type VM struct {
-	name        string
-	vm          *vz.VirtualMachine
+	name string
+	vm   *vz.VirtualMachine
+	// network is retained for the VM's whole lifetime so the shared vmnet
+	// network is not released by GC while the VM (or a cluster sibling) runs
+	// (ADR-0008, R3).
+	network     *vzNetwork
 	serialRead  *os.File
 	serialWrite *os.File
 }

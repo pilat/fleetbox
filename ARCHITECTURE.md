@@ -37,9 +37,9 @@ CLI is a wrapper (see ADR-0001).
 | **Backend** | The hypervisor abstraction (`internal/backend.Backend`). Exactly one implementation per platform, selected at compile time. v0: VZ on darwin/arm64. |
 | **Image** | A stock cloud distro image (raw or qcow2), downloaded once and cached in `~/.fleetbox/images/`. Never modified. |
 | **Seed ISO** | A cloud-init NoCloud ISO generated per VM. The only thing fleetbox ever "puts inside" a guest, and it is read by the guest's own cloud-init. |
-| **Runner** | A re-exec'd `fleetbox` process that holds one VM alive in CLI mode, exposing status/stop over a unix socket. Does not exist in library mode. |
+| **Runner / Holder** | A re-exec'd `fleetbox` process that holds an `up` group (one VM or a whole cluster) alive in CLI mode, exposing status/stop/addmember over per-member unix sockets. Does not exist in library mode. |
 | **Store** | The `~/.fleetbox/` directory layout and its `config.json` files. The only persistent state fleetbox has. |
-| **Cluster** | A naming convention (`prefix-1`, `prefix-2`, ...), not an entity. No cluster state exists anywhere (see §4.2). |
+| **Cluster** | VMs sharing one vmnet network, named by convention (`prefix-1`, `prefix-2`, ...). The `fleetbox.Cluster` type is an in-process runtime handle; no cluster state is *persisted* anywhere (see §4.2). |
 
 ## §3. Source-of-Truth Map
 
@@ -81,9 +81,12 @@ creating/booting a VM. Both the CLI runner and fleetboxtest go through it. The s
    MAC derived from name via `backend.GenerateMAC`), copy the cached image to
    `disk.raw` (sparse, truncated to requested size), and generate `seed.iso` via
    `seed.Create`.
-6. **Boot** — `newBackend().Create(backend.Config{...})` builds the platform VM
-   (EFI bootloader, NAT NIC, virtio disk + seed ISO, serial console → `serial.log`),
-   then `Start(ctx)` boots it and polls until the backend reports running.
+6. **Network & boot** — `newBackend().CreateNetwork()` makes a vmnet SharedMode
+   logical network (a single `Start` gets a one-member network; a `StartN` cluster
+   shares one network across all nodes — §4.3). `Create(backend.Config{...}, net)`
+   builds the platform VM (EFI bootloader, vmnet SharedMode NIC, virtio disk + seed
+   ISO, serial console → `serial.log`) on that network, then `Start(ctx)` boots it
+   and polls until the backend reports running.
 7. **IP discovery** — poll `dhcp.LookupByHostname(name)` (parses
    `/var/db/dhcpd_leases`) until the VM's hostname appears and TCP :22 is reachable
    (timeout 2 min). See ADR-0007 for why hostname, not MAC.
@@ -109,9 +112,9 @@ All persistent state lives under `~/.fleetbox/` and is owned by `internal/store`
 │   └── .lock              # flock target for TryLock
 ├── images/                # downloaded + converted raw cloud images (cache)
 ├── id_ed25519, id_ed25519.pub   # per-installation SSH keypair
-├── pid-<name>             # runner pidfile (CLI mode only)
-├── sock-<name>            # runner unix socket (CLI mode only)
-└── runner-<name>.log      # runner process output (CLI mode only)
+├── pid-<name>             # holder pidfile, one per member (CLI mode only)
+├── sock-<name>            # holder unix socket, one per member (CLI mode only)
+└── runner-<name>.log      # holder process output, named after the first member (CLI mode only)
 ```
 
 The VM model is **cattle with persistence**, a deliberate midpoint between two
@@ -129,21 +132,33 @@ return it), `down` exists for graceful shutdown that preserves the disk, and the
 survives host reboots and runner death. `rm`/`Destroy` is the only thing that deletes
 data — there is no GC, no TTL; explicit destruction is a feature, not an omission.
 
-There is no database, no global state file, and **no cluster entity** — clusters are a
-naming convention (`prefix-N`). Cluster features (membership, add/remove node) would
-duplicate what the software under test already does; the harness's job is N named VMs,
-nothing more. `ls ~/.fleetbox/vms/` is the entire "database."
+There is no database, no global state file, and **no persisted cluster entity** —
+clusters are a naming convention (`prefix-N`). The in-process `fleetbox.Cluster` (and
+the CLI holder that shares one network across a cluster's VMs) is a runtime handle only:
+it lives in memory, dies with the process, and writes nothing about "the cluster" to
+disk (ADR-0009). The harness's job is N named VMs sharing a network, nothing more —
+membership beyond that is what the software under test does. `ls ~/.fleetbox/vms/` is
+the entire "database."
 
 ### §4.3 Networking model
 
-- Every VM gets a **directly routable IP** from macOS's VZ NAT (`bridge100`, DHCP from
-  bootpd). There is no port forwarding of any kind, by design (ADR-0004).
-- Host→VM and VM→internet work. **VM→VM does not work** — VZ NAT isolates VMs from each
-  other. This is a known limitation discovered after the spec was written; multi-node
-  testing is deferred to v1 (bridged networking or socket_vmnet are the candidate
-  fixes). See ADR-0004 consequences.
+- VMs attach to a **vmnet SharedMode logical network**
+  (`VZVmnetNetworkDeviceAttachment`, macOS 26+). Each VM gets a **directly routable
+  IP** from bootpd on the network's bridge. There is no port forwarding of any kind,
+  by design (ADR-0004).
+- Host→VM, VM→internet (NAT44), **and VM↔VM** all work on a single NIC, with no root
+  and no `com.apple.vm.networking` entitlement. VM↔VM is the capability VZ NAT lacked
+  (NAT's bridge members carried a `PRIVATE` flag; SharedMode's do not). See ADR-0008.
+- **One network per `up`/Start group.** A single `Start` creates a one-member network;
+  a `StartN`/`StartCluster` cluster — and, in CLI mode, a holder process (§4.4) —
+  shares one network across all members, so the cluster is interconnected. The network
+  is an in-process object tied to VM lifetime — never persisted, so clusters remain a
+  naming convention with no state (§4.2). Concurrent networks get distinct `/24`s in
+  `192.168.0.0/16` from a host-aware subnet detector, and separate networks are
+  isolated from each other.
 - IP discovery: VMs are found by **hostname** in `/var/db/dhcpd_leases` (cloud-init
-  sets the hostname; VZ writes DUID-based identifiers instead of plain MACs). See
+  sets the hostname; VZ writes DUID-based identifiers instead of plain MACs). Unchanged
+  by the move to SharedMode — it rides the same bootpd/bridge machinery as NAT. See
   ADR-0007.
 - SSH: library mode uses `golang.org/x/crypto/ssh` programmatically; CLI `ssh`/`cp`
   exec the system `ssh`/`scp` binaries for a proper interactive terminal.
@@ -155,31 +170,50 @@ backend VM object. VMs die when the process exits. `fleetboxtest` registers
 `t.Cleanup(Destroy)` so test VMs never outlive their test.
 
 **CLI mode** — `fleetbox up` calls `runner.Spawn()`, which re-execs the `fleetbox`
-binary with a hidden `--fleetbox-runner <name>` flag. The runner process:
+binary with a hidden `--fleetbox-runner <name,name,...>` flag. The re-exec'd process is
+the *holder*. One holder owns a whole `up` group — a single VM or an interconnected
+cluster — via one `fleetbox.Cluster` (one shared vmnet network, ADR-0008, ADR-0009). It:
 
-1. writes `pid-<name>`, listens on `sock-<name>`;
-2. boots the VM via the same public `fleetbox.Start()`;
-3. answers `status` / `stop` commands on the socket (JSON-encoded `runner.Status`);
-4. on stop/SIGTERM: graceful `VM.Stop()` with a 30s budget, then exits.
+1. for each member, writes `pid-<name>` and listens on `sock-<name>`;
+2. creates the cluster's shared network once, then boots each member onto it
+   (`Cluster.Add`);
+3. answers `status` / `stop` / `addmember <name>` per member socket (JSON-encoded
+   `runner.Status`);
+4. on `stop`: graceful `VM.Stop()` of that one member, retiring its socket+pidfile; the
+   holder exits when its last member is gone, or on SIGTERM (stops all, 30s budget).
 
-The runner's *entire* job is holding the VM and answering the socket. No forwarding, no
-guest protocol, no tunnels (ADR-0006). CLI options are serialized to the runner via the
+The holder's *entire* job is holding VMs and answering the socket. No forwarding, no
+guest protocol, no tunnels (ADR-0006). CLI options are serialized to the holder via the
 `FLEETBOX_OPTS` env var (Option funcs → `Options` values → JSON).
+
+Because per-name sockets and pidfiles are unchanged, every per-name command
+(`ls`/`ssh`/`down`/`rm`) addresses a member without knowing whether it shares a process
+with siblings. `up` of a member whose siblings already run sends `addmember` to a live
+sibling so the node re-joins the existing network instead of getting an isolated one
+(ADR-0009). A holder crash takes its whole cluster down — the accepted cost of
+in-process network sharing.
 
 ### §4.5 Platform & build constraints
 
 - The whole module is build-tagged `darwin && arm64` (every non-test `.go` file in the
   root, cmd, fleetboxtest, and backend/vz packages). It does not compile elsewhere.
+- **macOS 26.0 is the floor.** Networking uses vmnet SharedMode
+  (`VZVmnetNetworkDeviceAttachment`), which exists only on macOS 26+; the requirement
+  surfaces as an error from the first network creation, wrapped once in the vz backend
+  (ADR-0008). Earlier releases (13–15) are no longer supported.
 - Any binary that creates VZ VMs (the CLI, VM test binaries) must carry the
-  `com.apple.security.virtualization` entitlement — ad-hoc codesign is enough for dev.
+  `com.apple.security.virtualization` entitlement — ad-hoc codesign is enough for dev,
+  and it is sufficient for vmnet SharedMode too (no `com.apple.vm.networking`).
   `make build` compiles and signs the CLI; `make test-vm` compiles, signs, and runs the
   `fleetboxtest` binary. There is no generic sign target — signing a VM test binary for
   any other package is a manual `go test -c` + `codesign --entitlements entitlements.plist`.
-- Nested virtualization (required by consumers that run KVM inside guests)
-  needs M3+ and macOS 15+. `fleetbox.NestedVirtSupported()` reports availability;
-  `fleetboxtest` skips tests when unsupported.
-- CI (GitHub-hosted macOS runners) cannot boot VZ VMs. CI = lint + build + unit tests
-  only. VM tests run locally via `make test-vm`.
+- Nested virtualization (required by consumers that run KVM inside guests) needs M3+.
+  `fleetbox.NestedVirtSupported()` reports availability; `fleetboxtest` skips tests when
+  unsupported.
+- CI runs on a `macos-26` GitHub-hosted runner and cannot boot VZ VMs. CI = lint +
+  build + unit tests only; VM-boot tests are skipped there (no nested virtualization).
+  `make test` passes `-short` so it stays VM-free even on capable hardware; VM tests run
+  locally via `make test-vm`.
 
 ## §5. Modules
 
@@ -200,12 +234,17 @@ When a PR changes any of these fields for a package, update its section.
 ### §5.1 `fleetbox` (root package)
 
 - Purpose: the public library API — everything a consumer can do with a VM.
-- Owns: the VM lifecycle orchestration (§4.1); per-VM serial log file handle.
+- Owns: the VM lifecycle orchestration (§4.1); per-VM serial log file handle; the
+  reference to the shared `backend.Network` held on each `VM` so the network is not
+  GC'd while the VM (or a cluster sibling) lives (§4.3, ADR-0008).
 - Depends on: `internal/backend` (+ compile-time `internal/backend/vz` via
   `backend_darwin_arm64.go`), `internal/dhcp`, `internal/image`, `internal/seed`,
   `internal/sshkey`, `internal/store`.
 - Public API:
   - `Start(ctx, name, opts...) (*VM, error)`, `StartN(ctx, prefix, n, opts...) ([]*VM, error)`
+  - `StartCluster(ctx, names, opts...) (*Cluster, error)`, `NewCluster(opts...) (*Cluster, error)`
+  - `type Cluster`: `Add(ctx, name) (*VM, error)`, `VMs() []*VM` — a set of VMs sharing
+    one in-process vmnet network; members can be added at runtime (ADR-0009)
   - `NestedVirtSupported() bool`
   - `type VM`: `Name()`, `IP() net.IP`, `SSH(ctx, cmd) (string, error)`, `Stop(ctx)`,
     `Destroy(ctx)`, `State() string`
@@ -215,6 +254,12 @@ When a PR changes any of these fields for a package, update its section.
 - Invariants:
   - No backend (vz) types in any exported signature — the API is backend-neutral
     (ADR-0002, enforced by depguard).
+  - `StartN`/`StartCluster` boot an **interconnected cluster**: all members share one
+    vmnet network and reach each other by IP (ADR-0008). Shared per-call setup (store,
+    SSH key, image, backend) runs once via `resolveStartDeps`; `startOnNetwork` does the
+    per-VM work; `StartN` is a thin wrapper over `StartCluster`. `Cluster` is an
+    in-process runtime handle — the shared network is never persisted, so "clusters are
+    a naming convention, no state" still holds (ADR-0009).
   - `Start` on an existing (stopped) VM boots it from its stored config; options are
     ignored for existing VMs. Note: `Start` does **not** detect an already-running VM
     — that guard currently lives in the CLI runner (`runner.Spawn` checks
@@ -245,8 +290,14 @@ When a PR changes any of these fields for a package, update its section.
 - Invariants:
   - The CLI adds no capability of its own — every VM operation goes through
     `fleetbox` / `runner` (ADR-0001).
-  - VM lifecycle in CLI mode is always delegated to the runner; the CLI process itself
+  - VM lifecycle in CLI mode is always delegated to the holder; the CLI process itself
     never holds a VM.
+  - `up` boots a single VM (`up name`) or an interconnected cluster (`up prefix -n N`,
+    or `up a b c`) — the whole group runs in one holder sharing one network (ADR-0009).
+    `up` partitions members into running/missing: none running → fresh holder; some
+    running in one holder → `addmember` the rest so a re-upped node re-joins the live
+    network; running members split across processes → rejected (their networks can't
+    merge). Flags and positional names may be interspersed (`up test1 -n 2` works).
   - No yaml, no config files — flags and defaults only.
 
 ### §5.4 `internal/backend`
@@ -254,26 +305,37 @@ When a PR changes any of these fields for a package, update its section.
 - Purpose: the hypervisor-neutral contract every backend implements.
 - Owns: stateless (interface + enum + MAC derivation).
 - Depends on: stdlib only.
-- Public API (internal): `Backend{Create, NestedVirtSupported}`,
+- Public API (internal): `Backend{CreateNetwork, Create, NestedVirtSupported}`,
+  `Network{Close}` (opaque network handle — no hypervisor types on it),
   `VM{Start, Stop, State, Wait}`, `Config{Name, DiskPath, SeedPath, EFIPath, MAC, CPUs,
-  MemoryBytes, SerialOut}`, `State` enum + `String()`, `GenerateMAC(name)`.
+  MemoryBytes, SerialOut}`, `State` enum + `String()`, `GenerateMAC(name)`. `Create`
+  takes the `Network` to attach the VM to.
 - Invariants:
-  - Imports no hypervisor SDK — pure contract.
+  - Imports no hypervisor SDK — pure contract. `Network` is opaque: no `vmnet`/`vz`
+    types appear on it (ADR-0002, ADR-0008).
   - `GenerateMAC` is deterministic: same name → same MAC (locally-administered,
     unicast).
 
 ### §5.5 `internal/backend/vz`
 
 - Purpose: the VZ (Apple Virtualization.framework) implementation of `backend.Backend`.
-- Owns: the `vz.VirtualMachine` object and the serial-console copy goroutine.
-- Depends on: `internal/backend`, `github.com/Code-Hex/vz/v3`.
-- Public API (internal): `New() *Backend`; `Backend` and `VM` satisfy the backend
-  interfaces (`var _` checks present).
+- Owns: the `vz.VirtualMachine` object and the serial-console copy goroutine; the
+  `vzNetwork` wrapper around a vmnet logical network; the process-wide reserved-subnet
+  set used by the subnet detector.
+- Depends on: `internal/backend`, `github.com/Code-Hex/vz/v3` and its
+  `.../vz/v3/vmnet` subpackage (both vendored under `third_party/vz`, ADR-0008).
+- Public API (internal): `New() *Backend`; `Backend` (`CreateNetwork`, `Create`,
+  `NestedVirtSupported`) and `VM`/`vzNetwork` satisfy the backend interfaces (`var _`
+  checks present).
 - Invariants:
-  - **The only package in the module that imports `Code-Hex/vz`** (ADR-0002; enforced
-    by the depguard rule in `.golangci.yml`).
-  - All vz types/states are translated to `backend` types at this boundary; nothing vz
-    leaks upward.
+  - **The only package in the module that imports `Code-Hex/vz`** and its `vmnet`
+    subpackage (ADR-0002; enforced by the depguard rule in `.golangci.yml`).
+  - All vz/vmnet types/states are translated to `backend` types at this boundary;
+    nothing vz leaks upward. The `vmnet.Network` lives behind the opaque
+    `backend.Network`.
+  - `CreateNetwork` makes a vmnet SharedMode network on a free `/24`; the macOS-26
+    requirement is the single canonical error here (ADR-0008). `vzNetwork.Close` is a
+    no-op — the network is released by GC once unreferenced (R3).
   - EFI boot of stock images only — no kernel/initrd extraction (ADR-0003).
 
 ### §5.6 `internal/image`
@@ -339,18 +401,23 @@ When a PR changes any of these fields for a package, update its section.
 
 ### §5.11 `internal/runner`
 
-- Purpose: the CLI-mode VM holder process — re-exec, pidfile, unix-socket control.
-- Owns: runner process lifecycle, `pid-<name>` / `sock-<name>` / `runner-<name>.log`
-  files, the socket-listener goroutine and per-connection handler goroutines,
-  mutex-protected `runnerState`.
+- Purpose: the CLI-mode holder process — one process owns an `up` group (single VM or
+  cluster) via one `fleetbox.Cluster`; re-exec, per-member pidfile, per-member
+  unix-socket control (ADR-0006, ADR-0009).
+- Owns: holder process lifecycle, per-member `pid-<name>` / `sock-<name>` files and the
+  shared `runner-<first>.log`, the per-member listener + handler goroutines, the
+  mutex-protected member registry (`holder`/`member`).
 - Depends on: `fleetbox` (public API), `internal/store`.
-- Public API (internal): `IsRunner`, `GetRunnerVMName`, `Spawn`, `Run`, `IsRunning`,
-  `GetStatus`, `Stop`, `WritePidfile`, `RemovePidfile`, `Status` struct.
+- Public API (internal): `IsRunner`, `GetRunnerVMNames`, `Spawn` (takes a name list),
+  `AddMember`, `Run`, `IsRunning`, `GetStatus`, `Stop`, `WritePidfile`,
+  `RemovePidfile`, `Status` struct.
 - Invariants:
-  - The runner boots VMs through the public `fleetbox.Start()` — it has no backdoor
-    into internals (ADR-0006).
-  - Socket protocol is two plain commands (`status`, `stop`) answering JSON; nothing
-    else will be added to it (no forwarding, no guest protocol).
+  - The holder boots VMs through the public `fleetbox` API (`NewCluster`/`Cluster.Add`)
+    — no backdoor into internals (ADR-0006).
+  - Socket protocol is three plain commands (`status`, `stop`, `addmember <name>`)
+    answering JSON/`ok`; it stays host-only — no forwarding, no guest protocol.
+  - `stop` shuts down one member; the holder process survives until its last member is
+    gone (or SIGTERM stops all). An initial multi-member boot is all-or-nothing.
   - CLI options survive the re-exec: `Spawn` serializes applied `Options` values into
     `FLEETBOX_OPTS`; `Run` deserializes them.
 
@@ -383,7 +450,10 @@ Edges that exist (verified by `go list -f '{{.Imports}}'`):
 - `fleetbox` (root) → all internal packages except `runner`; the
   `internal/backend/vz` import lives only in the build-tagged
   `backend_darwin_arm64.go`
-- `internal/backend/vz` → `internal/backend` + `Code-Hex/vz` (the only SDK import)
+- `internal/backend/vz` → `internal/backend` + `Code-Hex/vz` and its `vmnet`
+  subpackage (the only SDK imports; the vz module is vendored under `third_party/vz`
+  and wired via a relative `replace` in `go.mod`, ADR-0008 — a temporary bridge until
+  PR #205 releases upstream)
 - All other internal packages import stdlib / their one external dep only
 
 `internal/runner` is architecturally a *consumer* of the public API (like the CLI it
@@ -410,8 +480,11 @@ CLAUDE.md as checkable rules):
 5. **No yaml, no templates, no per-distro code paths.** Check: no yaml parser in
    go.mod; `internal/image.Catalog` is a dumb map; `internal/seed` has a single code
    path.
-6. **Clusters are a naming convention.** Check: no cluster type, no cluster state file
-   anywhere; `StartN`/`up -n` just loop over `prefix-i` names.
+6. **Clusters are a naming convention.** Check: no cluster *state file* anywhere. The
+   `fleetbox.Cluster` type is an in-process runtime handle only — `StartN`/`StartCluster`
+   produce `prefix-i`/named members sharing one in-process network, and the CLI holder
+   keeps that network in memory (ADR-0009); nothing about a cluster is persisted to
+   `~/.fleetbox/` (§5.1, §5.11).
 7. **Cattle with persistence.** `Start`/`up` boot existing VMs instead of failing;
    `Destroy`/`rm` is the only destructive operation. Check: nothing else calls
    `store.Delete`.
@@ -420,12 +493,21 @@ CLAUDE.md as checkable rules):
 
 ## §7. Known limitations (accepted for v0)
 
-- **VM→VM networking does not work** over VZ NAT (VMs are isolated from each other).
-  Single-VM testing is the v0 target; multi-node is deferred (ADR-0004).
+- **A holder crash takes its whole cluster down.** A CLI cluster's VMs share one holder
+  process so they can share one in-process vmnet network (ADR-0009). That trades the
+  per-VM crash isolation ADR-0006 originally had: lose the holder, lose every member of
+  that cluster. Single-VM `up` is unaffected (a cluster of one). Accepted for a
+  test-fixture tool; per-VM isolation would mean cross-process network sharing (the XPC
+  path ADR-0009 rejected).
+- **CLI members of one cluster can't span separate processes.** If members were started
+  by separate `up` commands (separate holders, separate networks), `up`-ing them
+  together can't merge their networks; it reports this instead of silently producing a
+  disconnected node (ADR-0009). Bring a cluster up together, or `rm` and retry.
 - **IP discovery is hostname-based**, which assumes cloud-init sets the hostname and
   the hostname is unique per VM. Both hold for fleetbox-created VMs (ADR-0007).
-- **macOS / Apple Silicon / M3+ only.** Not a limitation to fix but a v0 scope
-  decision; a linux/KVM backend is possible behind the same Backend interface
+- **macOS 26+ / Apple Silicon / M3+ only.** Networking requires macOS 26 (vmnet
+  SharedMode, ADR-0008); nested virt requires M3+. Not limitations to fix but scope
+  decisions; a linux/KVM backend is possible behind the same Backend interface
   (ADR-0002).
 - **VM tests can't run on CI.** GitHub-hosted runners have no nested virtualization.
 
@@ -444,6 +526,9 @@ After implementation changes, verify:
 - **State layout**: path methods in `internal/store/store.go` match the §4.2 tree.
 - **Dependencies**: direct requires in `go.mod` match the deps named in §5 module
   sections (currently: Code-Hex/vz, pilat/cloudiso, go-qcow2reader, x/crypto).
+  Code-Hex/vz is vendored under `third_party/vz` and resolved via a relative `replace`
+  pending upstream release of PR #205 (ADR-0008); `third_party/` is excluded from lint
+  and is its own module (skipped by `go ... ./...`).
 - **Invariants**: `make lint` passes (depguard enforces invariant #2); the rest of §6
   is spot-checked by reading the named files.
 - **New design decisions**: anything decided in a spec under `ai/tasks/` that changed

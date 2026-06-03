@@ -52,3 +52,9 @@ output is still captured to `runner-<name>.log` for debugging.)
   pidfiles/sockets after a crash are cleaned up by `rm`.
 - The CLI binary and the runner are the same binary — there is no separate daemon
   artifact to build, sign, or version.
+
+**Amended by ADR-0009.** "One runner per VM" became "one *holder* per `up` group" so a
+CLI cluster's VMs can share one in-process vmnet network (the cluster feature, ADR-0008).
+Everything else here stands — same re-exec'd binary, same minimal socket protocol (now
+also `addmember`), no forwarding or guest protocol. The single tradeoff: a holder crash
+now loses a whole cluster rather than one VM.
