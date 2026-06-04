@@ -172,6 +172,17 @@ func CopyDisk(src, dst string, sizeBytes int64) error {
 	}
 	defer func() { _ = srcF.Close() }()
 
+	// Truncate may only ever extend: a requested size smaller than the base
+	// image would shrink (corrupt) the copy. Fail fast before creating the
+	// destination so no partial/corrupt dst is left behind.
+	srcInfo, err := srcF.Stat()
+	if err != nil {
+		return fmt.Errorf("stat source: %w", err)
+	}
+	if sizeBytes > 0 && sizeBytes < srcInfo.Size() {
+		return fmt.Errorf("requested disk size %d is smaller than base image %d", sizeBytes, srcInfo.Size())
+	}
+
 	dstF, err := os.Create(dst)
 	if err != nil {
 		return fmt.Errorf("create destination: %w", err)
