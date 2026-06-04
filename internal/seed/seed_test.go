@@ -36,6 +36,57 @@ func TestCreate(t *testing.T) {
 	}
 }
 
+func TestBuildUserDataMountless(t *testing.T) {
+	cfg := Config{
+		Hostname: "test-vm",
+		User:     "fleetbox",
+		SSHKey:   "ssh-ed25519 AAAAKEY comment",
+	}
+
+	want := `#cloud-config
+users:
+  - name: fleetbox
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAKEY comment
+`
+
+	if got := buildUserData(cfg); got != want {
+		t.Errorf("mountless user-data mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestBuildUserDataWithMountsAndUID(t *testing.T) {
+	cfg := Config{
+		Hostname: "test-vm",
+		User:     "fleetbox",
+		SSHKey:   "ssh-ed25519 AAAAKEY comment",
+		UID:      501,
+		Mounts: []Mount{
+			{Tag: "fbm0", GuestPath: "/work"},
+			{Tag: "fbm1", GuestPath: "/data"},
+		},
+	}
+
+	want := `#cloud-config
+users:
+  - name: fleetbox
+    uid: 501
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAKEY comment
+mounts:
+  - [ fbm0, /work, virtiofs, "defaults,nofail", "0", "0" ]
+  - [ fbm1, /data, virtiofs, "defaults,nofail", "0", "0" ]
+`
+
+	if got := buildUserData(cfg); got != want {
+		t.Errorf("mounted user-data mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
 func TestConfigFormat(t *testing.T) {
 	cfg := Config{
 		Hostname: "my-hostname",

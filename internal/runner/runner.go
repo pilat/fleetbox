@@ -646,10 +646,20 @@ func RemovePidfile(st *store.Store, name string) error {
 
 // Options encoding
 type optionsData struct {
-	Image  string `json:"image,omitempty"`
-	CPUs   int    `json:"cpus,omitempty"`
-	MemGB  int    `json:"mem,omitempty"`
-	DiskGB int    `json:"disk,omitempty"`
+	Image  string      `json:"image,omitempty"`
+	CPUs   int         `json:"cpus,omitempty"`
+	MemGB  int         `json:"mem,omitempty"`
+	DiskGB int         `json:"disk,omitempty"`
+	Mounts []mountData `json:"mounts,omitempty"`
+}
+
+// mountData carries a mount across the holder process boundary. Only the host
+// and guest paths cross — the host path is already absolute (resolved by the
+// CLI); tags are not serialized because they are assigned at first-create in the
+// library (ADR-0010).
+type mountData struct {
+	HostPath  string `json:"host_path"`
+	GuestPath string `json:"guest_path"`
 }
 
 func encodeOptions(opts []fleetbox.Option) (string, error) {
@@ -665,6 +675,9 @@ func encodeOptions(opts []fleetbox.Option) (string, error) {
 		CPUs:   options.CPUs,
 		MemGB:  options.MemGB,
 		DiskGB: options.DiskGB,
+	}
+	for _, m := range options.Mounts {
+		data.Mounts = append(data.Mounts, mountData{HostPath: m.HostPath, GuestPath: m.GuestPath})
 	}
 
 	b, err := json.Marshal(data)
@@ -696,6 +709,9 @@ func decodeOptions(s string) ([]fleetbox.Option, error) {
 	}
 	if data.DiskGB > 0 {
 		opts = append(opts, fleetbox.WithDiskGB(data.DiskGB))
+	}
+	for _, m := range data.Mounts {
+		opts = append(opts, fleetbox.WithMount(m.HostPath, m.GuestPath))
 	}
 	return opts, nil
 }

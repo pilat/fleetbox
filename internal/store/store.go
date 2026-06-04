@@ -19,6 +19,18 @@ type VM struct {
 	DiskMB    int       `json:"disk_mb"`
 	Image     string    `json:"image"`
 	CreatedAt time.Time `json:"created_at"`
+	Mounts    []Mount   `json:"mounts,omitempty"`
+}
+
+// Mount is a persisted host↔guest shared directory. HostPath is absolute, Tag is
+// the stable virtiofs tag assigned at first creation (fbm<i>, i = position in the
+// mount list). The tag is the single source of truth shared between the host
+// virtiofs device and the guest fstab entry, so it is computed once and persisted
+// here rather than re-derived elsewhere.
+type Mount struct {
+	HostPath  string `json:"host_path"`
+	GuestPath string `json:"guest_path"`
+	Tag       string `json:"tag"`
 }
 
 // Store manages VM storage.

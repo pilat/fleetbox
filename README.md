@@ -150,6 +150,33 @@ instead of recreating it. State lives under `~/.fleetbox/vms/<name>/` and surviv
 — `Destroy` (or `fleetbox rm`) is the only thing that deletes a disk. Full API on
 [pkg.go.dev](https://pkg.go.dev/github.com/pilat/fleetbox).
 
+### Sharing a folder
+
+`WithMount` shares a host directory straight into the guest as a live, read-write
+folder — the testcontainers bind mount, for a real VM. Edits on either side show up on
+the other immediately, so it's the natural way to hand a VM your build output or fixtures
+without copying:
+
+```go
+dir := t.TempDir()
+vm := fleetboxtest.Start(t, fleetbox.Debian12, fleetbox.WithMount(dir, "/work"))
+
+os.WriteFile(filepath.Join(dir, "input.json"), payload, 0o644)
+out, _ := vm.SSH(context.Background(), "cat /work/input.json")  // sees it live
+```
+
+From the CLI it's a repeatable `--mount host:guest` flag:
+
+```bash
+./bin/fleetbox up dev --mount ./src:/work --mount ./fixtures:/data
+```
+
+Host-owned files line up with the guest login user (fleetbox pins the guest user's uid to
+your host uid), so `git`, `chown`-to-self, and `ls` all behave inside the share. Mounts
+are set when the VM is first created and re-applied on every boot; to change them, `rm` and
+recreate. The guest path must be absolute, and host paths must not contain colons (the
+value is split on the last colon).
+
 ### From the command line
 
 The CLI wraps the same library for manual work:
@@ -206,10 +233,10 @@ way, the decision log lives in [docs/adr/](docs/adr/).
 Both the library (`StartN`) and the CLI (`up -n N`) boot interconnected clusters whose
 VMs reach each other by IP. Mind the sharp edges:
 
-- **No mounts, and library file transfer is SSH-only.** From a test you run commands with
-  `vm.SSH`; there's no copy or mount in the library yet (the CLI has `cp` over scp). Getting
-  a large build artifact into a VM from Go isn't ergonomic today — mounts are the planned
-  fix.
+- **Mounts are read-write and frozen at creation.** `WithMount` / `--mount` gives a live
+  shared folder, but a read-only variant isn't exposed yet, and you can't add or change a
+  VM's mounts after it's created — `rm` and recreate. There's still no programmatic file
+  copy in the library for the cases a mount doesn't fit (the CLI has `cp` over scp).
 - **A CLI cluster shares one holder process.** All members of a cluster live in one process
   to share one vmnet network, so a holder crash takes the whole cluster down (a single VM is
   unaffected). Members started by separate `up` commands have separate networks and can't be
@@ -225,13 +252,14 @@ locally via `make test-vm`, while CI sticks to lint, build, and unit tests.
 
 Roughly in priority order:
 
-- **Mounts (virtiofs).** Share a host directory straight into the guest — the intended way
-  to hand a VM your build output or fixtures, no copying around.
+- **Read-only mounts.** A read-only variant of `WithMount` for fixtures you don't want the
+  guest to modify.
 - **Programmatic file copy** for the cases a mount doesn't fit.
 
-Done recently: VM-to-VM networking over a real network (vmnet SharedMode), and CLI
-clustering (`fleetbox up node -n 3`) — boot an actual cluster (kubeadm, etcd, a Raft group)
-on real interconnected nodes, not mocks or a single-host simulation.
+Done recently: live read-write folder mounts (virtiofs) via `WithMount` / `--mount`;
+VM-to-VM networking over a real network (vmnet SharedMode); and CLI clustering
+(`fleetbox up node -n 3`) — boot an actual cluster (kubeadm, etcd, a Raft group) on real
+interconnected nodes, not mocks or a single-host simulation.
 
 ## License
 

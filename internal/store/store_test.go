@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -93,6 +94,77 @@ func TestStoreCreateLoadDelete(t *testing.T) {
 	}
 	if st.Exists("test-vm") {
 		t.Error("Exists returned true after Delete")
+	}
+}
+
+func TestStoreMountsRoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+	st, err := NewAt(tmpDir)
+	if err != nil {
+		t.Fatalf("NewAt: %v", err)
+	}
+
+	vm := &VM{
+		Name:      "mounted-vm",
+		MAC:       "aa:bb:cc:dd:ee:ff",
+		CPUs:      2,
+		MemoryMB:  4096,
+		DiskMB:    20480,
+		Image:     "debian-12",
+		CreatedAt: time.Now(),
+		Mounts: []Mount{
+			{HostPath: "/host/work", GuestPath: "/work", Tag: "fbm0"},
+			{HostPath: "/host/data", GuestPath: "/data", Tag: "fbm1"},
+		},
+	}
+
+	if err := st.Create(vm); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	loaded, err := st.Load("mounted-vm")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded.Mounts) != 2 {
+		t.Fatalf("loaded %d mounts, want 2", len(loaded.Mounts))
+	}
+	for i, want := range vm.Mounts {
+		if loaded.Mounts[i] != want {
+			t.Errorf("Mounts[%d] = %+v, want %+v", i, loaded.Mounts[i], want)
+		}
+	}
+
+	// config.json must carry the documented json keys.
+	data, err := os.ReadFile(filepath.Join(st.VMDir("mounted-vm"), "config.json"))
+	if err != nil {
+		t.Fatalf("read config.json: %v", err)
+	}
+	for _, key := range []string{`"mounts"`, `"host_path"`, `"guest_path"`, `"tag"`} {
+		if !strings.Contains(string(data), key) {
+			t.Errorf("config.json missing key %s\n%s", key, data)
+		}
+	}
+}
+
+func TestStoreNoMountsOmitsField(t *testing.T) {
+	tmpDir := t.TempDir()
+	st, err := NewAt(tmpDir)
+	if err != nil {
+		t.Fatalf("NewAt: %v", err)
+	}
+
+	vm := &VM{Name: "plain-vm", CreatedAt: time.Now()}
+	if err := st.Create(vm); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(st.VMDir("plain-vm"), "config.json"))
+	if err != nil {
+		t.Fatalf("read config.json: %v", err)
+	}
+	if strings.Contains(string(data), "mounts") {
+		t.Errorf("config.json should omit mounts when empty\n%s", data)
 	}
 }
 

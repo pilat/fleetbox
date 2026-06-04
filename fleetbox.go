@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -91,6 +92,20 @@ type Options struct {
 	CPUs   int
 	MemGB  int
 	DiskGB int
+	Mounts []Mount
+}
+
+// Mount is a host↔guest shared directory. The host directory appears live and
+// read-write inside the guest at GuestPath; edits on either side are visible on
+// the other immediately (Apple Virtualization.framework virtiofs). Mounts are a
+// property the VM is born with: they are set at first creation, persisted, and
+// re-applied on every boot. Changing a VM's mounts means recreating it (rm + up).
+type Mount struct {
+	// HostPath is the directory on the macOS host to share. It must exist at
+	// creation time and is resolved to an absolute path before persistence.
+	HostPath string
+	// GuestPath is the absolute path inside the guest where HostPath appears.
+	GuestPath string
 }
 
 // Option is a functional option for configuring a VM.
@@ -114,6 +129,18 @@ func WithMemoryGB(n int) Option {
 // WithDiskGB sets the disk size in gigabytes.
 func WithDiskGB(n int) Option {
 	return func(o *Options) { o.DiskGB = n }
+}
+
+// WithMount shares the host directory hostPath into the guest at guestPath as a
+// live, read-write virtiofs mount. Call it more than once to add several mounts.
+// guestPath must be absolute. The mount is applied when the VM is first created
+// and re-applied on every subsequent boot; it is ignored when passed to an
+// already-existing VM, exactly as cpu/memory/disk options are. In a StartN or
+// StartCluster every member receives the same mounts.
+func WithMount(hostPath, guestPath string) Option {
+	return func(o *Options) {
+		o.Mounts = append(o.Mounts, Mount{HostPath: hostPath, GuestPath: guestPath})
+	}
 }
 
 // Start creates and boots a new VM with the given name.
@@ -194,6 +221,15 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 		}
 		vmConfig = loaded
 	} else {
+		// Mounts are frozen at birth: validated, absolutized, and tagged once
+		// here, then persisted and re-applied verbatim on every later boot
+		// (ADR-0010). Validation is a create-time concern only — see the loaded
+		// branch above, which never re-checks the host dir.
+		mounts, err := toStoreMounts(options.Mounts)
+		if err != nil {
+			return nil, fmt.Errorf("prepare mounts: %w", err)
+		}
+
 		// Create new VM
 		vmConfig = &store.VM{
 			Name:      name,
@@ -203,6 +239,7 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 			DiskMB:    options.DiskGB * 1024,
 			Image:     options.Image,
 			CreatedAt: time.Now(),
+			Mounts:    mounts,
 		}
 		if err := st.Create(vmConfig); err != nil {
 			return nil, fmt.Errorf("create vm store: %w", err)
@@ -215,12 +252,18 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 			return nil, fmt.Errorf("copy disk: %w", err)
 		}
 
-		// Create seed ISO
+		// Create seed ISO. With mounts, cloud-init also writes the fstab entries
+		// (so they survive reboots without a re-run) and pins the guest user's
+		// uid to the host uid so virtiofs identity pass-through lines up.
 		seedPath := st.SeedPath(name)
 		seedCfg := seed.Config{
 			Hostname: name,
 			User:     defaultUser,
 			SSHKey:   deps.pubKey,
+		}
+		if len(mounts) > 0 {
+			seedCfg.Mounts = toSeedMounts(mounts)
+			seedCfg.UID = os.Getuid()
 		}
 		if err := seed.Create(seedPath, seedCfg); err != nil {
 			return nil, fmt.Errorf("create seed: %w", err)
@@ -243,6 +286,9 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 		CPUs:        vmConfig.CPUs,
 		MemoryBytes: uint64(vmConfig.MemoryMB) * 1024 * 1024,
 		SerialOut:   serialLog,
+		// Re-attach the virtiofs devices from the persisted config, so both a
+		// freshly created and a rebooted VM get identical mounts (ADR-0010).
+		Mounts: toBackendMounts(vmConfig.Mounts),
 	}
 	backendVM, err := deps.backend.Create(backendCfg, nw)
 	if err != nil {
@@ -283,6 +329,63 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 	}
 
 	return vm, nil
+}
+
+// toStoreMounts validates the public mounts and converts them to persisted store
+// mounts, assigning each a stable fbm<i> tag where i is its position in the list
+// and resolving host paths to absolute. The tag↔index invariant (ADR-0010)
+// depends on order being preserved, so the list is neither reordered nor deduped.
+// It returns an error for a non-absolute guest path or a missing host directory —
+// the only place create-time mount validation happens.
+func toStoreMounts(mounts []Mount) ([]store.Mount, error) {
+	if len(mounts) == 0 {
+		return nil, nil
+	}
+	out := make([]store.Mount, 0, len(mounts))
+	for i, m := range mounts {
+		if !filepath.IsAbs(m.GuestPath) {
+			return nil, fmt.Errorf("mount guest path %q must be absolute", m.GuestPath)
+		}
+		host, err := filepath.Abs(m.HostPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve mount host path %q: %w", m.HostPath, err)
+		}
+		if _, err := os.Stat(host); err != nil {
+			return nil, fmt.Errorf("mount host path %q: %w", host, err)
+		}
+		out = append(out, store.Mount{
+			HostPath:  host,
+			GuestPath: m.GuestPath,
+			Tag:       fmt.Sprintf("fbm%d", i),
+		})
+	}
+	return out, nil
+}
+
+// toBackendMounts projects persisted mounts onto the backend's host-side view
+// (host path + tag); the guest path is irrelevant to attaching the device.
+func toBackendMounts(mounts []store.Mount) []backend.Mount {
+	if len(mounts) == 0 {
+		return nil
+	}
+	out := make([]backend.Mount, len(mounts))
+	for i, m := range mounts {
+		out[i] = backend.Mount{HostPath: m.HostPath, Tag: m.Tag}
+	}
+	return out
+}
+
+// toSeedMounts projects persisted mounts onto the guest-side view cloud-init
+// needs (tag + guest path) to write the fstab entries.
+func toSeedMounts(mounts []store.Mount) []seed.Mount {
+	if len(mounts) == 0 {
+		return nil
+	}
+	out := make([]seed.Mount, len(mounts))
+	for i, m := range mounts {
+		out[i] = seed.Mount{Tag: m.Tag, GuestPath: m.GuestPath}
+	}
+	return out
 }
 
 // Name returns the VM name.

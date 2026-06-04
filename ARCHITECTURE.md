@@ -78,9 +78,12 @@ creating/booting a VM. Both the CLI runner and fleetboxtest go through it. The s
 5. **VM config** — if `store.Exists(name)`: load `config.json` and boot from it
    (**all options are ignored for an existing VM** — the stored config wins; the image
    option only affects the shared image cache). Otherwise: create the config (stable
-   MAC derived from name via `backend.GenerateMAC`), copy the cached image to
-   `disk.raw` (sparse, truncated to requested size), and generate `seed.iso` via
-   `seed.Create`.
+   MAC derived from name via `backend.GenerateMAC`; any `WithMount` shares validated,
+   absolutized, and tagged `fbm<i>` here), copy the cached image to `disk.raw` (sparse,
+   truncated to requested size), and generate `seed.iso` via `seed.Create` (with the
+   mounts' fstab entries and host-uid alignment when the VM has mounts — ADR-0010).
+   On every boot, new or existing, the virtiofs devices are re-attached from the
+   persisted config.
 6. **Network & boot** — `newBackend().CreateNetwork()` makes a vmnet SharedMode
    logical network (a single `Start` gets a one-member network; a `StartN` cluster
    shares one network across all nodes — §4.3). `Create(backend.Config{...}, net)`
@@ -104,7 +107,7 @@ All persistent state lives under `~/.fleetbox/` and is owned by `internal/store`
 ```
 ~/.fleetbox/
 ├── vms/<name>/
-│   ├── config.json        # store.VM: name, MAC, cpus, memory, disk, image, created_at
+│   ├── config.json        # store.VM: name, MAC, cpus, memory, disk, image, created_at, mounts[]
 │   ├── disk.raw           # the VM's root disk (sparse file)
 │   ├── seed.iso           # cloud-init NoCloud seed (generated once at create)
 │   ├── efi.nvram          # EFI variable store (created by the VZ backend)
@@ -248,8 +251,10 @@ When a PR changes any of these fields for a package, update its section.
   - `NestedVirtSupported() bool`
   - `type VM`: `Name()`, `IP() net.IP`, `SSH(ctx, cmd) (string, error)`, `Stop(ctx)`,
     `Destroy(ctx)`, `State() string`
-  - `type Options{Image, CPUs, MemGB, DiskGB}`, `type Option func(*Options)`,
-    `WithImage`, `WithCPUs`, `WithMemoryGB`, `WithDiskGB`
+  - `type Options{Image, CPUs, MemGB, DiskGB, Mounts}`, `type Option func(*Options)`,
+    `WithImage`, `WithCPUs`, `WithMemoryGB`, `WithDiskGB`, `WithMount(host, guest)`
+  - `type Mount{HostPath, GuestPath}` — a live read-write host↔guest virtiofs share
+    (ADR-0010)
   - image aliases: `Debian12`, `Ubuntu2404`
 - Invariants:
   - No backend (vz) types in any exported signature — the API is backend-neutral
@@ -260,6 +265,13 @@ When a PR changes any of these fields for a package, update its section.
     per-VM work; `StartN` is a thin wrapper over `StartCluster`. `Cluster` is an
     in-process runtime handle — the shared network is never persisted, so "clusters are
     a naming convention, no state" still holds (ADR-0009).
+  - **Mounts are frozen at birth** (ADR-0010): `WithMount` shares are validated,
+    absolutized, and tagged (`fbm<i>`) once at first create, persisted in `config.json`,
+    and re-attached on every later boot from the store (host virtiofs device) and
+    `/etc/fstab` (guest, written once by cloud-init). Changing a VM's mounts means
+    `rm` + recreate — they are ignored when passed to an existing VM, like cpu/mem/disk.
+    A VM with ≥1 mount also gets its guest login user pinned to the host uid so virtiofs
+    identity pass-through lines up; mountless VMs are byte-for-byte unchanged.
   - `Start` on an existing (stopped) VM boots it from its stored config; options are
     ignored for existing VMs. Note: `Start` does **not** detect an already-running VM
     — that guard currently lives in the CLI runner (`runner.Spawn` checks
@@ -298,6 +310,10 @@ When a PR changes any of these fields for a package, update its section.
     running in one holder → `addmember` the rest so a re-upped node re-joins the live
     network; running members split across processes → rejected (their networks can't
     merge). Flags and positional names may be interspersed (`up test1 -n 2` works).
+  - `up` accepts a repeatable `--mount host:guest` flag (a custom `flag.Value`); host
+    paths are resolved to absolute against the CLI cwd before they cross into the holder
+    (split on the last colon), and flow to the library as `WithMount` (ADR-0010). In a
+    cluster every member gets the same mounts.
   - No yaml, no config files — flags and defaults only.
 
 ### §5.4 `internal/backend`
@@ -308,7 +324,8 @@ When a PR changes any of these fields for a package, update its section.
 - Public API (internal): `Backend{CreateNetwork, Create, NestedVirtSupported}`,
   `Network{Close}` (opaque network handle — no hypervisor types on it),
   `VM{Start, Stop, State, Wait}`, `Config{Name, DiskPath, SeedPath, EFIPath, MAC, CPUs,
-  MemoryBytes, SerialOut}`, `State` enum + `String()`, `GenerateMAC(name)`. `Create`
+  MemoryBytes, SerialOut, Mounts}`, `Mount{HostPath, Tag}` (backend-neutral — no vz
+  types, no guest path), `State` enum + `String()`, `GenerateMAC(name)`. `Create`
   takes the `Network` to attach the VM to.
 - Invariants:
   - Imports no hypervisor SDK — pure contract. `Network` is opaque: no `vmnet`/`vz`
@@ -336,6 +353,12 @@ When a PR changes any of these fields for a package, update its section.
   - `CreateNetwork` makes a vmnet SharedMode network on a free `/24`; the macOS-26
     requirement is the single canonical error here (ADR-0008). `vzNetwork.Close` is a
     no-op — the network is released by GC once unreferenced (R3).
+  - Folder mounts attach as one `VZVirtioFileSystemDeviceConfiguration` per
+    `cfg.Mounts` entry (a read-write `SingleDirectoryShare` tagged with the persisted
+    `fbm<i>`); the directory-sharing setter is skipped entirely when there are no mounts,
+    so a mountless VM's device set is unchanged (ADR-0010). `NewSharedDirectory` stats
+    the host path at attach time, so a mount whose host dir was deleted fails the next
+    boot here (guest-side `nofail` does not cover a missing host dir — ADR-0010).
   - EFI boot of stock images only — no kernel/initrd extraction (ADR-0003).
 
 ### §5.6 `internal/image`
@@ -355,11 +378,17 @@ When a PR changes any of these fields for a package, update its section.
 - Purpose: cloud-init NoCloud seed ISO generation.
 - Owns: stateless (writes one file per call).
 - Depends on: `github.com/pilat/cloudiso`.
-- Public API (internal): `Config{Hostname, User, SSHKey}`, `Create(path, cfg)`.
+- Public API (internal): `Config{Hostname, User, SSHKey, Mounts, UID}`,
+  `Mount{Tag, GuestPath}`, `Create(path, cfg)`.
 - Invariants:
   - The user-data stays minimal: one user, authorized key, passwordless sudo, hostname.
     Nothing else goes into the guest (ADR-0005).
   - No per-distro templates — the same seed works for every image.
+  - User-data is built by string concatenation (`buildUserData`), no yaml/template
+    library. With no mounts and no `UID` the output is byte-identical to the original
+    template; a `mounts:` block (one `virtiofs`/`defaults,nofail` fstab line per share)
+    and a `uid:` line are emitted only when set (ADR-0010). The `mounts:` directive
+    writes `/etc/fstab`, so shares re-mount on every boot with no cloud-init re-run.
 
 ### §5.8 `internal/store`
 
@@ -368,11 +397,15 @@ When a PR changes any of these fields for a package, update its section.
 - Owns: all on-disk state (§4.2).
 - Depends on: stdlib only.
 - Public API (internal): `Store` (`New`, `NewAt`, path methods, `Exists/Create/Save/
-  Load/Delete/List`, `TryLock`), `VM` config struct, `Lock.Unlock`.
+  Load/Delete/List`, `TryLock`), `VM` config struct (incl. `Mounts`), `Mount{HostPath,
+  GuestPath, Tag}`, `Lock.Unlock`.
 - Invariants:
   - Every path under `~/.fleetbox/` is produced by a `Store` method — no other package
     builds those paths by hand.
   - `config.json` is human-readable (indented JSON).
+  - `VM.Mounts` is the persisted source of truth for a VM's virtiofs shares; each
+    carries its `fbm<i>` tag, computed once at create and never re-derived (ADR-0010).
+    `mounts` is omitted from `config.json` for a mountless VM.
 - Notes: `TryLock` (flock-based per-VM locking) is implemented and tested but **not
   yet wired into `fleetbox.Start`** — it was designed to guard concurrent starts of
   the same VM. Wiring it in is an open task; until then the §5.1 known gap stands.
@@ -419,7 +452,8 @@ When a PR changes any of these fields for a package, update its section.
   - `stop` shuts down one member; the holder process survives until its last member is
     gone (or SIGTERM stops all). An initial multi-member boot is all-or-nothing.
   - CLI options survive the re-exec: `Spawn` serializes applied `Options` values into
-    `FLEETBOX_OPTS`; `Run` deserializes them.
+    `FLEETBOX_OPTS`; `Run` deserializes them. Mounts ride along as host+guest path
+    pairs (tags are assigned later at first-create, not serialized — ADR-0010).
 
 ### Dependency graph
 

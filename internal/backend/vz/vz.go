@@ -247,6 +247,30 @@ func (b *Backend) Create(cfg backend.Config, nw backend.Network) (backend.VM, er
 
 	vmConfig.SetStorageDevicesVirtualMachineConfiguration([]vz.StorageDeviceConfiguration{diskConfig, seedConfig})
 
+	// Directory sharing (virtiofs). One device per mount, each a single-directory
+	// read-write share tagged so the guest fstab can mount it (ADR-0010). Skipped
+	// entirely when there are no mounts so a mountless VM's config is unchanged.
+	if len(cfg.Mounts) > 0 {
+		fsDevices := make([]vz.DirectorySharingDeviceConfiguration, 0, len(cfg.Mounts))
+		for _, m := range cfg.Mounts {
+			sharedDir, err := vz.NewSharedDirectory(m.HostPath, false)
+			if err != nil {
+				return nil, fmt.Errorf("create shared directory %s: %w", m.HostPath, err)
+			}
+			share, err := vz.NewSingleDirectoryShare(sharedDir)
+			if err != nil {
+				return nil, fmt.Errorf("create directory share %s: %w", m.HostPath, err)
+			}
+			fsDevice, err := vz.NewVirtioFileSystemDeviceConfiguration(m.Tag)
+			if err != nil {
+				return nil, fmt.Errorf("create virtiofs device %s: %w", m.Tag, err)
+			}
+			fsDevice.SetDirectoryShare(share)
+			fsDevices = append(fsDevices, fsDevice)
+		}
+		vmConfig.SetDirectorySharingDevicesVirtualMachineConfiguration(fsDevices)
+	}
+
 	// Network: attach to the shared vmnet SharedMode logical network (ADR-0008).
 	vzNet, ok := nw.(*vzNetwork)
 	if !ok {
