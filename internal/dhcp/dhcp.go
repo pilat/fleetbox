@@ -35,30 +35,6 @@ func LookupByHostname(hostname string) (string, error) {
 	return "", fmt.Errorf("hostname %q not found in DHCP leases", hostname)
 }
 
-// LookupByMAC returns the IP address for the given MAC address.
-// MAC should be in format "aa:bb:cc:dd:ee:ff".
-func LookupByMAC(mac string) (string, error) {
-	leases, err := ParseLeases()
-	if err != nil {
-		return "", err
-	}
-
-	macLower := strings.ToLower(mac)
-	var latest *Lease
-	for i := range leases {
-		if strings.EqualFold(leases[i].HWAddress, macLower) {
-			if latest == nil || leases[i].LeaseTime > latest.LeaseTime {
-				latest = &leases[i]
-			}
-		}
-	}
-
-	if latest == nil {
-		return "", fmt.Errorf("MAC %q not found in DHCP leases", mac)
-	}
-	return latest.IPAddress, nil
-}
-
 // ParseLeases reads and parses /var/db/dhcpd_leases.
 func ParseLeases() ([]Lease, error) {
 	return ParseLeasesFile(leasesPath)
