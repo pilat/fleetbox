@@ -75,7 +75,6 @@ linters:
           list-mode: lax
           files:
             - "!**/internal/backend/vz/**"
-            - "!**/spike/**"
           deny:
             - pkg: github.com/Code-Hex/vz
               desc: vz (incl. vmnet/xpc) is only allowed in internal/backend/vz (backend-neutral API invariant)
@@ -156,7 +155,6 @@ linters:
 
   exclusions:
     paths:
-      - spike  # throwaway prototype, own go.mod
       - third_party  # vendored Code-Hex/vz PR #205, own go.mod (docs/adr/0008)
       - bin
     generated: lax
@@ -209,6 +207,5 @@ formatters:
       max-len: 120
   exclusions:
     paths:
-      - spike
       - third_party
       - bin

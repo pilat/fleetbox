@@ -49,7 +49,6 @@ internal/dhcp                   /var/db/dhcpd_leases parsing (hostname → IP)
 internal/sshkey                 keypair + x/crypto/ssh client
 internal/runner                 CLI-mode VM holder process (re-exec, pidfile, socket)
 cmd/fleetbox                    CLI: up/down/ls/ssh/cp/ssh-config/rm
-spike/                          standalone throwaway prototype (own go.mod) — ignore it
 ```
 
 Key external deps: `Code-Hex/vz/v3`, `pilat/cloudiso`, `go-qcow2reader`,

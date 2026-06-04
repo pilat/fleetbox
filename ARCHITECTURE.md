@@ -549,9 +549,8 @@ CLAUDE.md as checkable rules):
 
 After implementation changes, verify:
 
-- **Module list**: packages in §5 == `go list ./...` (minus `spike/`, which is a
-  separate throwaway module). A new/removed/renamed package requires a §5 section
-  update.
+- **Module list**: packages in §5 == `go list ./...`. A new/removed/renamed package
+  requires a §5 section update.
 - **Public API**: exported symbols in `fleetbox.go` and `fleetboxtest/` match §5.1 /
   §5.2. Quick check: `go doc github.com/pilat/fleetbox | grep '^func\|^type\|^const'`.
 - **CLI surface**: commands in `cmd/fleetbox/main.go`'s dispatch switch match §5.3 and
