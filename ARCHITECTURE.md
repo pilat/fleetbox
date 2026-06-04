@@ -412,10 +412,10 @@ When a PR changes any of these fields for a package, update its section.
 
 ### §5.9 `internal/dhcp`
 
-- Purpose: `/var/db/dhcpd_leases` parsing — hostname/MAC → IP.
+- Purpose: `/var/db/dhcpd_leases` parsing — hostname → IP.
 - Owns: stateless.
 - Depends on: stdlib only.
-- Public API (internal): `LookupByHostname`, `LookupByMAC`, `ParseLeases`,
+- Public API (internal): `LookupByHostname`, `ParseLeases`,
   `ParseLeasesFile`, `ParseLeasesData`, `Lease` struct.
 - Invariants:
   - Read-only consumer of a macOS system file; never writes anything.

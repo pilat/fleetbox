@@ -23,14 +23,16 @@ config.json, and find the lease whose `hw_address` matches that MAC.
    hostname in the lease — so the name itself is the lookup key.
 3. **The stable per-VM MAC is still generated and stored** (`backend.GenerateMAC`,
    derived from the name) — it keeps the VM's identity stable across boots so DHCP
-   re-issues the same address, and `LookupByMAC` exists for backends/situations where
-   MAC matching does work.
+   re-issues the same address. (A `LookupByMAC` helper was originally kept for
+   backends/situations where MAC matching does work; it was later removed as dead code
+   — it never matched VZ's DUID-form leases and had no callers.)
 
 ## Alternatives Considered
 
 **Lookup by MAC (the Tart approach, and the original spec).** Doesn't work with VZ:
-the DUID-form `hw_address` entries don't match the interface MAC. Kept as a secondary
-code path (`LookupByMAC`) since the parsing is shared.
+the DUID-form `hw_address` entries don't match the interface MAC. A secondary
+`LookupByMAC` code path was kept initially since the parsing is shared, but it was
+later removed as dead code (it could never match a VZ lease).
 
 **Guest agent reporting its IP.** Rejected: violates ADR-0005 (no guest agent).
 
