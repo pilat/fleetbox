@@ -1,7 +1,8 @@
 # fleetbox — Agent Brief
 
-Linux VMs as Go test fixtures on macOS (Apple Silicon), powered by Apple
-Virtualization.framework. Library-first: the Go package is the product, the CLI is a
+Linux VMs as Go test fixtures, on macOS (Apple Silicon, via Apple
+Virtualization.framework) and on Linux (amd64/arm64, via cloud-hypervisor) behind one
+backend-neutral Go API. Library-first: the Go package is the product, the CLI is a
 wrapper. Think "testcontainers-go, but for real VMs" — real kernel, real systemd, real
 KVM via nested virtualization.
 
@@ -24,11 +25,13 @@ Module: `github.com/pilat/fleetbox`
 ## Core principles (violations = bugs)
 
 - **Library-first.** Every capability exists in the Go API; the CLI only wraps it.
-- **Backend-neutral public API.** `Code-Hex/vz` types must never appear in exported
-  signatures. The only package allowed to import vz is `internal/backend/vz`.
+- **Backend-neutral public API.** Hypervisor types must never appear in exported
+  signatures. `Code-Hex/vz` is allowed only in `internal/backend/vz`; cloud-hypervisor
+  specifics only in `internal/backend/cloudhypervisor`.
 - **Nothing of ours inside the guest.** No agent, no helper binary, no host↔guest
   protocol. The guest is a stock distro configured once by cloud-init.
-- **No port forwarding.** VMs get directly routable IPs from VZ NAT (bridge100).
+- **No port forwarding.** VMs get directly routable IPs — vmnet SharedMode on macOS 26+,
+  a shared Linux bridge + tap on Linux.
 - **No yaml, no templates, no per-distro code paths.** Flags, defaults, and a dumb
   alias→URL image map.
 - **Clusters are a naming convention** (`prefix-N`), never an entity with state.
@@ -38,34 +41,43 @@ Module: `github.com/pilat/fleetbox`
 ## Architecture summary
 
 ```
-fleetbox.go                     public API: Start/StartN, VM, Options, NestedVirtSupported
+fleetbox.go                     public API: Start/StartN, VM, Cluster, Options, NestedVirtSupported
+backend_{darwin_arm64,linux,unsupported}.go  compile-time backend selection per platform
 fleetboxtest/                   testing.TB fixtures: Start(t, image), StartN, SkipIfShort
-internal/backend                Backend interface, compile-time selection per platform
-internal/backend/vz             VZ implementation (the only vz import site)
-internal/image                  cloud image download/verify/qcow2→raw/cache
-internal/seed                   cloud-init NoCloud seed ISO (via pilat/cloudiso)
-internal/store                  ~/.fleetbox/vms/<name>/ state, config.json, locking
-internal/dhcp                   /var/db/dhcpd_leases parsing (hostname → IP)
+internal/backend                Backend interface (CreateNetwork/Create/NestedVirtSupported/SupportsClustering)
+internal/backend/vz             VZ implementation, darwin/arm64 (the only vz import site)
+internal/backend/cloudhypervisor cloud-hypervisor implementation, linux (the only CH import site)
+internal/fetch                  shared download → verify(sha256) → atomic-cache primitive
+internal/image                  cloud image download/verify/qcow2→raw/cache (per-arch catalog)
+internal/seed                   cloud-init NoCloud seed ISO + static network-config (via pilat/cloudiso)
+internal/store                  ~/.fleetbox/{vms,images,bin}/ state, config.json, locking
+internal/dhcp                   /var/db/dhcpd_leases parsing (hostname → IP); darwin-only
 internal/sshkey                 keypair + x/crypto/ssh client
 internal/runner                 CLI-mode VM holder process (re-exec, pidfile, socket)
 cmd/fleetbox                    CLI: up/down/ls/ssh/cp/ssh-config/rm
 ```
 
-Key external deps: `Code-Hex/vz/v3`, `pilat/cloudiso`, `go-qcow2reader`,
-`golang.org/x/crypto/ssh`.
+Key external deps: `Code-Hex/vz/v3` (macOS), `pilat/cloudiso`, `go-qcow2reader`,
+`golang.org/x/crypto/ssh`. The Linux path is pure Go (cloud-hypervisor is a subprocess
+controlled over its unix socket with stdlib) — no new module dep, no cgo.
 
 ## Build & test notes
 
-- Binaries (CLI and test binaries) need the `com.apple.security.virtualization`
-  entitlement — ad-hoc codesign is enough for dev. Use the Makefile targets; never run
-  unsigned VM tests and wonder why they fail.
-- Tests that boot real VMs are separated (`make test-vm`) and only run on darwin/arm64
-  with nested-virt-capable hardware (M3+). Plain `make test` (unit tests) also requires
-  darwin/arm64 — the root package is build-tagged `darwin && arm64`, so the module does
-  not compile on other platforms. CI runs on macos-latest for this reason; never switch
-  it to ubuntu runners.
-- CI (GitHub-hosted runners) cannot boot VZ VMs — CI runs lint + build + unit tests
-  only. Do not write CI workflows that pretend otherwise.
+- **macOS** binaries (CLI and test binaries) need the `com.apple.security.virtualization`
+  entitlement — ad-hoc codesign is enough for dev. Use the Makefile targets (`make build`
+  skips codesign on Linux); never run unsigned VM tests on macOS and wonder why they fail.
+- The module compiles on `darwin/arm64`, `linux/amd64`, and `linux/arm64`. Other targets
+  (incl. `darwin/amd64`) compile but error at runtime with "unsupported platform". Unit
+  tests (`make test`) and `make lint` run on darwin/arm64; lint the Linux code with
+  `GOOS=linux golangci-lint run ./...`.
+- VM-boot tests on macOS (`make test-vm`) need darwin/arm64, M3+, macOS 26+. Linux VM
+  tests need a host with `/dev/kvm` + `CAP_NET_ADMIN` (a real Linux box, a Lima VM with
+  `nestedVirtualization: true`, or a KVM-enabled CI runner) — not the macOS dev box and
+  not Docker Desktop (no `/dev/kvm`).
+- CI (macos-26 GitHub runner) cannot boot VZ VMs — it runs lint + build + unit tests only.
+  Do not switch the macOS CI to ubuntu (it must keep building/linting the darwin code).
+  Unlike VZ, the cloud-hypervisor backend *is* CI-testable on Linux runners with KVM — a
+  future win, out of v1 scope.
 - Commands: `make test` (unit), `make test-vm` (boots real VMs), `make lint`,
   `make build` (compile + codesign the CLI). No generic sign-test target — signing a VM
   test binary for another package is a manual `go test -c` + `codesign`.
@@ -79,15 +91,23 @@ at the caller. Every exported symbol gets a doc comment — this is a library.
 
 ## Known deviations from spec
 
-- **VM↔VM connectivity works via vmnet SharedMode (macOS 26+), not VZ NAT.** VZ NAT
-  (`VZNATNetworkDeviceAttachment`) isolated VMs from each other, so the spec's "VM→VM"
-  claim was initially false. As of macOS 26, fleetbox uses
-  `VZVmnetNetworkDeviceAttachment` (vmnet SharedMode) instead: VMs on a shared network
-  reach the host, the internet, **and each other**, on one NIC, with no root and no
-  `com.apple.vm.networking` entitlement. `StartN` boots interconnected clusters. This
-  raised the platform floor to macOS 26 and removed the NAT path entirely. See
-  `docs/adr/0008` (and `0004`, which it partially supersedes). Both `StartN` and the CLI
-  (`fleetbox up <prefix> -n N`) boot interconnected clusters.
+- **Cross-platform: macOS (VZ) + Linux (cloud-hypervisor) behind one API.** The module
+  is no longer `darwin && arm64`-only. The backend is selected at compile time per
+  platform (`backend_darwin_arm64.go` → vz, `backend_linux.go` → cloud-hypervisor,
+  `backend_unsupported.go` → clear error). On Linux the VMM is a downloaded,
+  checksum-pinned cloud-hypervisor binary + firmware (cached in `~/.fleetbox/bin/`),
+  run as a subprocess and controlled over its unix-socket REST API with stdlib — pure
+  Go, no cgo. Linux networking is a shared bridge + per-VM tap with static IPs injected
+  via cloud-init `network-config`; mounts (virtio-fs) are deferred on Linux. IP
+  discovery moved behind the backend (`backend.VM.WaitForIP`). See `docs/adr/0011`.
+
+- **Platform matrix: clusters need macOS 26+ or Linux; single VM works on macOS <26.**
+  vmnet SharedMode (VM↔VM) is macOS 26+ only; below 26 the vz backend uses a resurrected
+  `VZNATNetworkDeviceAttachment` for a single, isolated VM, and `SupportsClustering()`
+  is false so a 2nd cluster member errors (`ErrClustersUnsupported`). Linux clusters work
+  via the shared bridge. Intel macOS is unsupported. See `docs/adr/0012` (and `0008`,
+  `0004`, which it references). Both `StartN` and the CLI (`fleetbox up <prefix> -n N`)
+  boot interconnected clusters where clustering is supported.
 
 - **CLI clusters run in one holder process (not one runner per VM).** ADR-0006's
   "one runner per VM" became "one holder per `up` group": a CLI cluster's VMs share one

@@ -1,3 +1,5 @@
+//go:build darwin
+
 // Package dhcp parses macOS dhcpd_leases file to discover VM IP addresses.
 package dhcp
 

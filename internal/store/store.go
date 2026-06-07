@@ -20,6 +20,11 @@ type VM struct {
 	Image     string    `json:"image"`
 	CreatedAt time.Time `json:"created_at"`
 	Mounts    []Mount   `json:"mounts,omitempty"`
+	// IP is the static IPv4 address assigned at first create on backends that
+	// allocate from a known subnet (Linux/cloud-hypervisor). It is the persisted
+	// source of truth so a rebooted VM keeps its address and a re-joining cluster
+	// member does not collide. Empty on macOS, where addresses come from DHCP.
+	IP string `json:"ip,omitempty"`
 }
 
 // Mount is a persisted host↔guest shared directory. HostPath is absolute, Tag is
@@ -75,6 +80,23 @@ func (s *Store) VMDir(name string) string {
 // ImagesDir returns the images cache directory.
 func (s *Store) ImagesDir() string {
 	return filepath.Join(s.baseDir, "images")
+}
+
+// BinDir returns the cache directory for downloaded executables and firmware
+// (~/.fleetbox/bin). The Linux backend caches the checksum-pinned
+// cloud-hypervisor binary and its firmware here; it is created on first download
+// rather than by New, so macOS installs never grow an empty bin directory.
+func (s *Store) BinDir() string {
+	return filepath.Join(s.baseDir, "bin")
+}
+
+// NetworkStateDir returns the directory holding the Linux backend's per-network
+// write-ahead records and ip_forward marker (~/.fleetbox/networks). It lets a
+// crashed cluster's bridges/taps/iptables rules be reclaimed on the next up or
+// via prune (ADR-0013); it is created on first network create, so macOS installs
+// never grow it.
+func (s *Store) NetworkStateDir() string {
+	return filepath.Join(s.baseDir, "networks")
 }
 
 // SSHKeyPath returns the path to the SSH private key.

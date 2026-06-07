@@ -2,10 +2,9 @@ package image
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -118,45 +117,20 @@ func TestCopyDiskPassthrough(t *testing.T) {
 	}
 }
 
-func TestVerifyChecksum(t *testing.T) {
-	content := []byte("checksum me")
-	sum := sha256.Sum256(content)
-	digest := hex.EncodeToString(sum[:])
-	path := writeTemp(t, "blob.raw", content)
-
-	if err := verifyChecksum(path, digest); err != nil {
-		t.Errorf("verifyChecksum(correct) = %v, want nil", err)
-	}
-
-	// Case-insensitive: an uppercase expected digest still matches.
-	if err := verifyChecksum(path, strings.ToUpper(digest)); err != nil {
-		t.Errorf("verifyChecksum(uppercase) = %v, want nil", err)
-	}
-
-	wrong := strings.Repeat("0", len(digest))
-	if err := verifyChecksum(path, wrong); err == nil {
-		t.Error("verifyChecksum(wrong) = nil, want error")
-	} else if !strings.Contains(err.Error(), "checksum mismatch") {
-		t.Errorf("error %q does not name the mismatch cause", err)
-	}
-
-	if err := verifyChecksum(filepath.Join(t.TempDir(), "missing"), digest); err == nil {
-		t.Error("verifyChecksum(missing file) = nil, want error")
-	}
-}
-
 // TestEnsureCacheHit pins the cache short-circuit and the URL -> raw-filename
-// derivation, with no network. Note the derivation appends ".raw"
-// unconditionally after stripping .qcow2/.img: debian's URL already ends in
-// .raw, so its cached name is the double-".raw.raw" below — a quirk this test
-// documents. ubuntu's .img URL derives cleanly to a single .raw.
+// derivation, with no network. The derivation appends ".raw" unconditionally
+// after stripping .qcow2/.img: debian's URL already ends in .raw, so its cached
+// name is the double-".raw.raw" below — a quirk this test documents. ubuntu's
+// .img URL derives cleanly to a single .raw. The arch token tracks GOARCH so the
+// alias resolves to the right per-arch image.
 func TestEnsureCacheHit(t *testing.T) {
+	arch := runtime.GOARCH
 	cases := []struct {
 		alias       string
 		wantRawName string
 	}{
-		{"debian-12", "debian-12-generic-arm64.raw.raw"},
-		{"ubuntu-24.04", "ubuntu-24.04-server-cloudimg-arm64.raw"},
+		{"debian-12", "debian-12-generic-" + arch + ".raw.raw"},
+		{"ubuntu-24.04", "ubuntu-24.04-server-cloudimg-" + arch + ".raw"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.alias, func(t *testing.T) {

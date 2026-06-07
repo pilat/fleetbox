@@ -17,6 +17,10 @@ type Config struct {
 	MemoryBytes uint64
 	SerialOut   io.Writer
 	Mounts      []Mount
+	// AssignedIP is the static IPv4 address the VM is configured with via its
+	// seed (Linux/cloud-hypervisor backend). Backends that discover the IP from
+	// DHCP (vz) leave it empty and find the address themselves in WaitForIP.
+	AssignedIP string
 }
 
 // Mount is a host directory shared into the guest via virtiofs. HostPath is the
@@ -41,6 +45,13 @@ type Network interface {
 	// GC once every VM referencing it is unreferenced, in which case Close is
 	// a no-op.
 	Close() error
+
+	// Subnet returns the network's IPv4 CIDR (e.g. "192.168.5.0/24") when the
+	// backend assigns static addresses from a known range (Linux). It returns
+	// the empty string for backends whose guests obtain addresses via DHCP
+	// (vz), which is the signal the orchestrator uses to skip static IP
+	// allocation and emit no cloud-init network-config.
+	Subnet() string
 }
 
 // VM represents a running virtual machine.
@@ -56,6 +67,13 @@ type VM interface {
 
 	// Wait blocks until the VM stops.
 	Wait(ctx context.Context) error
+
+	// WaitForIP blocks until the VM's IPv4 address is known and TCP port 22 on
+	// it is reachable, then returns the address. It honors ctx cancellation and
+	// any deadline on ctx. vz discovers the address from dhcpd_leases by
+	// hostname; cloud-hypervisor returns the statically assigned address after
+	// the reachability probe.
+	WaitForIP(ctx context.Context) (string, error)
 }
 
 // State represents the VM's current state.
@@ -110,4 +128,18 @@ type Backend interface {
 
 	// NestedVirtSupported returns true if nested virtualization is available.
 	NestedVirtSupported() bool
+
+	// SupportsClustering reports whether this backend can run more than one VM
+	// on a single shared network so the members reach each other. It is false
+	// only on macOS releases older than 26, where VZ NAT isolates VMs from one
+	// another; the public layer checks it before booting a second member and
+	// rejects the request with a clear error.
+	SupportsClustering() bool
+
+	// Reconcile reclaims host resources left by a holder that crashed before it
+	// could tear its network down — orphaned bridges, taps, and firewall rules.
+	// Backends that own no such host state (vz: vmnet manages its own) return
+	// nil. It backs `fleetbox prune`; backends may also run it implicitly on
+	// network create so orphans self-heal (ADR-0013).
+	Reconcile() error
 }

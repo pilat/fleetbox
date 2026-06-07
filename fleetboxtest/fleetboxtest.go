@@ -1,5 +1,3 @@
-//go:build darwin && arm64
-
 // Package fleetboxtest provides testing.T integration for fleetbox VMs.
 //
 // VMs created with Start or StartN are automatically destroyed when the test completes.
@@ -84,12 +82,14 @@ func StartN(t testing.TB, prefix string, n int, opts ...fleetbox.Option) []*flee
 	return vms
 }
 
-// skipIfUnsupported skips the test if running on unsupported platform.
+// skipIfUnsupported skips the test if running on an unsupported platform. The
+// fixtures currently target darwin/arm64; Linux (cloud-hypervisor) fixtures are
+// a follow-up, so non-darwin/arm64 hosts skip rather than attempt a boot.
 func skipIfUnsupported(t testing.TB) {
 	t.Helper()
 
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
-		t.Skip("fleetbox requires darwin/arm64")
+		t.Skip("fleetboxtest currently supports darwin/arm64 only (Linux fixtures are a follow-up)")
 	}
 
 	if !fleetbox.NestedVirtSupported() {

@@ -7,8 +7,8 @@ import (
 	"github.com/pilat/fleetbox/internal/backend/vz"
 )
 
-func newBackend() backend.Backend {
-	return vz.New()
+func newBackend() (backend.Backend, error) {
+	return vz.New(), nil
 }
 
 func nestedVirtSupported() bool {

@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -33,16 +34,25 @@ import (
 const (
 	runnerFlag = "--fleetbox-runner"
 
-	// Runner states reported over the status socket.
-	stateStarting = "starting"
-	stateRunning  = "running"
-	stateStopped  = "stopped"
-	stateError    = "error"
+	// Runner states reported over the status socket. stateDownloading is the
+	// one-time pull of the image + VMM binaries that precedes booting; it is
+	// reported separately so the CLI's readiness wait does not charge that
+	// (potentially multi-GB) download against the per-boot budget (ADR-0013).
+	stateDownloading = "downloading"
+	stateStarting    = "starting"
+	stateRunning     = "running"
+	stateStopped     = "stopped"
+	stateError       = "error"
 
 	// failedClusterLinger is how long a holder keeps serving error status after
 	// a failed initial boot, so the spawning CLI can read the error before the
 	// process tears down. The CLI polls every 500ms, so this is generous.
 	failedClusterLinger = 30 * time.Second
+
+	// maxDownloadWait bounds the stateDownloading phase: while a member is
+	// pulling, waitForMembers keeps the boot deadline ahead of it, but a stuck
+	// download must still fail rather than hang the CLI forever.
+	maxDownloadWait = 30 * time.Minute
 )
 
 // Status represents the state of a VM member.
@@ -150,11 +160,14 @@ func waitForMembers(st *store.Store, names []string, timeout time.Duration) (map
 	result := make(map[string]*Status, len(names))
 	pending := append([]string(nil), names...)
 
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) && len(pending) > 0 {
+	bootDeadline := time.Now().Add(timeout)
+	hardDeadline := time.Now().Add(maxDownloadWait)
+	announcedPull := false
+	for len(pending) > 0 {
 		time.Sleep(500 * time.Millisecond)
 
 		var still []string
+		downloading := false
 		for _, name := range pending {
 			status, err := GetStatus(st, name)
 			if err != nil {
@@ -168,9 +181,31 @@ func waitForMembers(st *store.Store, names []string, timeout time.Duration) (map
 				result[name] = status
 				continue
 			}
+			if status.State == stateDownloading {
+				downloading = true
+			}
 			still = append(still, name)
 		}
 		pending = still
+
+		now := time.Now()
+		if now.After(hardDeadline) {
+			break
+		}
+		// The one-time image/binary pull must not consume the per-boot budget:
+		// while any member is still downloading, keep the boot deadline ahead of
+		// it. hardDeadline still bounds a stuck download (ADR-0013).
+		if downloading {
+			if !announcedPull {
+				fmt.Fprintln(os.Stderr, "Pulling image and VMM binaries (first run, this can take a few minutes)...")
+				announcedPull = true
+			}
+			bootDeadline = now.Add(timeout)
+			continue
+		}
+		if now.After(bootDeadline) {
+			break
+		}
 	}
 
 	if len(pending) > 0 {
@@ -200,7 +235,7 @@ func (m *member) status() Status {
 	return Status{
 		Name:    m.name,
 		PID:     os.Getpid(),
-		Running: m.state == stateRunning || m.state == stateStarting,
+		Running: m.state == stateRunning || m.state == stateStarting || m.state == stateDownloading,
 		IP:      m.ip,
 		State:   m.state,
 		Error:   m.err,
@@ -221,6 +256,13 @@ type holder struct {
 
 // Run is the holder's main loop.
 func Run() error {
+	// Pin this goroutine to its OS thread for the holder's lifetime. Every VM is
+	// booted from here (bootMember runs synchronously below), and each VM's child
+	// process carries a PR_SET_PDEATHSIG so it dies if its parent thread dies. A
+	// stable, long-lived parent thread makes that signal fire only when the holder
+	// actually exits, not when Go happens to retire the launching thread (ADR-0013).
+	runtime.LockOSThread()
+
 	names := GetRunnerVMNames()
 	if len(names) == 0 {
 		return errors.New("no VM names provided")
@@ -238,6 +280,18 @@ func Run() error {
 
 	h := &holder{st: st, members: make(map[string]*member), done: make(chan struct{})}
 
+	// On any exit — clean shutdown, signal, or panic — release the cluster's
+	// shared network so a Linux bridge and its egress rules don't leak. Runs
+	// after stopAll (deferred LIFO), so members are down first. No-op on macOS.
+	defer func() {
+		h.mu.Lock()
+		c := h.cluster
+		h.mu.Unlock()
+		if c != nil {
+			_ = c.Close()
+		}
+	}()
+
 	// Register every member as "starting" and start serving its socket BEFORE
 	// booting, so the spawning CLI sees status the moment it polls.
 	for _, name := range names {
@@ -246,7 +300,14 @@ func Run() error {
 		}
 	}
 
-	// Create the shared network once (no VMs yet), then boot each member onto it.
+	// NewCluster performs the one-time, cluster-wide pull of the image and VMM
+	// binaries before any VM exists. Mark members "downloading" around it so the
+	// CLI's readiness wait does not charge that (potentially multi-GB) download
+	// against the per-boot budget (ADR-0013); flip back to "starting" once the
+	// pull is done and the per-VM boot begins.
+	for _, name := range names {
+		h.setState(name, stateDownloading)
+	}
 	ctx := context.Background()
 	cluster, err := fleetbox.NewCluster(opts...)
 	if err != nil {
@@ -258,6 +319,9 @@ func Run() error {
 		h.mu.Lock()
 		h.cluster = cluster
 		h.mu.Unlock()
+		for _, name := range names {
+			h.setState(name, stateStarting)
+		}
 		for _, name := range names {
 			h.bootMember(ctx, name)
 		}
@@ -409,12 +473,26 @@ func (h *holder) markRunning(m *member, vm *fleetbox.VM) {
 	m.mu.Unlock()
 }
 
+// setState transitions a member between two "active" states (the
+// downloading->starting flip around the cluster-wide pull). Unlike
+// markRunning/markError/markStopped it does not touch the running counter, since
+// both downloading and starting already count as active.
+func (h *holder) setState(name, state string) {
+	m := h.memberByName(name)
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.state = state
+	m.mu.Unlock()
+}
+
 func (h *holder) markError(m *member, err error) {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
-	wasActive := m.state == stateStarting || m.state == stateRunning
+	wasActive := m.state == stateStarting || m.state == stateRunning || m.state == stateDownloading
 	m.state = stateError
 	m.err = err.Error()
 	m.mu.Unlock()
@@ -425,7 +503,7 @@ func (h *holder) markError(m *member, err error) {
 
 func (h *holder) markStopped(m *member) {
 	m.mu.Lock()
-	wasActive := m.state == stateStarting || m.state == stateRunning
+	wasActive := m.state == stateStarting || m.state == stateRunning || m.state == stateDownloading
 	m.state = stateStopped
 	m.mu.Unlock()
 	if wasActive {
@@ -551,45 +629,47 @@ func IsRunning(st *store.Store, name string) bool {
 	return proc.Signal(syscall.Signal(0)) == nil
 }
 
-// GetStatus returns the status of a member via its holder socket.
+// GetStatus returns the status of a member. A live holder is authoritative — even
+// for a member still downloading or booting, whose config.json does not exist yet
+// (it is written during boot) — so the holder socket is consulted first. Only
+// when no holder serves the name do we fall back to on-disk state: stopped if the
+// VM exists, otherwise an error that it is absent.
 func GetStatus(st *store.Store, name string) (*Status, error) {
+	if IsRunning(st, name) {
+		sockPath := st.SocketPath(name)
+		conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("connect to runner: %w", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		_, _ = conn.Write([]byte("status"))
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			return nil, fmt.Errorf("read status: %w", err)
+		}
+
+		var status Status
+		if err := json.Unmarshal(buf[:n], &status); err != nil {
+			return nil, fmt.Errorf("parse status: %w", err)
+		}
+		return &status, nil
+	}
+
 	if !st.Exists(name) {
 		return nil, fmt.Errorf("VM %q does not exist", name)
 	}
-
-	if !IsRunning(st, name) {
-		cfg, err := st.Load(name)
-		if err != nil {
-			return nil, fmt.Errorf("load vm config: %w", err)
-		}
-		return &Status{
-			Name:  cfg.Name,
-			State: stateStopped,
-		}, nil
-	}
-
-	sockPath := st.SocketPath(name)
-	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
+	cfg, err := st.Load(name)
 	if err != nil {
-		return nil, fmt.Errorf("connect to runner: %w", err)
+		return nil, fmt.Errorf("load vm config: %w", err)
 	}
-	defer func() { _ = conn.Close() }()
-
-	_, _ = conn.Write([]byte("status"))
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-
-	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, fmt.Errorf("read status: %w", err)
-	}
-
-	var status Status
-	if err := json.Unmarshal(buf[:n], &status); err != nil {
-		return nil, fmt.Errorf("parse status: %w", err)
-	}
-
-	return &status, nil
+	return &Status{
+		Name:  cfg.Name,
+		State: stateStopped,
+	}, nil
 }
 
 // Stop gracefully shuts down a single member (the holder keeps running for its

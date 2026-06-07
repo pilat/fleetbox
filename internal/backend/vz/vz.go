@@ -15,12 +15,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Code-Hex/vz/v3"
 	"github.com/Code-Hex/vz/v3/vmnet"
 
 	"github.com/pilat/fleetbox/internal/backend"
+	"github.com/pilat/fleetbox/internal/dhcp"
 )
 
 // reservedSubnets records every /24 handed out by detectFreeIPv4Subnet in this
@@ -38,11 +40,17 @@ var (
 )
 
 // Backend implements the VZ backend.
-type Backend struct{}
+type Backend struct {
+	// macOSMajor is the host's major macOS version (e.g. 26), detected once in
+	// New. It selects the network path: 26+ uses vmnet SharedMode (VM↔VM); older
+	// releases fall back to VZ NAT (single, isolated VM — ADR-0012).
+	macOSMajor int
+}
 
-// New creates a new VZ backend.
+// New creates a new VZ backend, detecting the host macOS version so the network
+// path (SharedMode vs NAT) and clustering capability are fixed for its lifetime.
 func New() *Backend {
-	return &Backend{}
+	return &Backend{macOSMajor: detectMacOSMajor()}
 }
 
 // NestedVirtSupported returns true if nested virtualization is available.
@@ -50,12 +58,53 @@ func (b *Backend) NestedVirtSupported() bool {
 	return vz.IsNestedVirtualizationSupported()
 }
 
-// CreateNetwork creates a vmnet SharedMode logical network. Every VM attached
-// to it reaches the host, the internet (via NAT44), and the other VMs on the
-// same network — VM↔VM connectivity that VZ NAT did not provide (ADR-0008).
-// It requires macOS 26 or newer; on older releases the underlying vmnet API
-// returns an error, wrapped here as the single canonical message.
+// SupportsClustering reports whether VM↔VM connectivity is available. It is
+// true on macOS 26+ (vmnet SharedMode) and false on older releases, where VZ
+// NAT isolates VMs from one another (ADR-0008, ADR-0012).
+func (b *Backend) SupportsClustering() bool {
+	return b.macOSMajor >= 26
+}
+
+// Reconcile is a no-op on macOS: vmnet owns the host network state, so there are
+// no fleetbox-created bridges, taps, or firewall rules to reclaim after a crash
+// (ADR-0013).
+func (b *Backend) Reconcile() error {
+	return nil
+}
+
+// detectMacOSMajor returns the host's major macOS version from
+// kern.osproductversion. On a sysctl error it returns 0, which conservatively
+// selects the NAT, single-VM path.
+func detectMacOSMajor() int {
+	ver, err := syscall.Sysctl("kern.osproductversion")
+	if err != nil {
+		return 0
+	}
+	return parseMacOSMajor(ver)
+}
+
+// parseMacOSMajor extracts the leading integer of a macOS version string
+// (e.g. "26.4.1" → 26). It returns 0 for an unparseable string.
+func parseMacOSMajor(ver string) int {
+	major, _, _ := strings.Cut(ver, ".")
+	n, err := strconv.Atoi(major)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// CreateNetwork creates the logical network VMs attach to. On macOS 26+ it is a
+// vmnet SharedMode network: every VM on it reaches the host, the internet (via
+// NAT44), and the other VMs — VM↔VM connectivity VZ NAT lacked (ADR-0008). On
+// older releases there is no shared network object; CreateNetwork returns a
+// no-op holder and the per-VM NAT attachment is applied in Create instead, which
+// gives a single, isolated VM (ADR-0012).
 func (b *Backend) CreateNetwork() (backend.Network, error) {
+	if b.macOSMajor < 26 {
+		return &vzNetwork{}, nil
+	}
+
 	cfg, err := vmnet.NewNetworkConfiguration(vmnet.SharedMode)
 	if err != nil {
 		return nil, fmt.Errorf("create vmnet configuration (fleetbox networking requires macOS 26+): %w", err)
@@ -89,6 +138,13 @@ type vzNetwork struct {
 // R3). It exists for explicit whole-cluster teardown / Phase 2.
 func (n *vzNetwork) Close() error {
 	return nil
+}
+
+// Subnet returns the empty string: vmnet SharedMode hands out addresses via
+// bootpd (DHCP), so the orchestrator allocates no static IP and emits no
+// cloud-init network-config for vz VMs (ADR-0007).
+func (n *vzNetwork) Subnet() string {
+	return ""
 }
 
 // detectFreeIPv4Subnet returns a /24 inside 192.168.0.0/16 that overlaps no
@@ -271,17 +327,19 @@ func (b *Backend) Create(cfg backend.Config, nw backend.Network) (backend.VM, er
 		vmConfig.SetDirectorySharingDevicesVirtualMachineConfiguration(fsDevices)
 	}
 
-	// Network: attach to the shared vmnet SharedMode logical network (ADR-0008).
+	// Network: vmnet SharedMode on macOS 26+ (ADR-0008), VZ NAT on older
+	// releases (ADR-0012). The attachment differs; everything downstream
+	// (MAC, config) is identical.
 	vzNet, ok := nw.(*vzNetwork)
 	if !ok {
 		return nil, fmt.Errorf("network is not a vz network: %T", nw)
 	}
 	vm.network = vzNet // retain for the VM's lifetime so GC keeps the network (R3)
-	vmnetAttachment, err := vz.NewVmnetNetworkDeviceAttachment(vzNet.network)
+	attachment, err := b.networkAttachment(vzNet)
 	if err != nil {
-		return nil, fmt.Errorf("create vmnet attachment: %w", err)
+		return nil, err
 	}
-	netConfig, err := vz.NewVirtioNetworkDeviceConfiguration(vmnetAttachment)
+	netConfig, err := vz.NewVirtioNetworkDeviceConfiguration(attachment)
 	if err != nil {
 		return nil, fmt.Errorf("create net config: %w", err)
 	}
@@ -316,6 +374,26 @@ func (b *Backend) Create(cfg backend.Config, nw backend.Network) (backend.VM, er
 
 	vm.vm = vzVM
 	return vm, nil
+}
+
+// networkAttachment builds the NIC attachment for the active macOS version:
+// vmnet SharedMode on 26+ (the shared network on nw, giving VM↔VM — ADR-0008),
+// or VZ NAT on older releases (a single, isolated VM — ADR-0012). On the NAT
+// path nw is the no-op holder and its network field is nil.
+func (b *Backend) networkAttachment(nw *vzNetwork) (vz.NetworkDeviceAttachment, error) {
+	if b.macOSMajor < 26 {
+		nat, err := vz.NewNATNetworkDeviceAttachment()
+		if err != nil {
+			return nil, fmt.Errorf("create nat attachment: %w", err)
+		}
+		return nat, nil
+	}
+
+	att, err := vz.NewVmnetNetworkDeviceAttachment(nw.network)
+	if err != nil {
+		return nil, fmt.Errorf("create vmnet attachment: %w", err)
+	}
+	return att, nil
 }
 
 func validateConfig(cfg backend.Config) error {
@@ -469,6 +547,40 @@ func (v *VM) Wait(ctx context.Context) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// WaitForIP discovers the VM's IPv4 address by looking up its hostname in
+// /var/db/dhcpd_leases (ADR-0007) and returns it once TCP port 22 is reachable.
+// It polls until ctx is cancelled or its deadline passes, mirroring the combined
+// IP-discovery + reachability wait that previously lived in the root package.
+func (v *VM) WaitForIP(ctx context.Context) (string, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
+		ipStr, err := dhcp.LookupByHostname(v.name)
+		if err == nil && ipStr != "" {
+			if ip := net.ParseIP(ipStr); ip != nil && reachableSSH(ip.String()) {
+				return ipStr, nil
+			}
+		}
+
+		time.Sleep(time.Second)
+	}
+}
+
+// reachableSSH reports whether TCP port 22 on ip accepts a connection within a
+// short timeout. It is the readiness signal that the guest's network is up.
+func reachableSSH(ip string) bool {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "22"), 2*time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 func parseMACBytes(mac string) ([]byte, error) {

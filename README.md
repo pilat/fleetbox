@@ -1,15 +1,16 @@
 # fleetbox
 
-**Real Linux VMs as Go test fixtures on macOS.**
+**Real Linux VMs as Go test fixtures — on macOS and Linux.**
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/pilat/fleetbox.svg)](https://pkg.go.dev/github.com/pilat/fleetbox)
-![Platform](https://img.shields.io/badge/platform-macOS%20arm64-black)
+![Platform](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20linux%20amd64%2Farm64-black)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-fleetbox boots stock Linux cloud images on Apple Silicon through Apple's
-Virtualization.framework, hands them to your tests over SSH, and tears them down when the
-test ends. Think testcontainers — except instead of a container you get a whole machine:
-real kernel, real systemd, real `/dev/kvm`.
+fleetbox boots stock Linux cloud images — on macOS (Apple Silicon) through Apple's
+Virtualization.framework, on Linux through cloud-hypervisor — hands them to your tests
+over SSH, and tears them down when the test ends. Think testcontainers — except instead
+of a container you get a whole machine: real kernel, real systemd, real `/dev/kvm`. The
+Go API is the same on both platforms.
 
 ```go
 func TestAgainstRealLinux(t *testing.T) {
@@ -57,12 +58,17 @@ and sane defaults.
 
 ## Requirements
 
-- **macOS 26** (Tahoe) or newer — networking uses vmnet SharedMode, which is macOS 26+
-- **Apple Silicon**, M3 or newer — nested virtualization (`/dev/kvm` in the guest) needs it
-- **Go 1.24+**
+One of:
 
-Intel Macs and Linux hosts aren't supported; the module is build-tagged `darwin && arm64`
-and won't compile elsewhere.
+- **macOS, Apple Silicon** — clusters (VM↔VM) need macOS 26+ (vmnet SharedMode); macOS
+  below 26 runs a single VM via VZ NAT. Nested virtualization (`/dev/kvm` in the guest)
+  needs M3 or newer. Intel Macs are not supported.
+- **Linux, amd64 or arm64** — needs `/dev/kvm` (be in the `kvm` group) and `CAP_NET_ADMIN`
+  (to create the bridge and taps). The cloud-hypervisor binary and firmware are downloaded
+  and checksum-pinned to `~/.fleetbox/bin/` on first use.
+
+Plus **Go 1.24+**. The module compiles on `darwin/arm64` and `linux/{amd64,arm64}`; other
+targets build but return a clear "unsupported platform" error.
 
 ## Install
 
@@ -196,8 +202,9 @@ make build                                   # compiles + signs ./bin/fleetbox
 ./bin/fleetbox rm node                        # destroy the whole cluster (prefix match)
 ```
 
-A cluster runs in one holder process sharing one vmnet network, so its VMs reach each
-other by IP; `down`/`ssh`/`rm` still address each member by name.
+A cluster runs in one holder process sharing one network (a vmnet network on macOS, a
+Linux bridge on Linux), so its VMs reach each other by IP; `down`/`ssh`/`rm` still address
+each member by name.
 
 ## Images
 
@@ -205,8 +212,8 @@ Use a built-in alias or any direct URL to a raw / qcow2 cloud image:
 
 | Alias | Image |
 |-------|-------|
-| `debian-12` *(default)* | Debian 12 generic cloud, arm64 |
-| `ubuntu-24.04` | Ubuntu 24.04 server cloud, arm64 |
+| `debian-12` *(default)* | Debian 12 generic cloud (amd64/arm64, per host) |
+| `ubuntu-24.04` | Ubuntu 24.04 server cloud (amd64/arm64, per host) |
 
 ```go
 fleetboxtest.Start(t, fleetbox.Debian12)
@@ -220,10 +227,12 @@ paths.
 ## How it works
 
 `Start` runs a short, boring pipeline: ensure the SSH key → download and cache the image →
-generate a cloud-init seed ISO → boot via EFI on a vmnet SharedMode NIC → find the VM's IP
-in `/var/db/dhcpd_leases` by hostname → wait for SSH. No daemon: in library mode the test
-process owns its VMs; the CLI re-execs a tiny holder process per `up` group (a single VM,
-or a whole cluster sharing one network) so they outlive the command.
+generate a cloud-init seed ISO → boot the VM (macOS: EFI on a vmnet SharedMode NIC; Linux:
+cloud-hypervisor with a tap on a shared bridge) → get the VM's IP (macOS: from
+`/var/db/dhcpd_leases` by hostname; Linux: the statically assigned address) → wait for SSH.
+No daemon: in library mode the test process owns its VMs; the CLI re-execs a tiny holder
+process per `up` group (a single VM, or a whole cluster sharing one network) so they
+outlive the command.
 
 For the full picture, read [ARCHITECTURE.md](ARCHITECTURE.md); for *why* it's built this
 way, the decision log lives in [docs/adr/](docs/adr/).
@@ -233,16 +242,20 @@ way, the decision log lives in [docs/adr/](docs/adr/).
 Both the library (`StartN`) and the CLI (`up -n N`) boot interconnected clusters whose
 VMs reach each other by IP. Mind the sharp edges:
 
-- **Mounts are read-write and frozen at creation.** `WithMount` / `--mount` gives a live
-  shared folder, but a read-only variant isn't exposed yet, and you can't add or change a
-  VM's mounts after it's created — `rm` and recreate. There's still no programmatic file
-  copy in the library for the cases a mount doesn't fit (the CLI has `cp` over scp).
+- **Mounts are macOS-only, read-write, and frozen at creation.** `WithMount` / `--mount`
+  gives a live shared folder on macOS (virtiofs); the Linux backend rejects mounts for now
+  (virtio-fs is a follow-up). A read-only variant isn't exposed yet, and you can't add or
+  change a VM's mounts after it's created — `rm` and recreate. The CLI has `cp` over scp.
 - **A CLI cluster shares one holder process.** All members of a cluster live in one process
-  to share one vmnet network, so a holder crash takes the whole cluster down (a single VM is
-  unaffected). Members started by separate `up` commands have separate networks and can't be
-  merged into one cluster afterwards — bring a cluster up together.
-- **macOS 26+ and Apple Silicon M3+ only.** Networking needs macOS 26 (vmnet SharedMode);
-  nested virtualization needs M3+. Older macOS, older chips, and Intel Macs are out of scope.
+  to share one network, so a holder crash takes the whole cluster down (a single VM is
+  unaffected); on Linux a SIGKILL'd holder also leaves its bridge/taps behind. Members
+  started by separate `up` commands have separate networks and can't be merged into one
+  cluster afterwards — bring a cluster up together.
+- **Platform matrix.** macOS Apple Silicon 26+ (clusters), macOS Apple Silicon <26 (single
+  VM only), Linux amd64/arm64 (clusters); Intel macOS unsupported. On Linux, a stopped VM
+  brought back up needs its `/24` to still be free — on a contended host the auto-picked
+  subnet can shift and the rebooted VM won't be reachable; bring clusters up fresh. arm64
+  Linux boot via rust-hypervisor-firmware is not yet validated on hardware.
 - **v0 API.** Expect breaking changes until it stabilizes.
 
 CI note: GitHub-hosted macOS runners can't nest virtualization, so VM-boot tests run

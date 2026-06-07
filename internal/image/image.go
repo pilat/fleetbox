@@ -2,33 +2,42 @@
 package image
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/lima-vm/go-qcow2reader"
+
+	"github.com/pilat/fleetbox/internal/fetch"
 )
 
-// Catalog maps image aliases to their URLs and optional SHA256 checksums.
+// Catalog maps image aliases to a per-GOARCH URL and an optional SHA256. The
+// arch tokens in the URLs (amd64/arm64) match Go's GOARCH, so the same alias
+// resolves to the right image on macOS Apple Silicon and on Linux amd64/arm64.
 var Catalog = map[string]ImageInfo{
 	"debian-12": {
-		URL:    "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.raw",
+		URLs: map[string]string{
+			"amd64": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.raw",
+			"arm64": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.raw",
+		},
 		SHA256: "", // Skip verification for latest
 	},
 	"ubuntu-24.04": {
-		URL:    "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img",
+		URLs: map[string]string{
+			"amd64": "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img",
+			"arm64": "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img",
+		},
 		SHA256: "",
 	},
 }
 
-// ImageInfo describes a cloud image.
+// ImageInfo describes a cloud image: a URL per GOARCH and an optional SHA256
+// (empty means "latest, unverified").
 type ImageInfo struct {
-	URL    string
+	URLs   map[string]string
 	SHA256 string
 }
 
@@ -36,13 +45,21 @@ type ImageInfo struct {
 // If the image is already cached and verified, returns immediately.
 // If url is a known alias (e.g., "debian-12"), uses the catalog.
 func Ensure(cacheDir, urlOrAlias string) (string, error) {
-	info, ok := Catalog[urlOrAlias]
-	if !ok {
-		info = ImageInfo{URL: urlOrAlias}
+	// Resolve an alias to the URL for the current architecture; a non-alias is
+	// treated as a literal URL (unverified).
+	url := urlOrAlias
+	sha := ""
+	if info, ok := Catalog[urlOrAlias]; ok {
+		archURL, ok := info.URLs[runtime.GOARCH]
+		if !ok {
+			return "", fmt.Errorf("image %q has no URL for %s", urlOrAlias, runtime.GOARCH)
+		}
+		url = archURL
+		sha = info.SHA256
 	}
 
 	// Determine filename and format from URL
-	urlParts := strings.Split(info.URL, "/")
+	urlParts := strings.Split(url, "/")
 	filename := urlParts[len(urlParts)-1]
 	isQcow2 := strings.HasSuffix(filename, ".qcow2") || strings.HasSuffix(filename, ".img")
 
@@ -57,79 +74,29 @@ func Ensure(cacheDir, urlOrAlias string) (string, error) {
 		return rawPath, nil
 	}
 
-	// Download to temp file
-	downloadPath := rawPath + ".download"
-	if err := download(info.URL, downloadPath); err != nil {
-		return "", fmt.Errorf("download: %w", err)
+	// A raw source needs no conversion: fetch it (verified) straight to its raw
+	// cache name and we are done.
+	if !isQcow2 {
+		path, err := fetch.Ensure(cacheDir, rawFilename, url, sha)
+		if err != nil {
+			return "", fmt.Errorf("fetch image: %w", err)
+		}
+		return path, nil
 	}
 
-	// Verify checksum if provided
-	if info.SHA256 != "" {
-		if err := verifyChecksum(downloadPath, info.SHA256); err != nil {
-			_ = os.Remove(downloadPath)
-			return "", fmt.Errorf("verify checksum: %w", err)
-		}
+	// A qcow2/img source is fetched (verified) under its own name, converted to
+	// raw, then removed so only the raw image stays cached.
+	srcPath, err := fetch.Ensure(cacheDir, filename, url, sha)
+	if err != nil {
+		return "", fmt.Errorf("fetch image: %w", err)
 	}
-
-	// Convert if needed
-	if isQcow2 {
-		if err := convertQcow2ToRaw(downloadPath, rawPath); err != nil {
-			_ = os.Remove(downloadPath)
-			return "", fmt.Errorf("convert qcow2: %w", err)
-		}
-		_ = os.Remove(downloadPath)
-	} else {
-		if err := os.Rename(downloadPath, rawPath); err != nil {
-			_ = os.Remove(downloadPath)
-			return "", fmt.Errorf("rename: %w", err)
-		}
+	if err := convertQcow2ToRaw(srcPath, rawPath); err != nil {
+		_ = os.Remove(rawPath)
+		return "", fmt.Errorf("convert qcow2: %w", err)
 	}
+	_ = os.Remove(srcPath)
 
 	return rawPath, nil
-}
-
-func download(url, destPath string) error {
-	resp, err := http.Get(url)
-	if err != nil {
-		return fmt.Errorf("http get: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %s", resp.Status)
-	}
-
-	f, err := os.Create(destPath)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", destPath, err)
-	}
-	defer func() { _ = f.Close() }()
-
-	if _, err := io.Copy(f, resp.Body); err != nil {
-		return fmt.Errorf("write %s: %w", destPath, err)
-	}
-
-	return nil
-}
-
-func verifyChecksum(path, expected string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", path, err)
-	}
-	defer func() { _ = f.Close() }()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return fmt.Errorf("hash %s: %w", path, err)
-	}
-
-	actual := hex.EncodeToString(h.Sum(nil))
-	if !strings.EqualFold(actual, expected) {
-		return fmt.Errorf("checksum mismatch: got %s, want %s", actual, expected)
-	}
-
-	return nil
 }
 
 func convertQcow2ToRaw(qcow2Path, rawPath string) error {

@@ -1,5 +1,3 @@
-//go:build darwin && arm64
-
 package main
 
 import (
@@ -67,7 +65,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Println(`fleetbox - Linux VMs as test fixtures on macOS
+	fmt.Println(`fleetbox - Linux VMs as test fixtures (macOS Apple Silicon + Linux)
 
 Usage:
   fleetbox up [name...] [-n N] [--cpus N] [--mem GB] [--disk GB] [--image alias|URL] [--mount host:guest]
@@ -325,6 +323,14 @@ func cmdDown(args []string) error {
 
 	if len(names) == 0 {
 		return errors.New("no VMs specified")
+	}
+
+	// Sweep up anything a crashed holder left behind (orphaned bridges, taps,
+	// firewall rules) before stopping — cleanup is automatic on down as well as
+	// up, never the user's job (ADR-0013). Best-effort: a failure must not block
+	// the shutdown the user asked for.
+	if err := fleetbox.Prune(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cleanup of orphaned resources failed: %v\n", err)
 	}
 
 	for _, name := range names {

@@ -3,10 +3,13 @@
 # Default target
 all: build
 
-# Build the CLI
+# Build the CLI. On macOS the binary needs the virtualization entitlement
+# (ad-hoc codesign); on Linux there is nothing to sign, so codesign is skipped.
 build:
 	go build -o bin/fleetbox ./cmd/fleetbox
-	codesign --entitlements entitlements.plist --force -s - bin/fleetbox
+	@if [ "$$(uname)" = "Darwin" ]; then \
+		codesign --entitlements entitlements.plist --force -s - bin/fleetbox; \
+	fi
 
 # Run unit tests (no VMs, works on any machine).
 # -short skips VM-boot tests (they call fleetboxtest.SkipIfShort), so this stays

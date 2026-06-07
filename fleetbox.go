@@ -1,9 +1,9 @@
-//go:build darwin && arm64
-
-// Package fleetbox provides Linux VMs as Go test fixtures on macOS (Apple Silicon).
+// Package fleetbox provides Linux VMs as Go test fixtures.
 //
-// Fleetbox boots stock Linux cloud images via Apple Virtualization.framework,
-// configures them with cloud-init, and provides SSH access for testing.
+// On macOS (Apple Silicon) fleetbox boots stock Linux cloud images via Apple
+// Virtualization.framework; on Linux it boots them via cloud-hypervisor. Either
+// way it configures the guest once with cloud-init and provides SSH access for
+// testing, through the same backend-neutral Go API.
 //
 // Basic usage:
 //
@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -28,7 +29,6 @@ import (
 	"time"
 
 	"github.com/pilat/fleetbox/internal/backend"
-	"github.com/pilat/fleetbox/internal/dhcp"
 	"github.com/pilat/fleetbox/internal/image"
 	"github.com/pilat/fleetbox/internal/seed"
 	"github.com/pilat/fleetbox/internal/sshkey"
@@ -49,6 +49,11 @@ const (
 	Ubuntu2404 = "ubuntu-24.04"
 )
 
+// ErrClustersUnsupported is returned when a second cluster member is requested
+// on a backend that cannot interconnect VMs — macOS older than 26, where VZ NAT
+// isolates VMs from one another (ADR-0008, ADR-0012). A single VM still works.
+var ErrClustersUnsupported = errors.New("fleetbox: clusters require macOS 26+")
+
 // VM represents a running virtual machine.
 type VM struct {
 	name      string
@@ -59,6 +64,10 @@ type VM struct {
 	network   backend.Network
 	config    *store.VM
 	serialLog *os.File
+	// ownsNetwork is true only for a VM created by a bare Start (its network has
+	// a single member), so Destroy may release the network. Cluster members share
+	// a network and leave it false — the Cluster owns its teardown (Cluster.Close).
+	ownsNetwork bool
 }
 
 // startDeps holds the once-per-call handles shared by every VM in a Start or
@@ -73,12 +82,12 @@ type startDeps struct {
 	backend   backend.Backend
 }
 
-// Cluster is a set of VMs sharing one vmnet SharedMode network, so every member
-// reaches the others by IP (ADR-0008). The shared network is an in-process
-// object tied to the Cluster's lifetime — it is never persisted, so a Cluster is
-// a runtime handle, not on-disk state. Members can be added after creation,
-// which is what lets a CLI holder process grow a live cluster without recreating
-// its network.
+// Cluster is a set of VMs sharing one network, so every member reaches the
+// others by IP — a vmnet SharedMode network on macOS, a Linux bridge on Linux
+// (ADR-0008, ADR-0011). The shared network is a runtime object tied to the
+// Cluster's lifetime — never persisted, so a Cluster is a runtime handle, not
+// on-disk state. Members can be added after creation, which is what lets a CLI
+// holder process grow a live cluster without recreating its network.
 type Cluster struct {
 	mu      sync.Mutex
 	deps    *startDeps
@@ -97,15 +106,24 @@ type Options struct {
 
 // Mount is a host↔guest shared directory. The host directory appears live and
 // read-write inside the guest at GuestPath; edits on either side are visible on
-// the other immediately (Apple Virtualization.framework virtiofs). Mounts are a
-// property the VM is born with: they are set at first creation, persisted, and
-// re-applied on every boot. Changing a VM's mounts means recreating it (rm + up).
+// the other immediately (virtiofs). Mounts are a property the VM is born with:
+// they are set at first creation, persisted, and re-applied on every boot.
+// Changing a VM's mounts means recreating it (rm + up). Mounts are currently
+// supported on macOS only; the Linux backend rejects them (ADR-0011).
 type Mount struct {
-	// HostPath is the directory on the macOS host to share. It must exist at
-	// creation time and is resolved to an absolute path before persistence.
+	// HostPath is the host directory to share. It must exist at creation time and
+	// is resolved to an absolute path before persistence.
 	HostPath string
 	// GuestPath is the absolute path inside the guest where HostPath appears.
 	GuestPath string
+}
+
+// ipAssignment is a static address allocated from a backend network's subnet:
+// the host IP plus the gateway and netmask the guest needs to configure its NIC.
+type ipAssignment struct {
+	ip      string
+	gateway string
+	netmask string
 }
 
 // Option is a functional option for configuring a VM.
@@ -151,15 +169,21 @@ func Start(ctx context.Context, name string, opts ...Option) (*VM, error) {
 		return nil, err
 	}
 
-	// One vmnet SharedMode network for this VM. A single Start yields a
-	// one-member network; the macOS-26 requirement surfaces here, propagated
-	// from the backend (ADR-0008).
+	// One network for this VM. A single Start yields a one-member network; the
+	// macOS-26 requirement surfaces here, propagated from the backend (ADR-0008).
 	nw, err := deps.backend.CreateNetwork()
 	if err != nil {
 		return nil, fmt.Errorf("create network: %w", err)
 	}
 
-	return startOnNetwork(ctx, name, nw, deps)
+	vm, err := startOnNetwork(ctx, name, nw, deps)
+	if err != nil {
+		_ = nw.Close() // sole owner failed to boot: release the network it made
+		return nil, err
+	}
+	// A bare Start owns its one-member network, so Destroy may release it.
+	vm.ownsNetwork = true
+	return vm, nil
 }
 
 // resolveStartDeps performs the once-per-call setup shared by every VM in a
@@ -193,13 +217,18 @@ func resolveStartDeps(opts ...Option) (*startDeps, error) {
 		return nil, fmt.Errorf("ensure image: %w", err)
 	}
 
+	b, err := newBackend()
+	if err != nil {
+		return nil, err
+	}
+
 	return &startDeps{
 		options:   options,
 		store:     st,
 		sshMgr:    sshMgr,
 		pubKey:    pubKey,
 		imagePath: imagePath,
-		backend:   newBackend(),
+		backend:   b,
 	}, nil
 }
 
@@ -241,6 +270,26 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 			CreatedAt: time.Now(),
 			Mounts:    mounts,
 		}
+
+		// On a backend that assigns static addresses (Linux), allocate this VM's
+		// IP from the network's subnet now, before the seed is written, and
+		// persist it so reboots and re-joining cluster members keep it. A
+		// DHCP backend (vz) reports an empty subnet and skips this entirely.
+		var netCfg *seed.NetworkConfig
+		if subnet := nw.Subnet(); subnet != "" {
+			assignment, err := allocateIP(st, subnet)
+			if err != nil {
+				return nil, fmt.Errorf("allocate ip: %w", err)
+			}
+			vmConfig.IP = assignment.ip
+			netCfg = &seed.NetworkConfig{
+				MAC:     vmConfig.MAC,
+				IP:      assignment.ip,
+				Gateway: assignment.gateway,
+				Netmask: assignment.netmask,
+			}
+		}
+
 		if err := st.Create(vmConfig); err != nil {
 			return nil, fmt.Errorf("create vm store: %w", err)
 		}
@@ -254,12 +303,14 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 
 		// Create seed ISO. With mounts, cloud-init also writes the fstab entries
 		// (so they survive reboots without a re-run) and pins the guest user's
-		// uid to the host uid so virtiofs identity pass-through lines up.
+		// uid to the host uid so virtiofs identity pass-through lines up. On Linux
+		// it also carries the static network-config allocated above.
 		seedPath := st.SeedPath(name)
 		seedCfg := seed.Config{
 			Hostname: name,
 			User:     defaultUser,
 			SSHKey:   deps.pubKey,
+			Network:  netCfg,
 		}
 		if len(mounts) > 0 {
 			seedCfg.Mounts = toSeedMounts(mounts)
@@ -289,6 +340,9 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 		// Re-attach the virtiofs devices from the persisted config, so both a
 		// freshly created and a rebooted VM get identical mounts (ADR-0010).
 		Mounts: toBackendMounts(vmConfig.Mounts),
+		// The persisted static IP (empty on the DHCP/vz path); the Linux backend
+		// returns it from WaitForIP after a reachability probe.
+		AssignedIP: vmConfig.IP,
 	}
 	backendVM, err := deps.backend.Create(backendCfg, nw)
 	if err != nil {
@@ -298,6 +352,7 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 
 	// Boot the VM
 	if err := backendVM.Start(ctx); err != nil {
+		_ = backendVM.Stop(ctx) // release any tap/process a partial boot left behind
 		_ = serialLog.Close()
 		return nil, fmt.Errorf("start vm: %w", err)
 	}
@@ -312,12 +367,23 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 		serialLog: serialLog,
 	}
 
-	// Wait for IP
-	ip, err := vm.waitForIP(ctx, 2*time.Minute)
+	// Wait for IP. Discovery is the backend's job (vz parses dhcpd_leases by
+	// hostname; cloud-hypervisor returns the static IP it assigned) — the only
+	// platform coupling that used to live here. Scope the 2-minute budget to the
+	// wait so a slow boot does not consume the caller's whole context.
+	ipCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	ipStr, err := backendVM.WaitForIP(ipCtx)
+	cancel()
 	if err != nil {
 		_ = backendVM.Stop(ctx)
 		_ = serialLog.Close()
 		return nil, fmt.Errorf("wait for ip: %w", err)
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		_ = backendVM.Stop(ctx)
+		_ = serialLog.Close()
+		return nil, fmt.Errorf("backend returned invalid IP %q", ipStr)
 	}
 	vm.ip = ip
 
@@ -388,6 +454,55 @@ func toSeedMounts(mounts []store.Mount) []seed.Mount {
 	return out
 }
 
+// allocateIP picks the lowest free host address in subnet for a new VM. The
+// gateway (.1), network, and broadcast addresses are reserved, as are the IPs
+// already persisted to other VMs' configs in the same subnet — so members of a
+// cluster get distinct, stable addresses without any cluster-level state. It is
+// only called on backends that assign static IPs (Linux); vz reports no subnet.
+func allocateIP(st *store.Store, subnetCIDR string) (ipAssignment, error) {
+	prefix, err := netip.ParsePrefix(subnetCIDR)
+	if err != nil {
+		return ipAssignment{}, fmt.Errorf("parse subnet %q: %w", subnetCIDR, err)
+	}
+	prefix = prefix.Masked()
+
+	gateway := prefix.Addr().Next() // .1
+	broadcast := lastAddr(prefix)
+
+	taken := map[netip.Addr]bool{gateway: true}
+	names, err := st.List()
+	if err != nil {
+		return ipAssignment{}, fmt.Errorf("list vms: %w", err)
+	}
+	for _, n := range names {
+		cfg, err := st.Load(n)
+		if err != nil || cfg.IP == "" {
+			continue
+		}
+		if a, err := netip.ParseAddr(cfg.IP); err == nil && prefix.Contains(a) {
+			taken[a] = true
+		}
+	}
+
+	netmask := net.IP(net.CIDRMask(prefix.Bits(), 32)).String()
+	for candidate := gateway.Next(); prefix.Contains(candidate) && candidate != broadcast; candidate = candidate.Next() {
+		if !taken[candidate] {
+			return ipAssignment{ip: candidate.String(), gateway: gateway.String(), netmask: netmask}, nil
+		}
+	}
+
+	return ipAssignment{}, fmt.Errorf("no free IP in subnet %s", subnetCIDR)
+}
+
+// lastAddr returns the broadcast (all host bits set) address of an IPv4 prefix.
+func lastAddr(p netip.Prefix) netip.Addr {
+	bytes := p.Addr().As4()
+	for i := p.Bits(); i < 32; i++ {
+		bytes[i/8] |= 1 << (7 - uint(i%8))
+	}
+	return netip.AddrFrom4(bytes)
+}
+
 // Name returns the VM name.
 func (v *VM) Name() string {
 	return v.name
@@ -437,6 +552,13 @@ func (v *VM) Destroy(ctx context.Context) error {
 		v.serialLog = nil
 	}
 
+	// Release the network only for a sole-owner VM; a cluster member's network is
+	// shared and torn down by Cluster.Close (R3). No-op on macOS.
+	if v.ownsNetwork && v.network != nil {
+		_ = v.network.Close()
+		v.network = nil
+	}
+
 	if err := v.store.Delete(v.name); err != nil {
 		return fmt.Errorf("delete vm files: %w", err)
 	}
@@ -449,38 +571,6 @@ func (v *VM) State() string {
 	return v.backend.State().String()
 }
 
-func (v *VM) waitForIP(ctx context.Context, timeout time.Duration) (net.IP, error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		ipStr, err := dhcp.LookupByHostname(v.name)
-		if err == nil && ipStr != "" {
-			if ip := net.ParseIP(ipStr); ip != nil {
-				if isReachable(ip) {
-					return ip, nil
-				}
-			}
-		}
-
-		time.Sleep(time.Second)
-	}
-	return nil, errors.New("timeout waiting for IP")
-}
-
-func isReachable(ip net.IP) bool {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip.String(), "22"), 2*time.Second)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
-}
-
 func (v *VM) waitForSSH(ctx context.Context, timeout time.Duration) error {
 	addr := net.JoinHostPort(v.ip.String(), "22")
 	if err := v.sshMgr.WaitForSSH(addr, defaultUser, timeout); err != nil {
@@ -491,8 +581,8 @@ func (v *VM) waitForSSH(ctx context.Context, timeout time.Duration) error {
 }
 
 // StartN creates and boots N VMs with the given prefix (prefix-1, prefix-2, ...).
-// All N VMs share ONE vmnet SharedMode network, so they reach each other by IP —
-// the cluster is interconnected (ADR-0008). It is a thin wrapper over
+// All N VMs share ONE network, so they reach each other by IP — the cluster is
+// interconnected (ADR-0008 macOS, ADR-0011 Linux). It is a thin wrapper over
 // StartCluster with generated names.
 func StartN(ctx context.Context, prefix string, n int, opts ...Option) ([]*VM, error) {
 	names := make([]string, n)
@@ -506,10 +596,10 @@ func StartN(ctx context.Context, prefix string, n int, opts ...Option) ([]*VM, e
 	return c.VMs(), nil
 }
 
-// NewCluster creates a cluster's shared vmnet network but boots no VMs. Use Add
-// to bring members up on it. Shared setup (store, SSH key, image, backend) runs
-// once here and is reused for every Add. The macOS-26 requirement surfaces here,
-// propagated from the backend (ADR-0008).
+// NewCluster creates a cluster's shared network but boots no VMs. Use Add to
+// bring members up on it. Shared setup (store, SSH key, image, backend) runs once
+// here and is reused for every Add. A platform that cannot interconnect VMs
+// (macOS < 26) surfaces its limit when a second member is added, not here.
 func NewCluster(opts ...Option) (*Cluster, error) {
 	deps, err := resolveStartDeps(opts...)
 	if err != nil {
@@ -534,15 +624,42 @@ func StartCluster(ctx context.Context, names []string, opts ...Option) (*Cluster
 		return nil, err
 	}
 
+	// Reject a multi-member cluster up front on a backend that can't interconnect
+	// VMs, before booting anything (ADR-0012). A single-member StartCluster is a
+	// VM, not a cluster, so it is allowed.
+	if len(names) > 1 && !c.deps.backend.SupportsClustering() {
+		_ = c.Close()
+		return nil, ErrClustersUnsupported
+	}
+
 	for _, name := range names {
 		if _, err := c.Add(ctx, name); err != nil {
 			for _, vm := range c.VMs() {
 				_ = vm.Destroy(ctx)
 			}
+			_ = c.Close()
 			return nil, fmt.Errorf("start %s: %w", name, err)
 		}
 	}
 	return c, nil
+}
+
+// Close releases the cluster's shared network. Call it once every member has been
+// stopped or destroyed — on Linux it tears down the bridge and egress rules; on
+// macOS it is a no-op (the vmnet network is released by GC). It is idempotent.
+func (c *Cluster) Close() error {
+	c.mu.Lock()
+	nw := c.network
+	c.network = nil
+	c.mu.Unlock()
+
+	if nw == nil {
+		return nil
+	}
+	if err := nw.Close(); err != nil {
+		return fmt.Errorf("close cluster network: %w", err)
+	}
+	return nil
 }
 
 // Add boots an additional VM on the cluster's shared network and registers it as
@@ -550,6 +667,16 @@ func StartCluster(ctx context.Context, names []string, opts ...Option) (*Cluster
 // cluster is what lets a CLI holder re-join a previously stopped node without
 // recreating the network.
 func (c *Cluster) Add(ctx context.Context, name string) (*VM, error) {
+	// Adding a second member to a cluster that can't interconnect VMs is the same
+	// rejection as StartCluster's, but it also covers a node re-joining a live
+	// cluster (ADR-0012). The first member is a lone VM and is always allowed.
+	c.mu.Lock()
+	existing := len(c.vms)
+	c.mu.Unlock()
+	if existing >= 1 && !c.deps.backend.SupportsClustering() {
+		return nil, ErrClustersUnsupported
+	}
+
 	vm, err := startOnNetwork(ctx, name, c.network, c.deps)
 	if err != nil {
 		return nil, err
@@ -569,8 +696,30 @@ func (c *Cluster) VMs() []*VM {
 	return slices.Clone(c.vms)
 }
 
-// NestedVirtSupported returns true if nested virtualization is available.
-// Requires M3+ and macOS 15+.
+// NestedVirtSupported returns true if nested virtualization is available — what
+// consumers that run KVM inside guests need. On macOS it requires M3+; on Linux
+// it requires /dev/kvm and the KVM nested parameter enabled.
 func NestedVirtSupported() bool {
 	return nestedVirtSupported()
+}
+
+// Prune reclaims the inert host resources a fleetbox holder leaves behind if it
+// dies without running its teardown — on Linux, orphaned bridges, taps, and
+// firewall rules, plus restoring ip_forward once nothing of ours remains. The VMs
+// themselves do not leak: each is started with a parent-death signal, so a dying
+// holder takes its VMs with it (ADR-0013). Prune only touches networks whose
+// owning process is gone, never a live cluster's, so it is always safe to call;
+// on macOS it is a no-op (vmnet owns its state). It runs automatically — on every
+// Start/StartN (via the backend's network create) and on the CLI's down — so
+// cleanup is never the user's job; this exported form is for library callers that
+// want to sweep explicitly.
+func Prune() error {
+	b, err := newBackend()
+	if err != nil {
+		return err
+	}
+	if err := b.Reconcile(); err != nil {
+		return fmt.Errorf("prune: %w", err)
+	}
+	return nil
 }
