@@ -16,11 +16,6 @@ import (
 	"github.com/pilat/fleetbox/internal/backend"
 )
 
-// ErrMountsUnsupported is returned by Create for a VM that requests folder
-// mounts: virtio-fs on Linux needs an external virtiofsd, deferred past v1
-// (ADR-0011).
-var ErrMountsUnsupported = errors.New("fleetbox: mounts not yet supported on the Linux backend")
-
 var (
 	_ backend.Backend = (*Backend)(nil)
 	_ backend.Network = (*chNetwork)(nil)
@@ -71,12 +66,8 @@ func (b *Backend) Reconcile() error {
 
 // Create builds (but does not boot) a cloud-hypervisor VM attached to nw: it
 // ensures the pinned binaries, checks /dev/kvm, and creates a tap enslaved to
-// the cluster bridge. Boot happens in VM.Start. Folder mounts are rejected
-// (ErrMountsUnsupported) until virtio-fs lands.
+// the cluster bridge. Boot happens in VM.Start.
 func (b *Backend) Create(cfg backend.Config, nw backend.Network) (backend.VM, error) {
-	if len(cfg.Mounts) > 0 {
-		return nil, ErrMountsUnsupported
-	}
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}

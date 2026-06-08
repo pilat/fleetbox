@@ -5,7 +5,8 @@ go 1.24.0
 require (
 	github.com/Code-Hex/vz/v3 v3.7.1
 	github.com/lima-vm/go-qcow2reader v0.7.1
-	github.com/pilat/cloudiso v0.0.0-20260419041849-ea20c7e62292
+	github.com/pilat/cloudiso v0.1.0
+	github.com/pilat/go-ext4fs v1.0.0
 	golang.org/x/crypto v0.46.0
 )
 

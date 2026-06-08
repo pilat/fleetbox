@@ -39,13 +39,13 @@ CLI is a wrapper (see ADR-0001).
 
 | Term | Meaning |
 |------|---------|
-| **VM** | One virtual machine: a directory under `~/.fleetbox/vms/<name>/` plus, when running, a backend VM object (a VZ machine, or a cloud-hypervisor child process) inside some process. |
+| **VM** | One virtual machine: a member directory under `~/.fleetbox/clusters/<cluster>/<member>/` plus, when running, a backend VM object (a VZ machine, or a cloud-hypervisor child process) inside some process. |
 | **Backend** | The hypervisor abstraction (`internal/backend.Backend`). Exactly one implementation per platform, selected at compile time: VZ on darwin/arm64, cloud-hypervisor on linux/{amd64,arm64}. |
 | **Image** | A stock cloud distro image (raw or qcow2), downloaded once and cached in `~/.fleetbox/images/`. Never modified. |
 | **Seed ISO** | A cloud-init NoCloud ISO generated per VM. The only thing fleetbox ever "puts inside" a guest, and it is read by the guest's own cloud-init. |
 | **Runner / Holder** | A re-exec'd `fleetbox` process that holds an `up` group (one VM or a whole cluster) alive in CLI mode, exposing status/stop/addmember over per-member unix sockets. Does not exist in library mode. |
 | **Store** | The `~/.fleetbox/` directory layout and its `config.json` files. The only persistent state fleetbox has. |
-| **Cluster** | VMs sharing one vmnet network, named by convention (`prefix-1`, `prefix-2`, ...). The `fleetbox.Cluster` type is an in-process runtime handle; no cluster state is *persisted* anywhere (see §4.2). |
+| **Cluster** | VMs sharing one network, named by convention (`prefix-1`, `prefix-2`, ...). The `fleetbox.Cluster` type is an in-process runtime handle for membership/health. The cluster is *also* a storage grouping — members nest under `~/.fleetbox/clusters/<cluster>/` (the cluster name derived from the member name) — but there is no cluster *object* with persisted membership; disk grouping and runtime grouping need not be 1:1 (ADR-0014, see §4.2). |
 
 ## §3. Source-of-Truth Map
 
@@ -61,7 +61,8 @@ Where the canonical version of each thing lives. When two files disagree, the So
 | Image catalog | `internal/image/image.go` `Catalog` map | Alias → per-GOARCH URL + sha256. |
 | Pinned VMM binaries | `internal/backend/cloudhypervisor/binaries.go` | cloud-hypervisor + firmware: version + per-arch URL + sha256. |
 | Network teardown records & reconcile | `internal/backend/cloudhypervisor/netstate.go` | Write-ahead bridge/tap records + `ip_forward` marker under `~/.fleetbox/networks/`; crash recovery (ADR-0013). |
-| Guest provisioning contract | `internal/seed/seed.go` (user-data / meta-data) | One user, one SSH key, hostname. Nothing else. |
+| Guest provisioning contract | `internal/seed/seed.go` (user-data / meta-data) | One user, one SSH key, hostname, fixture mount lines. Nothing else. |
+| Fixture payload format | `internal/fixture/fixture.go` | Host dir → read-only ext4 image (go-ext4fs), attached read-only, mounted by LABEL (ADR-0015). |
 | Code style rules | `docs/coding-style.md` + `.golangci.yml` | Prescriptive. Lint enforces the machine-checkable subset. |
 | Architecture (current state) | `ARCHITECTURE.md` (this file) | Descriptive. |
 | Design decisions & rationale | `docs/adr/` | One file per decision, sequentially numbered. |
@@ -78,7 +79,7 @@ creating/booting a VM. Both the CLI runner and fleetboxtest go through it. The s
 
 1. **Options** — apply functional options over defaults (image=debian-12, cpus=2,
    mem=4GB, disk=20GB).
-2. **Store** — `store.New()` ensures `~/.fleetbox/{vms,images}/` exist.
+2. **Store** — `store.New()` ensures `~/.fleetbox/{clusters,images}/` exist.
 3. **SSH key** — `sshkey.EnsureKey()` generates the per-installation ed25519 keypair on
    first use (`~/.fleetbox/id_ed25519[.pub]`).
 4. **Image** — `image.Ensure()` returns a cached raw image, downloading / verifying /
@@ -86,16 +87,18 @@ creating/booting a VM. Both the CLI runner and fleetboxtest go through it. The s
 5. **VM config** — if `store.Exists(name)`: load `config.json` and boot from it
    (**all options are ignored for an existing VM** — the stored config wins; the image
    option only affects the shared image cache). Otherwise: create the config (stable
-   MAC derived from name via `backend.GenerateMAC`; any `WithMount` shares validated,
-   absolutized, and tagged `fbm<i>` here), copy the cached image to `disk.raw` (sparse,
+   MAC derived from name via `backend.GenerateMAC`; any `WithFixture` payloads validated,
+   absolutized, and labeled `FBFIX<i>` here), copy the cached image to `disk.raw` (sparse,
    truncated to requested size), and generate `seed.iso` via `seed.Create` (with the
-   mounts' fstab entries and host-uid alignment when the VM has mounts — ADR-0010).
+   fixtures' `LABEL=` fstab entries when the VM has fixtures — ADR-0015).
    On a backend that assigns static addresses (Linux), a free IP is allocated from the
    network's subnet here (`allocateIP`, scanning persisted configs so members get
    distinct, stable addresses), persisted as `config.json`'s `ip`, and injected into
    the seed as a NoCloud `network-config`; the DHCP backend (vz) reports no subnet and
-   skips this. On every boot, new or existing, the virtiofs devices are re-attached
-   from the persisted config.
+   skips this. On **every** boot, new or existing, each fixture's read-only ext4 image is
+   rebuilt from its persisted host dir (`internal/fixture`, no cache) and re-attached as a
+   read-only block device — the set is frozen at create, the content refreshed per boot
+   (ADR-0015).
 6. **Network & boot** — `newBackend()` (per-platform, §4.5) is called once in
    `resolveStartDeps`. `CreateNetwork()` makes the shared network (vmnet SharedMode on
    macOS 26+, a Linux bridge on Linux; a single `Start` gets a one-member network, a
@@ -121,22 +124,30 @@ All persistent state lives under `~/.fleetbox/` and is owned by `internal/store`
 
 ```
 ~/.fleetbox/
-├── vms/<name>/
-│   ├── config.json        # store.VM: name, MAC, cpus, memory, disk, image, created_at, mounts[], ip (Linux)
+├── clusters/<cluster>/<member>/   # <cluster> = member name with a trailing -<N> stripped; solo VM = cluster of one
+│   ├── config.json        # store.VM: name, MAC, cpus, memory, disk, image, created_at, fixtures[], ip (Linux)
 │   ├── disk.raw           # the VM's root disk (sparse file)
 │   ├── seed.iso           # cloud-init NoCloud seed (generated once at create)
+│   ├── fixture-<i>.img    # read-only ext4 fixture payload, one per WithFixture, rebuilt each boot (ADR-0015)
 │   ├── efi.nvram          # EFI variable store (VZ backend only)
 │   ├── ch.sock            # cloud-hypervisor REST api socket (Linux, while running)
 │   ├── serial.log         # serial console capture (debugging)
+│   ├── pid                # holder pidfile, one per member (CLI mode only)
+│   ├── sock               # holder unix control socket, one per member (CLI mode only)
 │   └── .lock              # flock target for TryLock
 ├── images/                # downloaded + converted raw cloud images (cache)
 ├── bin/                   # downloaded, checksum-pinned cloud-hypervisor + firmware (Linux)
 ├── networks/              # Linux: per-bridge write-ahead records (<bridge>.json) + ipforward.orig marker (ADR-0013)
 ├── id_ed25519, id_ed25519.pub   # per-installation SSH keypair
-├── pid-<name>             # holder pidfile, one per member (CLI mode only)
-├── sock-<name>            # holder unix socket, one per member (CLI mode only)
 └── runner-<name>.log      # holder process output, named after the first member (CLI mode only)
 ```
+
+The cluster segment is **derived** from the member name (strip a single trailing
+`-<digits>`), never stored: `web-3 → web`, `dev → dev`, `node-2024 → node`. A solo VM is
+a cluster of one (`clusters/dev/dev/`); a `-n N` cluster groups under one cluster dir
+(`clusters/web/{web-1,web-2,web-3}/`). The derivation must be computable from the member
+name alone because the member directory has to exist before `config.json` is written into
+it (ADR-0014).
 
 The VM model is **cattle with persistence**, a deliberate midpoint between two
 opposing styles:
@@ -153,13 +164,18 @@ return it), `down` exists for graceful shutdown that preserves the disk, and the
 survives host reboots and runner death. `rm`/`Destroy` is the only thing that deletes
 data — there is no GC, no TTL; explicit destruction is a feature, not an omission.
 
-There is no database, no global state file, and **no persisted cluster entity** —
-clusters are a naming convention (`prefix-N`). The in-process `fleetbox.Cluster` (and
-the CLI holder that shares one network across a cluster's VMs) is a runtime handle only:
-it lives in memory, dies with the process, and writes nothing about "the cluster" to
-disk (ADR-0009). The harness's job is N named VMs sharing a network, nothing more —
-membership beyond that is what the software under test does. `ls ~/.fleetbox/vms/` is
-the entire "database."
+There is no database and no global state file. The cluster is a **storage grouping** —
+members nest under `clusters/<cluster>/` so a cluster's state (and, later, a shared
+cluster-level artifact) has one home — but it is **not a persisted entity**: there is no
+cluster object with stored membership, the cluster name is *derived* from the member name
+rather than recorded, and disk grouping need not match runtime grouping (a heterogeneous
+`up a b c` makes three single-member cluster dirs yet one shared network — ADR-0014). The
+in-process `fleetbox.Cluster` (and the CLI holder that shares one network across a
+cluster's VMs) remains a runtime handle for membership/health only: it lives in memory,
+dies with the process, and writes nothing about "the cluster" beyond the directory tree
+(ADR-0009, ADR-0014). The harness's job is N named VMs sharing a network, nothing more —
+membership beyond that is what the software under test does. `ls ~/.fleetbox/clusters/*/`
+is the entire "database."
 
 ### §4.3 Networking model
 
@@ -185,8 +201,9 @@ single NIC. How that is realized differs by backend.
 - **One network per `up`/Start group.** A single `Start` creates a one-member network;
   a `StartN`/`StartCluster` cluster — and, in CLI mode, a holder process (§4.4) —
   shares one network across all members, so the cluster is interconnected. The network
-  is a runtime object tied to VM lifetime — never persisted, so clusters remain a
-  naming convention with no state (§4.2). Concurrent networks get distinct `/24`s in
+  is a runtime object tied to VM lifetime — never persisted; the cluster's only on-disk
+  trace is the `clusters/<cluster>/` storage grouping, not a network or membership record
+  (§4.2). Concurrent networks get distinct `/24`s in
   `192.168.0.0/16` from a host-aware subnet detector (one per backend), and separate
   networks are isolated.
 - **IP discovery is behind the backend** (`backend.VM.WaitForIP`). vz finds VMs by
@@ -210,7 +227,8 @@ cluster — via one `fleetbox.Cluster` (one shared network: a vmnet network on m
 the Linux bridge and the cloud-hypervisor child processes booted onto it — ADR-0009,
 ADR-0011). It:
 
-1. for each member, writes `pid-<name>` and listens on `sock-<name>`;
+1. for each member, ensures its directory exists, writes its `pid` file and listens on
+   its `sock` (both inside `clusters/<cluster>/<member>/`);
 2. creates the cluster's shared network once, then boots each member onto it
    (`Cluster.Add`);
 3. answers `status` / `stop` / `addmember <name>` per member socket (JSON-encoded
@@ -320,10 +338,10 @@ When a PR changes any of these fields for a package, update its section.
     for library callers that want to sweep explicitly (ADR-0013)
   - `type VM`: `Name()`, `IP() net.IP`, `SSH(ctx, cmd) (string, error)`, `Stop(ctx)`,
     `Destroy(ctx)`, `State() string`
-  - `type Options{Image, CPUs, MemGB, DiskGB, Mounts}`, `type Option func(*Options)`,
-    `WithImage`, `WithCPUs`, `WithMemoryGB`, `WithDiskGB`, `WithMount(host, guest)`
-  - `type Mount{HostPath, GuestPath}` — a live read-write host↔guest virtiofs share
-    (ADR-0010)
+  - `type Options{Image, CPUs, MemGB, DiskGB, Fixtures}`, `type Option func(*Options)`,
+    `WithImage`, `WithCPUs`, `WithMemoryGB`, `WithDiskGB`, `WithFixture(hostDir, guestPath)`
+  - `type Fixture{HostPath, GuestPath}` — a read-only host directory packed into the guest
+    at boot as an ext4 payload (ADR-0015)
   - image aliases: `Debian12`, `Ubuntu2404`
 - Invariants:
   - No hypervisor (vz/CH) types in any exported signature — the API is backend-neutral
@@ -341,13 +359,15 @@ When a PR changes any of these fields for a package, update its section.
     releases its one-member network; cluster members share a network and leave it to
     `Cluster.Close` (R3). A no-op for vmnet (GC), the explicit teardown for the Linux
     bridge.
-  - **Mounts are frozen at birth** (ADR-0010): `WithMount` shares are validated,
-    absolutized, and tagged (`fbm<i>`) once at first create, persisted in `config.json`,
-    and re-attached on every later boot from the store (host virtiofs device) and
-    `/etc/fstab` (guest, written once by cloud-init). Changing a VM's mounts means
-    `rm` + recreate — they are ignored when passed to an existing VM, like cpu/mem/disk.
-    A VM with ≥1 mount also gets its guest login user pinned to the host uid so virtiofs
-    identity pass-through lines up; mountless VMs are byte-for-byte unchanged.
+  - **The fixture set is frozen at birth, the content refreshed each boot** (ADR-0015):
+    `WithFixture` payloads are validated, absolutized, and labeled (`FBFIX<i>`) once at
+    first create and persisted in `config.json`; the guest's `LABEL=` fstab line is written
+    once by cloud-init. A different set passed to an existing VM is ignored (like
+    cpu/mem/disk) — changing it means `rm` + recreate. But because there is no cache, every
+    boot rebuilds each fixture's read-only ext4 image from its persisted host dir and
+    re-attaches it, so the guest sees the host dir as of that boot (never live within a
+    boot). Files arrive world-readable (`0444`/`0555`, uid 0); a VM with no fixtures is
+    byte-for-byte unchanged.
   - `Start` on an existing (stopped) VM boots it from its stored config; options are
     ignored for existing VMs. Note: `Start` does **not** detect an already-running VM
     — that guard currently lives in the CLI runner (`runner.Spawn` checks
@@ -386,10 +406,10 @@ When a PR changes any of these fields for a package, update its section.
     running in one holder → `addmember` the rest so a re-upped node re-joins the live
     network; running members split across processes → rejected (their networks can't
     merge). Flags and positional names may be interspersed (`up test1 -n 2` works).
-  - `up` accepts a repeatable `--mount host:guest` flag (a custom `flag.Value`); host
+  - `up` accepts a repeatable `--fixture host:guest` flag (a custom `flag.Value`); host
     paths are resolved to absolute against the CLI cwd before they cross into the holder
-    (split on the last colon), and flow to the library as `WithMount` (ADR-0010). In a
-    cluster every member gets the same mounts.
+    (split on the last colon), and flow to the library as `WithFixture` (ADR-0015). In a
+    cluster every member gets the same fixtures.
   - Cleanup is automatic, never a user command: `down` (like `up`) runs the backend
     reconcile via `fleetbox.Prune()` to reclaim resources a crashed holder left, so on
     Linux it too needs root for the `ip`/`iptables` calls (ADR-0013).
@@ -404,8 +424,9 @@ When a PR changes any of these fields for a package, update its section.
   SupportsClustering, Reconcile}`, `Network{Close, Subnet}` (opaque handle — no hypervisor types;
   `Subnet` returns the CIDR for static-IP backends, "" for DHCP backends),
   `VM{Start, Stop, State, Wait, WaitForIP}`, `Config{Name, DiskPath, SeedPath, EFIPath,
-  MAC, CPUs, MemoryBytes, SerialOut, Mounts, AssignedIP}`, `Mount{HostPath, Tag}`
-  (backend-neutral — no SDK types, no guest path), `State` enum + `String()`,
+  MAC, CPUs, MemoryBytes, SerialOut, FixturePaths, AssignedIP}` — `FixturePaths` are host
+  paths of pre-built read-only ext4 fixture images to attach (backend-neutral, no SDK
+  types, no guest path), `State` enum + `String()`,
   `GenerateMAC(name)`. `Create` takes the `Network` to attach the VM to.
 - Invariants:
   - Imports no hypervisor SDK — pure contract. `Network` is opaque: no `vmnet`/`vz`/CH
@@ -443,12 +464,12 @@ When a PR changes any of these fields for a package, update its section.
     no-op, GC reaps it — R3); **<26** → a no-op network holder plus a per-VM
     `VZNATNetworkDeviceAttachment`, a single isolated VM. `SupportsClustering` returns
     `major >= 26` (ADR-0008, ADR-0012).
-  - Folder mounts attach as one `VZVirtioFileSystemDeviceConfiguration` per
-    `cfg.Mounts` entry (a read-write `SingleDirectoryShare` tagged with the persisted
-    `fbm<i>`); the directory-sharing setter is skipped entirely when there are no mounts,
-    so a mountless VM's device set is unchanged (ADR-0010). `NewSharedDirectory` stats
-    the host path at attach time, so a mount whose host dir was deleted fails the next
-    boot here (guest-side `nofail` does not cover a missing host dir — ADR-0010).
+  - Fixture payloads attach as one read-only `VZVirtioBlockDeviceConfiguration` per
+    `cfg.FixturePaths` entry (a `NewDiskImageStorageDeviceAttachment(p, true)`), appended to
+    the disk + seed storage devices; the loop is a no-op when there are no fixtures, so a
+    fixtureless VM's device set is unchanged (ADR-0015). The guest mounts each by volume
+    `LABEL=`, so attachment order is irrelevant. The images are built — and rebuilt on every
+    boot — by `internal/fixture` before `Create` runs; VZ only attaches them.
   - EFI boot of stock images only — no kernel/initrd extraction (ADR-0003).
 
 ### §5.6 `internal/image`
@@ -471,8 +492,8 @@ When a PR changes any of these fields for a package, update its section.
 - Purpose: cloud-init NoCloud seed ISO generation.
 - Owns: stateless (writes one file per call).
 - Depends on: `github.com/pilat/cloudiso`.
-- Public API (internal): `Config{Hostname, User, SSHKey, Mounts, UID, Network}`,
-  `Mount{Tag, GuestPath}`, `NetworkConfig{MAC, IP, Gateway, Netmask}`,
+- Public API (internal): `Config{Hostname, User, SSHKey, Fixtures, Network}`,
+  `Fixture{Label, GuestPath}`, `NetworkConfig{MAC, IP, Gateway, Netmask}`,
   `Create(path, cfg)`.
 - Invariants:
   - The user-data stays minimal: one user, authorized key, passwordless sudo, hostname.
@@ -484,10 +505,11 @@ When a PR changes any of these fields for a package, update its section.
     (`1.1.1.1, 8.8.8.8`), not the gateway — the bridge gateway runs no resolver, so
     pointing the guest at it would break name resolution (ADR-0013).
   - User-data is built by string concatenation (`buildUserData`), no yaml/template
-    library. With no mounts and no `UID` the output is byte-identical to the original
-    template; a `mounts:` block (one `virtiofs`/`defaults,nofail` fstab line per share)
-    and a `uid:` line are emitted only when set (ADR-0010). The `mounts:` directive
-    writes `/etc/fstab`, so shares re-mount on every boot with no cloud-init re-run.
+    library. With no fixtures the output is byte-identical to the original template; a
+    `mounts:` block (one `[ LABEL=<label>, <guestPath>, ext4, "ro,nofail", "0", "0" ]` line
+    per fixture) is emitted only when fixtures are set (ADR-0015). The `mounts:` directive
+    writes `/etc/fstab`, so fixtures re-mount on every boot with no cloud-init re-run; the
+    label is stable, so the per-boot rebuilt image is always found.
 
 ### §5.8 `internal/store`
 
@@ -496,17 +518,28 @@ When a PR changes any of these fields for a package, update its section.
 - Owns: all on-disk state (§4.2).
 - Depends on: stdlib only.
 - Public API (internal): `Store` (`New`, `NewAt`, path methods incl. `BinDir`,
-  `NetworkStateDir`, `Exists/Create/Save/Load/Delete/List`, `TryLock`), `VM` config struct
-  (incl. `Mounts`, `IP`), `Mount{HostPath, GuestPath, Tag}`, `Lock.Unlock`.
+  `NetworkStateDir`, `FixturePath`, `EnsureDir`, `Exists/Create/Save/Load/Delete/List`,
+  `TryLock`), `VM` config struct (incl. `Fixtures`, `IP`),
+  `Fixture{HostPath, GuestPath, Label}`, `Lock.Unlock`.
 - Invariants:
   - Every path under `~/.fleetbox/` is produced by a `Store` method — no other package
     builds those paths by hand. `BinDir` (`~/.fleetbox/bin`) and `NetworkStateDir`
     (`~/.fleetbox/networks`, the Linux backend's write-ahead records — ADR-0013) are
     created on first use, not by `New`, so macOS installs grow neither.
+  - A VM's member directory is `clusters/<cluster>/<member>/`, with `<cluster>` derived
+    from the member name (`VMDir` → `clusterName`, never a stored field — ADR-0014). All
+    member-dir creation funnels through `EnsureDir` (called by both `Create` and the
+    holder's `register`). `List` walks the two-level tree and returns member names; every
+    name it returns round-trips back to the same dir through `VMDir`. `Delete` removes the
+    member dir, then `os.Remove`s the parent cluster dir (which refuses, harmlessly, while
+    siblings remain) — never `os.RemoveAll`.
   - `config.json` is human-readable (indented JSON).
-  - `VM.Mounts` is the persisted source of truth for a VM's virtiofs shares; each
-    carries its `fbm<i>` tag, computed once at create and never re-derived (ADR-0010).
-    `mounts` is omitted from `config.json` for a mountless VM.
+  - `VM.Fixtures` is the persisted source of truth for a VM's read-only payloads; each
+    carries its `FBFIX<i>` volume label, computed once at create and never re-derived — the
+    label is shared byte-for-byte between the image and the guest's `LABEL=` mount line
+    (ADR-0015). `FixturePath(name, i)` gives the per-member image path
+    (`…/<member>/fixture-<i>.img`). `fixtures` is omitted from `config.json` for a VM with
+    none.
   - `VM.IP` is the persisted static address for static-IP backends (Linux), assigned
     once at create so reboots and re-joining members keep it; omitted on macOS (DHCP).
 - Notes: `TryLock` (flock-based per-VM locking) is implemented and tested but **not
@@ -543,8 +576,9 @@ When a PR changes any of these fields for a package, update its section.
 - Purpose: the CLI-mode holder process — one process owns an `up` group (single VM or
   cluster) via one `fleetbox.Cluster`; re-exec, per-member pidfile, per-member
   unix-socket control (ADR-0006, ADR-0009).
-- Owns: holder process lifecycle, per-member `pid-<name>` / `sock-<name>` files and the
-  shared `runner-<first>.log`, the per-member listener + handler goroutines, the
+- Owns: holder process lifecycle, the per-member `pid` / `sock` files inside each
+  member dir and the shared `runner-<first>.log`, the per-member listener + handler
+  goroutines, the
   mutex-protected member registry (`holder`/`member`).
 - Depends on: `fleetbox` (public API), `internal/store`.
 - Public API (internal): `IsRunner`, `GetRunnerVMNames`, `Spawn` (takes a name list),
@@ -569,8 +603,8 @@ When a PR changes any of these fields for a package, update its section.
     via a deferred `Cluster.Close()` — a no-op on macOS, the Linux bridge/egress
     teardown on Linux (ADR-0011). It runs after `stopAll`, so members are down first.
   - CLI options survive the re-exec: `Spawn` serializes applied `Options` values into
-    `FLEETBOX_OPTS`; `Run` deserializes them. Mounts ride along as host+guest path
-    pairs (tags are assigned later at first-create, not serialized — ADR-0010).
+    `FLEETBOX_OPTS`; `Run` deserializes them. Fixtures ride along as host+guest path
+    pairs (labels are assigned later at first-create, not serialized — ADR-0015).
 
 ### §5.12 `internal/backend/cloudhypervisor`
 
@@ -583,15 +617,16 @@ When a PR changes any of these fields for a package, update its section.
   binary/firmware table; the process-wide reserved-subnet set. **Build-tagged `linux`.**
 - Depends on: `internal/backend`, `internal/fetch`, stdlib (`os/exec`, `net/http` over a
   unix socket). No cgo, no third-party module.
-- Public API (internal): `New(binDir, netDir) *Backend`; `ErrMountsUnsupported`;
-  `Backend` (incl. `Reconcile`), `VM`, `chNetwork` satisfy the backend interfaces
-  (`var _` checks present).
+- Public API (internal): `New(binDir, netDir) *Backend`; `Backend` (incl. `Reconcile`),
+  `VM`, `chNetwork` satisfy the backend interfaces (`var _` checks present).
 - Invariants:
   - **The only package that knows cloud-hypervisor specifics** (the CH analogue of the
     vz-isolation rule — ADR-0002, ADR-0011).
   - `NestedVirtSupported` probes `/dev/kvm` + the KVM `nested` parameter; `Create` opens
-    `/dev/kvm` and rejects non-empty `Mounts` with `ErrMountsUnsupported` (virtio-fs
-    deferred). `CreateNetwork`'s first `ip` call doubles as the `CAP_NET_ADMIN` probe.
+    `/dev/kvm`. Fixture images (`cfg.FixturePaths`) are appended as extra
+    `path=…,readonly=on` values on the single `--disk` flag, after the seed — the guest
+    mounts each by `LABEL`, so order is irrelevant (ADR-0015). `CreateNetwork`'s first `ip`
+    call doubles as the `CAP_NET_ADMIN` probe.
   - `CreateNetwork` makes one bridge per cluster on a free `/24` (gateway `.1`) and
     installs `iptables` MASQUERADE/FORWARD egress rules; `Create` adds a tap enslaved to
     the bridge. `Network.Close` removes taps, egress rules, and the bridge — real OS
@@ -631,6 +666,24 @@ When a PR changes any of these fields for a package, update its section.
     "building-block packages don't import each other" (coding-style B.1.2; recorded in
     ADR-0011). It imports nothing of ours.
 
+### §5.14 `internal/fixture`
+
+- Purpose: pack a host directory into a read-only ext4 image for attaching to a VM as a
+  block device — the host→guest fixture payload (ADR-0015).
+- Owns: stateless (writes one `.img` file per call).
+- Depends on: `github.com/pilat/go-ext4fs`, stdlib.
+- Public API (internal): `BuildImage(imgPath, srcDir, label string) error`.
+- Invariants:
+  - **The only package that imports `go-ext4fs`** — the seed ISO stays on cloudiso, so each
+    image library has exactly one import site (the fixture/seed split).
+  - Builds on a 16 GiB sparse canvas, then `Resize(MinSize())` to fit, so the on-disk image
+    is a few MiB for a typical fixture and the canvas never materializes; a payload > 16 GiB
+    is unsupported. No content-hash cache — the image is rebuilt on every boot (ADR-0015).
+  - Every entry is world-readable: files `0444`, dirs `0555`, uid/gid `0`; symlinks are
+    copied as symlinks; host permission/exec bits are not preserved. Arbitrary filenames
+    (255-byte, spaces, unicode) and nesting are supported — the reason ext4 was chosen over
+    ISO9660 (ADR-0015).
+
 ### Dependency graph
 
 ```
@@ -644,12 +697,12 @@ public API               fleetbox (root) ◄────────────
                               │   vz on darwin/arm64, cloudhypervisor on linux)
         ┌─────────────┬───────┼──────────┬────────┬────────┬───────┐
         ▼             ▼       ▼          ▼        ▼        ▼       ▼
-internal backend ◄─ backend/vz       image     seed   sshkey   dhcp
-            ▲    ◄─ backend/cloudhypervisor  │   │       │     (darwin)
-            │          │        │      │     │   │       │
-            │   Code-Hex/vz  (CH: stdlib  │   cloudiso  x/crypto/ssh
-            │   (darwin)      os/exec +   │
-            │                 net/http)   ▼
+internal backend ◄─ backend/vz     image   seed  fixture  sshkey   dhcp
+            ▲    ◄─ backend/cloudhypervisor │    │     │      │     (darwin)
+            │          │        │     │     │    │     │      │
+            │   Code-Hex/vz  (CH: stdlib │   cloudiso  │  x/crypto/ssh
+            │   (darwin)      os/exec +  │        go-ext4fs
+            │                 net/http)  ▼
             │                          fetch ◄── image, backend/cloudhypervisor
             └── (contract; no SDK imports)        (shared download primitive)
 
@@ -671,6 +724,7 @@ Edges that exist (verified by `go list -f '{{.Imports}}'`):
 - `internal/backend/cloudhypervisor` (linux) → `internal/backend`, `internal/fetch`,
   stdlib only (the only CH import site; no third-party module, no cgo)
 - `internal/image` → `internal/fetch`, `go-qcow2reader`
+- `internal/fixture` → `github.com/pilat/go-ext4fs` (its only import site; pure Go, no cgo)
 - All other internal packages import stdlib / their one external dep only
 - The two building-block→building-block edges (`image`→`fetch`,
   `backend/cloudhypervisor`→`fetch`) are the sanctioned exception to B.1.2 (ADR-0011);
@@ -743,9 +797,11 @@ CLAUDE.md as checkable rules):
   Silicon macOS < 26 (single VM, VZ NAT), Linux amd64/arm64 (clusters, cloud-hypervisor);
   Intel macOS unsupported. Nested virt needs M3+ on macOS or the host KVM `nested`
   parameter on Linux (ADR-0008, ADR-0011, ADR-0012).
-- **Folder mounts (virtio-fs) are macOS-only.** The Linux backend returns
-  `cloudhypervisor.ErrMountsUnsupported` for a non-empty `Mounts`; virtio-fs (an external
-  `virtiofsd`) is a follow-up (ADR-0011).
+- **Fixtures are read-only, not a live share.** `WithFixture` copies a host dir into the
+  guest read-only (an ext4 payload, both platforms — ADR-0015); there is no live read-write
+  folder share on either backend (cloud-hypervisor has no daemon-free one, so it was dropped
+  on macOS too). The output direction is `fleetbox cp` / scp. Host permission and exec bits
+  are not preserved — everything arrives world-readable, uid 0.
 - **`fleetboxtest` fixtures skip on Linux.** They target darwin/arm64 for now; the
   package compiles everywhere but `skipIfUnsupported` skips non-darwin/arm64. Wiring
   Linux fixtures (and Linux KVM CI) is a follow-up.
@@ -766,7 +822,8 @@ After implementation changes, verify:
 - **Backend contract**: `internal/backend/backend.go` interfaces match §5.4.
 - **State layout**: path methods in `internal/store/store.go` match the §4.2 tree.
 - **Dependencies**: direct requires in `go.mod` match the deps named in §5 module
-  sections (currently: Code-Hex/vz, pilat/cloudiso, go-qcow2reader, x/crypto).
+  sections (currently: Code-Hex/vz, pilat/cloudiso, pilat/go-ext4fs, go-qcow2reader,
+  x/crypto).
   Code-Hex/vz is vendored under `third_party/vz` and resolved via a relative `replace`
   pending upstream release of PR #205 (ADR-0008); `third_party/` is excluded from lint
   and is its own module (skipped by `go ... ./...`).

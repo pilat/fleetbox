@@ -28,25 +28,21 @@ type Config struct {
 	Hostname string
 	User     string
 	SSHKey   string
-	// Mounts are virtiofs shares to mount in the guest via cloud-init's mounts:
-	// directive (which writes /etc/fstab, so they re-mount on every boot without
-	// a cloud-init re-run). Empty for a mountless VM.
-	Mounts []Mount
-	// UID, when non-zero, pins the guest login user's uid so host-owned files in
-	// a virtiofs mount line up with the guest user (virtiofs is identity
-	// pass-through with no uid mapping). Zero means "let the image decide" — the
-	// macOS login user is never uid 0, so 0 is a safe "unset" sentinel.
-	UID int
+	// Fixtures are read-only ext4 images to mount in the guest via cloud-init's
+	// mounts: directive (which writes /etc/fstab, so they re-mount on every boot
+	// without a cloud-init re-run), each addressed by its volume LABEL. Empty for
+	// a VM with no fixtures.
+	Fixtures []Fixture
 	// Network, when non-nil, makes the guest configure its NIC with a static
 	// IPv4 address via a NoCloud network-config (Linux/cloud-hypervisor). Nil
 	// means "no network-config", leaving the guest on DHCP (macOS).
 	Network *NetworkConfig
 }
 
-// Mount is a guest-side virtiofs mount: the device Tag (assigned host-side) and
-// the absolute GuestPath where it is mounted.
-type Mount struct {
-	Tag       string
+// Fixture is a guest-side read-only ext4 mount: the volume Label (assigned
+// host-side) and the absolute GuestPath where cloud-init mounts it by LABEL.
+type Fixture struct {
+	Label     string
 	GuestPath string
 }
 
@@ -103,27 +99,25 @@ func Create(path string, cfg Config) error {
 	return nil
 }
 
-// buildUserData renders the cloud-init user-data. With no mounts and no UID the
-// output is byte-identical to fleetbox's original template; the uid: line and the
-// mounts: block are emitted only when set, keeping mountless VMs unchanged.
+// buildUserData renders the cloud-init user-data. With no fixtures the output is
+// byte-identical to fleetbox's original template (login user + SSH key); a
+// mounts: block is appended only when fixtures are set, each line mounting a
+// read-only ext4 image by its volume LABEL (ADR-0015).
 func buildUserData(cfg Config) string {
 	var b strings.Builder
 
 	b.WriteString("#cloud-config\n")
 	b.WriteString("users:\n")
 	fmt.Fprintf(&b, "  - name: %s\n", cfg.User)
-	if cfg.UID != 0 {
-		fmt.Fprintf(&b, "    uid: %d\n", cfg.UID)
-	}
 	b.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n")
 	b.WriteString("    shell: /bin/bash\n")
 	b.WriteString("    ssh_authorized_keys:\n")
 	fmt.Fprintf(&b, "      - %s\n", cfg.SSHKey)
 
-	if len(cfg.Mounts) > 0 {
+	if len(cfg.Fixtures) > 0 {
 		b.WriteString("mounts:\n")
-		for _, m := range cfg.Mounts {
-			fmt.Fprintf(&b, "  - [ %s, %s, virtiofs, \"defaults,nofail\", \"0\", \"0\" ]\n", m.Tag, m.GuestPath)
+		for _, f := range cfg.Fixtures {
+			fmt.Fprintf(&b, "  - [ LABEL=%s, %s, ext4, \"ro,nofail\", \"0\", \"0\" ]\n", f.Label, f.GuestPath)
 		}
 	}
 

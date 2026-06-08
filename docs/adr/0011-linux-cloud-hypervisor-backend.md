@@ -67,9 +67,14 @@ a library that owns a subprocess and talks to it over a socket is still a librar
    This removes the last platform coupling (`dhcp.LookupByHostname`) from the root
    package and makes the public API genuinely platform-neutral.
 
-6. **virtio-fs folder mounts are deferred on Linux.** CH virtio-fs needs an
-   external `virtiofsd`; to keep v1 scoped, the CH backend returns a sentinel
-   `ErrMountsUnsupported` for a non-empty `Mounts`. Full virtio-fs is a follow-up.
+6. **No live host↔guest folder share on this backend.** CH has no built-in
+   virtio-fs (it needs an external `virtiofsd`) and no virtio-9p, so it ships with
+   no live folder-share capability. *(This was the one capability the Linux backend
+   lagged macOS on. It was resolved by [ADR-0015](0015-fixture-payload-ext4.md):
+   rather than take a `virtiofsd` host dependency, live mounts were dropped on both
+   platforms in favor of read-only `WithFixture` ext4 payloads, which both backends
+   attach as a plain read-only block device with no daemon. There is no
+   `ErrMountsUnsupported` — `WithMount` no longer exists.)*
 
 ## Alternatives Considered
 
@@ -120,7 +125,10 @@ preserves the `vm.Start()` "just works" experience without the weight.
 - **No cgo on the Linux path**, so cross-compilation and CI on Linux runners are
   straightforward — and, unlike the VZ backend, the CH backend is testable in CI
   (GitHub Linux runners can expose `/dev/kvm`). Wiring that CI is a follow-up.
-- **Mounts are macOS-only for now** (`ErrMountsUnsupported` on Linux).
+- **No live folder share on this backend; read-only fixtures cover both platforms
+  instead** (ADR-0015). cloud-hypervisor has no virtio-fs, so rather than keep mounts
+  macOS-only, live mounts were dropped everywhere in favor of `WithFixture` — a read-only
+  ext4 payload attached as a plain block device, no daemon.
 - **Two follow-ups before Linux is production-grade**, both needing real hardware to
   validate: (1) the static IP/gateway are baked into the seed at create but the bridge
   subnet is re-picked on each `up`, so rebooting a stopped VM is only reliable while its

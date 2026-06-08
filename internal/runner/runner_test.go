@@ -7,12 +7,12 @@ import (
 	"github.com/pilat/fleetbox"
 )
 
-func TestEncodeDecodeOptionsMounts(t *testing.T) {
+func TestEncodeDecodeOptionsFixtures(t *testing.T) {
 	opts := []fleetbox.Option{
 		fleetbox.WithImage("debian-12"),
 		fleetbox.WithCPUs(4),
-		fleetbox.WithMount("/abs/host", "/work"),
-		fleetbox.WithMount("/abs/host2", "/data"),
+		fleetbox.WithFixture("/abs/host", "/work"),
+		fleetbox.WithFixture("/abs/host2", "/data"),
 	}
 
 	encoded, err := encodeOptions(opts)
@@ -36,26 +36,26 @@ func TestEncodeDecodeOptionsMounts(t *testing.T) {
 		t.Errorf("CPUs = %d, want 4", o.CPUs)
 	}
 
-	want := []fleetbox.Mount{
+	want := []fleetbox.Fixture{
 		{HostPath: "/abs/host", GuestPath: "/work"},
 		{HostPath: "/abs/host2", GuestPath: "/data"},
 	}
-	if len(o.Mounts) != len(want) {
-		t.Fatalf("Mounts len = %d, want %d", len(o.Mounts), len(want))
+	if len(o.Fixtures) != len(want) {
+		t.Fatalf("Fixtures len = %d, want %d", len(o.Fixtures), len(want))
 	}
 	for i := range want {
-		if o.Mounts[i] != want[i] {
-			t.Errorf("Mounts[%d] = %+v, want %+v", i, o.Mounts[i], want[i])
+		if o.Fixtures[i] != want[i] {
+			t.Errorf("Fixtures[%d] = %+v, want %+v", i, o.Fixtures[i], want[i])
 		}
 	}
 }
 
-func TestEncodeOptionsNoMountsOmitsKey(t *testing.T) {
+func TestEncodeOptionsNoFixturesOmitsKey(t *testing.T) {
 	encoded, err := encodeOptions([]fleetbox.Option{fleetbox.WithImage("debian-12")})
 	if err != nil {
 		t.Fatalf("encodeOptions: %v", err)
 	}
-	if strings.Contains(encoded, "mounts") {
-		t.Errorf("encoded options should omit mounts when empty: %s", encoded)
+	if strings.Contains(encoded, "fixtures") {
+		t.Errorf("encoded options should omit fixtures when empty: %s", encoded)
 	}
 }

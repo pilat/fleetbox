@@ -68,7 +68,7 @@ func usage() {
 	fmt.Println(`fleetbox - Linux VMs as test fixtures (macOS Apple Silicon + Linux)
 
 Usage:
-  fleetbox up [name...] [-n N] [--cpus N] [--mem GB] [--disk GB] [--image alias|URL] [--mount host:guest]
+  fleetbox up [name...] [-n N] [--cpus N] [--mem GB] [--disk GB] [--image alias|URL] [--fixture host:guest]
   fleetbox down <name>... | --all
   fleetbox ls
   fleetbox ssh <name> [-- cmd]
@@ -90,16 +90,17 @@ Clusters (interconnected, VMs reach each other by IP):
   fleetbox up db cache      boots db and cache on one shared network
   down/ssh/rm address each member by name (e.g. fleetbox ssh web-2)
 
-Mounts (live read-write host↔guest folders, set at creation, repeatable):
-  fleetbox up dev --mount ./src:/work   shares ./src into the guest at /work
-  Mounts are frozen at creation; change them by rm + up. Host paths must not
-  contain colons (the value is split on the last colon).
+Fixtures (read-only host dir copied into the guest, set at creation, repeatable):
+  fleetbox up dev --fixture ./src:/work   packs ./src into the guest at /work
+  Fixtures are read-only and world-readable; the set is frozen at creation
+  (change it by rm + up), but the content is re-snapshotted on every boot. Host
+  paths must not contain colons (the value is split on the last colon).
 
 Defaults: image=debian-12, cpus=2, mem=4, disk=20`)
 }
 
 // stringSlice is a flag.Value that accumulates a repeatable string flag (the
-// stdlib flag package has no []string), used for --mount.
+// stdlib flag package has no []string), used for --fixture.
 type stringSlice []string
 
 func (s *stringSlice) String() string { return strings.Join(*s, ",") }
@@ -116,8 +117,8 @@ func cmdUp(args []string) error {
 	mem := fs.Int("mem", 4, "memory in GB")
 	disk := fs.Int("disk", 20, "disk size in GB")
 	image := fs.String("image", "debian-12", "image alias or URL")
-	var mounts stringSlice
-	fs.Var(&mounts, "mount", "share a host dir into the guest (host:guest, repeatable)")
+	var fixtures stringSlice
+	fs.Var(&fixtures, "fixture", "pack a host dir into the guest read-only (host:guest, repeatable)")
 
 	// Go's flag package stops at the first positional arg, so `up test1 -n 2`
 	// would treat `-n 2` as names. Parse flags and positionals interspersed.
@@ -145,33 +146,33 @@ func cmdUp(args []string) error {
 
 	// Resolve host paths to absolute here, against the CLI's cwd, before they
 	// cross into the holder process (which re-execs and may not share the cwd).
-	for _, mv := range mounts {
-		host, guest, err := parseMount(mv)
+	for _, fv := range fixtures {
+		host, guest, err := parseFixture(fv)
 		if err != nil {
 			return err
 		}
-		opts = append(opts, fleetbox.WithMount(host, guest))
+		opts = append(opts, fleetbox.WithFixture(host, guest))
 	}
 
 	return upMembers(st, members, opts)
 }
 
-// parseMount splits a --mount value into an absolute host path and a guest path.
-// The split is on the LAST colon: guest paths are absolute and colon-free, and
-// macOS host paths effectively never contain colons, so this keeps the absolute
+// parseFixture splits a --fixture value into an absolute host path and a guest
+// path. The split is on the LAST colon: guest paths are absolute and colon-free,
+// and host paths effectively never contain colons, so this keeps the absolute
 // guest path unambiguous. A value missing a colon, host, or guest is an error.
-func parseMount(v string) (host, guest string, err error) {
+func parseFixture(v string) (host, guest string, err error) {
 	idx := strings.LastIndex(v, ":")
 	if idx < 0 {
-		return "", "", fmt.Errorf("invalid --mount %q: expected host:guest", v)
+		return "", "", fmt.Errorf("invalid --fixture %q: expected host:guest", v)
 	}
 	host, guest = v[:idx], v[idx+1:]
 	if host == "" || guest == "" {
-		return "", "", fmt.Errorf("invalid --mount %q: expected host:guest", v)
+		return "", "", fmt.Errorf("invalid --fixture %q: expected host:guest", v)
 	}
 	abs, err := filepath.Abs(host)
 	if err != nil {
-		return "", "", fmt.Errorf("resolve mount host path %q: %w", host, err)
+		return "", "", fmt.Errorf("resolve fixture host path %q: %w", host, err)
 	}
 	return abs, guest, nil
 }
@@ -600,10 +601,8 @@ func cmdRemove(args []string) error {
 				return fmt.Errorf("stop %s: %w", name, err)
 			}
 		}
-		// Clean up stale pid/sock files
-		_ = os.Remove(st.PidfilePath(name))
-		_ = os.Remove(st.SocketPath(name))
-		// Delete VM directory
+		// Delete the member directory (its pid/sock live inside it now, so
+		// st.Delete's RemoveAll sweeps them; the empty cluster dir is dropped too).
 		if err := st.Delete(name); err != nil {
 			return fmt.Errorf("delete %s: %w", name, err)
 		}

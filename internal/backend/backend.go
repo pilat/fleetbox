@@ -16,21 +16,14 @@ type Config struct {
 	CPUs        int
 	MemoryBytes uint64
 	SerialOut   io.Writer
-	Mounts      []Mount
+	// FixturePaths are host paths of pre-built read-only ext4 fixture images to
+	// attach to the VM as additional read-only block devices (ADR-0015). The
+	// guest mounts each by its volume LABEL, so attachment order is irrelevant.
+	FixturePaths []string
 	// AssignedIP is the static IPv4 address the VM is configured with via its
 	// seed (Linux/cloud-hypervisor backend). Backends that discover the IP from
 	// DHCP (vz) leave it empty and find the address themselves in WaitForIP.
 	AssignedIP string
-}
-
-// Mount is a host directory shared into the guest via virtiofs. HostPath is the
-// absolute host directory; Tag is the virtiofs device tag the guest mounts by.
-// The struct is backend-neutral by design — no hypervisor types appear here
-// (ADR-0002). The guest path is not present because the host side only needs to
-// attach the device; where it mounts inside the guest is the seed's concern.
-type Mount struct {
-	HostPath string
-	Tag      string
 }
 
 // Network is an opaque handle to a backend network that VMs attach to.

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/pilat/fleetbox/internal/backend"
+	"github.com/pilat/fleetbox/internal/fixture"
 	"github.com/pilat/fleetbox/internal/image"
 	"github.com/pilat/fleetbox/internal/seed"
 	"github.com/pilat/fleetbox/internal/sshkey"
@@ -97,24 +98,27 @@ type Cluster struct {
 
 // Options configures VM creation.
 type Options struct {
-	Image  string
-	CPUs   int
-	MemGB  int
-	DiskGB int
-	Mounts []Mount
+	Image    string
+	CPUs     int
+	MemGB    int
+	DiskGB   int
+	Fixtures []Fixture
 }
 
-// Mount is a host↔guest shared directory. The host directory appears live and
-// read-write inside the guest at GuestPath; edits on either side are visible on
-// the other immediately (virtiofs). Mounts are a property the VM is born with:
-// they are set at first creation, persisted, and re-applied on every boot.
-// Changing a VM's mounts means recreating it (rm + up). Mounts are currently
-// supported on macOS only; the Linux backend rejects them (ADR-0011).
-type Mount struct {
-	// HostPath is the host directory to share. It must exist at creation time and
-	// is resolved to an absolute path before persistence.
+// Fixture is a read-only host directory packed into the guest at boot. At first
+// creation HostPath is snapshotted into an ext4 image, attached to the VM as a
+// read-only block device, and mounted by the stock guest at GuestPath via
+// cloud-init. Fixtures are a property the VM is born with: the set is frozen at
+// first creation and persisted, but the content is rebuilt from HostPath on every
+// boot (so the guest sees the directory as it is at that boot, never live within
+// a boot). Files arrive world-readable (0444), directories traversable (0555),
+// owned by root; host permission and executable bits are not preserved. It works
+// identically on macOS and Linux (ADR-0015).
+type Fixture struct {
+	// HostPath is the host directory to pack. It must exist and be a directory at
+	// creation time, and is resolved to an absolute path before persistence.
 	HostPath string
-	// GuestPath is the absolute path inside the guest where HostPath appears.
+	// GuestPath is the absolute path inside the guest where the fixture is mounted.
 	GuestPath string
 }
 
@@ -149,15 +153,19 @@ func WithDiskGB(n int) Option {
 	return func(o *Options) { o.DiskGB = n }
 }
 
-// WithMount shares the host directory hostPath into the guest at guestPath as a
-// live, read-write virtiofs mount. Call it more than once to add several mounts.
-// guestPath must be absolute. The mount is applied when the VM is first created
-// and re-applied on every subsequent boot; it is ignored when passed to an
-// already-existing VM, exactly as cpu/memory/disk options are. In a StartN or
-// StartCluster every member receives the same mounts.
-func WithMount(hostPath, guestPath string) Option {
+// WithFixture packs the host directory hostDir into the guest at guestPath as a
+// read-only fixture: at boot the directory is snapshotted into an ext4 image,
+// attached as a read-only block device, and mounted by the stock guest at
+// guestPath. Call it more than once to add several fixtures. guestPath must be
+// absolute; hostDir must exist and be a directory, and is resolved to an absolute
+// path. The fixture set is frozen when the VM is first created and ignored when
+// passed to an already-existing VM (exactly as cpu/memory/disk options are), but
+// the content is rebuilt from hostDir on every boot. Files arrive world-readable,
+// owned by root. In a StartN or StartCluster every member receives the same
+// fixtures (ADR-0015).
+func WithFixture(hostDir, guestPath string) Option {
 	return func(o *Options) {
-		o.Mounts = append(o.Mounts, Mount{HostPath: hostPath, GuestPath: guestPath})
+		o.Fixtures = append(o.Fixtures, Fixture{HostPath: hostDir, GuestPath: guestPath})
 	}
 }
 
@@ -250,13 +258,13 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 		}
 		vmConfig = loaded
 	} else {
-		// Mounts are frozen at birth: validated, absolutized, and tagged once
+		// Fixtures are frozen at birth: validated, absolutized, and labeled once
 		// here, then persisted and re-applied verbatim on every later boot
-		// (ADR-0010). Validation is a create-time concern only — see the loaded
-		// branch above, which never re-checks the host dir.
-		mounts, err := toStoreMounts(options.Mounts)
+		// (ADR-0015). Validation is a create-time concern only — see the loaded
+		// branch above, which never re-checks the host dirs.
+		fixtures, err := toStoreFixtures(options.Fixtures)
 		if err != nil {
-			return nil, fmt.Errorf("prepare mounts: %w", err)
+			return nil, fmt.Errorf("prepare fixtures: %w", err)
 		}
 
 		// Create new VM
@@ -268,7 +276,7 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 			DiskMB:    options.DiskGB * 1024,
 			Image:     options.Image,
 			CreatedAt: time.Now(),
-			Mounts:    mounts,
+			Fixtures:  fixtures,
 		}
 
 		// On a backend that assigns static addresses (Linux), allocate this VM's
@@ -301,24 +309,38 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 			return nil, fmt.Errorf("copy disk: %w", err)
 		}
 
-		// Create seed ISO. With mounts, cloud-init also writes the fstab entries
-		// (so they survive reboots without a re-run) and pins the guest user's
-		// uid to the host uid so virtiofs identity pass-through lines up. On Linux
-		// it also carries the static network-config allocated above.
+		// Create seed ISO. The fixture mount lines (by LABEL) are written here, at
+		// first create, and persist via the guest's /etc/fstab — so a reboot
+		// re-mounts them without re-running cloud-init, the same way the labels
+		// stay stable while the images are rebuilt each boot (ADR-0015). On Linux
+		// it also carries the static network-config allocated above; on macOS the
+		// guest stays on DHCP and that config is omitted.
 		seedPath := st.SeedPath(name)
 		seedCfg := seed.Config{
 			Hostname: name,
 			User:     defaultUser,
 			SSHKey:   deps.pubKey,
 			Network:  netCfg,
-		}
-		if len(mounts) > 0 {
-			seedCfg.Mounts = toSeedMounts(mounts)
-			seedCfg.UID = os.Getuid()
+			Fixtures: toSeedFixtures(vmConfig.Fixtures),
 		}
 		if err := seed.Create(seedPath, seedCfg); err != nil {
 			return nil, fmt.Errorf("create seed: %w", err)
 		}
+	}
+
+	// Build (or rebuild) each fixture's read-only ext4 image from its persisted
+	// host directory. The fixture SET is frozen at birth (it lives in
+	// vmConfig.Fixtures, whether just-created or loaded), but the CONTENT is
+	// snapshotted fresh on every boot — no cache (ADR-0015). The member dir exists
+	// on both paths, so the images are writable here; the labels are persisted, so
+	// they keep matching the seed's LABEL= mount lines across reboots.
+	fixturePaths := make([]string, len(vmConfig.Fixtures))
+	for i, f := range vmConfig.Fixtures {
+		imgPath := st.FixturePath(name, i)
+		if err := fixture.BuildImage(imgPath, f.HostPath, f.Label); err != nil {
+			return nil, fmt.Errorf("build fixture image %q: %w", f.HostPath, err)
+		}
+		fixturePaths[i] = imgPath
 	}
 
 	// Create serial log file (owned by VM, closed in Stop/Destroy)
@@ -337,9 +359,9 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 		CPUs:        vmConfig.CPUs,
 		MemoryBytes: uint64(vmConfig.MemoryMB) * 1024 * 1024,
 		SerialOut:   serialLog,
-		// Re-attach the virtiofs devices from the persisted config, so both a
-		// freshly created and a rebooted VM get identical mounts (ADR-0010).
-		Mounts: toBackendMounts(vmConfig.Mounts),
+		// Re-attach the read-only fixture images built above, so both a freshly
+		// created and a rebooted VM get identical fixtures (ADR-0015).
+		FixturePaths: fixturePaths,
 		// The persisted static IP (empty on the DHCP/vz path); the Linux backend
 		// returns it from WaitForIP after a reachability probe.
 		AssignedIP: vmConfig.IP,
@@ -397,59 +419,57 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 	return vm, nil
 }
 
-// toStoreMounts validates the public mounts and converts them to persisted store
-// mounts, assigning each a stable fbm<i> tag where i is its position in the list
-// and resolving host paths to absolute. The tag↔index invariant (ADR-0010)
-// depends on order being preserved, so the list is neither reordered nor deduped.
-// It returns an error for a non-absolute guest path or a missing host directory —
-// the only place create-time mount validation happens.
-func toStoreMounts(mounts []Mount) ([]store.Mount, error) {
-	if len(mounts) == 0 {
+// toStoreFixtures validates the public fixtures and converts them to persisted
+// store fixtures, assigning each a stable FBFIX<i> label (i = position in the
+// list) and resolving host paths to absolute. The label↔index invariant
+// (ADR-0015) depends on order, so the list is neither reordered nor deduped. It
+// errors on a non-absolute guest path, a host path that is missing or not a
+// directory, or two fixtures sharing one guest path (cloud-init double-mounting
+// one path is undefined) — the only place create-time fixture validation happens.
+func toStoreFixtures(fixtures []Fixture) ([]store.Fixture, error) {
+	if len(fixtures) == 0 {
 		return nil, nil
 	}
-	out := make([]store.Mount, 0, len(mounts))
-	for i, m := range mounts {
-		if !filepath.IsAbs(m.GuestPath) {
-			return nil, fmt.Errorf("mount guest path %q must be absolute", m.GuestPath)
+	out := make([]store.Fixture, 0, len(fixtures))
+	seen := make(map[string]bool, len(fixtures))
+	for i, f := range fixtures {
+		if !filepath.IsAbs(f.GuestPath) {
+			return nil, fmt.Errorf("fixture guest path %q must be absolute", f.GuestPath)
 		}
-		host, err := filepath.Abs(m.HostPath)
+		if seen[f.GuestPath] {
+			return nil, fmt.Errorf("duplicate fixture guest path %q", f.GuestPath)
+		}
+		seen[f.GuestPath] = true
+
+		host, err := filepath.Abs(f.HostPath)
 		if err != nil {
-			return nil, fmt.Errorf("resolve mount host path %q: %w", m.HostPath, err)
+			return nil, fmt.Errorf("resolve fixture host path %q: %w", f.HostPath, err)
 		}
-		if _, err := os.Stat(host); err != nil {
-			return nil, fmt.Errorf("mount host path %q: %w", host, err)
+		info, err := os.Stat(host)
+		if err != nil {
+			return nil, fmt.Errorf("fixture host path %q: %w", host, err)
 		}
-		out = append(out, store.Mount{
+		if !info.IsDir() {
+			return nil, fmt.Errorf("fixture host path %q is not a directory", host)
+		}
+		out = append(out, store.Fixture{
 			HostPath:  host,
-			GuestPath: m.GuestPath,
-			Tag:       fmt.Sprintf("fbm%d", i),
+			GuestPath: f.GuestPath,
+			Label:     fmt.Sprintf("FBFIX%d", i),
 		})
 	}
 	return out, nil
 }
 
-// toBackendMounts projects persisted mounts onto the backend's host-side view
-// (host path + tag); the guest path is irrelevant to attaching the device.
-func toBackendMounts(mounts []store.Mount) []backend.Mount {
-	if len(mounts) == 0 {
+// toSeedFixtures projects persisted fixtures onto the guest-side view cloud-init
+// needs (label + guest path) to emit the mount line.
+func toSeedFixtures(fixtures []store.Fixture) []seed.Fixture {
+	if len(fixtures) == 0 {
 		return nil
 	}
-	out := make([]backend.Mount, len(mounts))
-	for i, m := range mounts {
-		out[i] = backend.Mount{HostPath: m.HostPath, Tag: m.Tag}
-	}
-	return out
-}
-
-// toSeedMounts projects persisted mounts onto the guest-side view cloud-init
-// needs (tag + guest path) to write the fstab entries.
-func toSeedMounts(mounts []store.Mount) []seed.Mount {
-	if len(mounts) == 0 {
-		return nil
-	}
-	out := make([]seed.Mount, len(mounts))
-	for i, m := range mounts {
-		out[i] = seed.Mount{Tag: m.Tag, GuestPath: m.GuestPath}
+	out := make([]seed.Fixture, len(fixtures))
+	for i, f := range fixtures {
+		out[i] = seed.Fixture{Label: f.Label, GuestPath: f.GuestPath}
 	}
 	return out
 }

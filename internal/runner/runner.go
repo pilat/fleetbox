@@ -354,7 +354,20 @@ func Run() error {
 }
 
 // register opens a member's control socket and pidfile and marks it starting.
+// It ensures the member directory exists first, because the socket and pidfile
+// now live inside it but the VM (and thus store.Create) boots later. This is
+// the single chokepoint for both boot paths — the initial loop and addMember's
+// runtime re-join — so the directory is guaranteed for a brand-new member too.
 func (h *holder) register(name string) error {
+	if err := h.st.EnsureDir(name); err != nil {
+		return fmt.Errorf("ensure member dir: %w", err)
+	}
+	// If the subsequent boot fails, this dir is intentionally left in place: a
+	// re-joining member keeps its persistent disk, and an empty dir from a
+	// never-retried failed boot is benign (List/cmdList skip a configless member
+	// and the next `up` reuses the dir). Deleting it here would risk wiping a
+	// real disk on a transient boot failure — cattle with persistence.
+
 	sockPath := h.st.SocketPath(name)
 	_ = os.Remove(sockPath)
 	ln, err := net.Listen("unix", sockPath)
@@ -726,18 +739,18 @@ func RemovePidfile(st *store.Store, name string) error {
 
 // Options encoding
 type optionsData struct {
-	Image  string      `json:"image,omitempty"`
-	CPUs   int         `json:"cpus,omitempty"`
-	MemGB  int         `json:"mem,omitempty"`
-	DiskGB int         `json:"disk,omitempty"`
-	Mounts []mountData `json:"mounts,omitempty"`
+	Image    string        `json:"image,omitempty"`
+	CPUs     int           `json:"cpus,omitempty"`
+	MemGB    int           `json:"mem,omitempty"`
+	DiskGB   int           `json:"disk,omitempty"`
+	Fixtures []fixtureData `json:"fixtures,omitempty"`
 }
 
-// mountData carries a mount across the holder process boundary. Only the host
+// fixtureData carries a fixture across the holder process boundary. Only the host
 // and guest paths cross — the host path is already absolute (resolved by the
-// CLI); tags are not serialized because they are assigned at first-create in the
-// library (ADR-0010).
-type mountData struct {
+// CLI); labels are not serialized because they are assigned at first-create in
+// the library (ADR-0015).
+type fixtureData struct {
 	HostPath  string `json:"host_path"`
 	GuestPath string `json:"guest_path"`
 }
@@ -756,8 +769,8 @@ func encodeOptions(opts []fleetbox.Option) (string, error) {
 		MemGB:  options.MemGB,
 		DiskGB: options.DiskGB,
 	}
-	for _, m := range options.Mounts {
-		data.Mounts = append(data.Mounts, mountData{HostPath: m.HostPath, GuestPath: m.GuestPath})
+	for _, f := range options.Fixtures {
+		data.Fixtures = append(data.Fixtures, fixtureData{HostPath: f.HostPath, GuestPath: f.GuestPath})
 	}
 
 	b, err := json.Marshal(data)
@@ -790,8 +803,8 @@ func decodeOptions(s string) ([]fleetbox.Option, error) {
 	if data.DiskGB > 0 {
 		opts = append(opts, fleetbox.WithDiskGB(data.DiskGB))
 	}
-	for _, m := range data.Mounts {
-		opts = append(opts, fleetbox.WithMount(m.HostPath, m.GuestPath))
+	for _, f := range data.Fixtures {
+		opts = append(opts, fleetbox.WithFixture(f.HostPath, f.GuestPath))
 	}
 	return opts, nil
 }

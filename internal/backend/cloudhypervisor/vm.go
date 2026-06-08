@@ -23,19 +23,20 @@ import (
 // configuration on the command line (so it boots on launch) and controlled
 // afterwards over the REST API on its unix socket.
 type VM struct {
-	name       string
-	chBin      string
-	fwPath     string
-	diskPath   string
-	seedPath   string
-	serialPath string
-	cpus       int
-	memBytes   uint64
-	mac        string
-	assignedIP string
-	apiSocket  string
-	tap        string
-	network    *chNetwork
+	name         string
+	chBin        string
+	fwPath       string
+	diskPath     string
+	seedPath     string
+	fixturePaths []string
+	serialPath   string
+	cpus         int
+	memBytes     uint64
+	mac          string
+	assignedIP   string
+	apiSocket    string
+	tap          string
+	network      *chNetwork
 
 	mu     sync.Mutex
 	cmd    *exec.Cmd
@@ -55,20 +56,21 @@ func newVM(cfg backend.Config, nw *chNetwork, chBin, fwPath, tap string) *VM {
 	}
 
 	return &VM{
-		name:       cfg.Name,
-		chBin:      chBin,
-		fwPath:     fwPath,
-		diskPath:   cfg.DiskPath,
-		seedPath:   cfg.SeedPath,
-		serialPath: serialPath,
-		cpus:       cfg.CPUs,
-		memBytes:   cfg.MemoryBytes,
-		mac:        cfg.MAC,
-		assignedIP: cfg.AssignedIP,
-		apiSocket:  filepath.Join(vmDir, "ch.sock"),
-		tap:        tap,
-		network:    nw,
-		state:      backend.StateStopped,
+		name:         cfg.Name,
+		chBin:        chBin,
+		fwPath:       fwPath,
+		diskPath:     cfg.DiskPath,
+		seedPath:     cfg.SeedPath,
+		fixturePaths: cfg.FixturePaths,
+		serialPath:   serialPath,
+		cpus:         cfg.CPUs,
+		memBytes:     cfg.MemoryBytes,
+		mac:          cfg.MAC,
+		assignedIP:   cfg.AssignedIP,
+		apiSocket:    filepath.Join(vmDir, "ch.sock"),
+		tap:          tap,
+		network:      nw,
+		state:        backend.StateStopped,
 	}
 }
 
@@ -188,18 +190,30 @@ func (v *VM) WaitForIP(ctx context.Context) (string, error) {
 }
 
 // buildArgs renders the full cloud-hypervisor command line: firmware as the
-// kernel (PVH), the raw disk and read-only seed ISO, cpu/memory, the tap NIC
-// with the VM's MAC, and serial to the log file.
+// kernel (PVH), the raw disk, the read-only seed ISO and any read-only fixture
+// images, cpu/memory, the tap NIC with the VM's MAC, and serial to the log file.
+// All block devices share one --disk flag (cloud-hypervisor takes multiple
+// space-separated values); the guest mounts fixtures by LABEL, so their order
+// after the seed does not matter (ADR-0015).
 func (v *VM) buildArgs() []string {
+	disks := make([]string, 0, 2+len(v.fixturePaths))
+	disks = append(disks, "path="+v.diskPath, "path="+v.seedPath+",readonly=on")
+	for _, p := range v.fixturePaths {
+		disks = append(disks, "path="+p+",readonly=on")
+	}
+
 	args := []string{
 		"--api-socket", v.apiSocket,
 		"--kernel", v.fwPath,
-		"--disk", "path=" + v.diskPath, "path=" + v.seedPath + ",readonly=on",
-		"--cpus", "boot=" + strconv.Itoa(v.cpus),
-		"--memory", "size=" + strconv.FormatUint(v.memBytes/(1024*1024), 10) + "M",
-		"--net", "tap=" + v.tap + ",mac=" + v.mac,
-		"--console", "off",
+		"--disk",
 	}
+	args = append(args, disks...)
+	args = append(args,
+		"--cpus", "boot="+strconv.Itoa(v.cpus),
+		"--memory", "size="+strconv.FormatUint(v.memBytes/(1024*1024), 10)+"M",
+		"--net", "tap="+v.tap+",mac="+v.mac,
+		"--console", "off",
+	)
 	if v.serialPath != "" {
 		args = append(args, "--serial", "file="+v.serialPath)
 	} else {

@@ -301,31 +301,23 @@ func (b *Backend) Create(cfg backend.Config, nw backend.Network) (backend.VM, er
 		return nil, fmt.Errorf("create seed config: %w", err)
 	}
 
-	vmConfig.SetStorageDevicesVirtualMachineConfiguration([]vz.StorageDeviceConfiguration{diskConfig, seedConfig})
+	storageDevices := []vz.StorageDeviceConfiguration{diskConfig, seedConfig}
 
-	// Directory sharing (virtiofs). One device per mount, each a single-directory
-	// read-write share tagged so the guest fstab can mount it (ADR-0010). Skipped
-	// entirely when there are no mounts so a mountless VM's config is unchanged.
-	if len(cfg.Mounts) > 0 {
-		fsDevices := make([]vz.DirectorySharingDeviceConfiguration, 0, len(cfg.Mounts))
-		for _, m := range cfg.Mounts {
-			sharedDir, err := vz.NewSharedDirectory(m.HostPath, false)
-			if err != nil {
-				return nil, fmt.Errorf("create shared directory %s: %w", m.HostPath, err)
-			}
-			share, err := vz.NewSingleDirectoryShare(sharedDir)
-			if err != nil {
-				return nil, fmt.Errorf("create directory share %s: %w", m.HostPath, err)
-			}
-			fsDevice, err := vz.NewVirtioFileSystemDeviceConfiguration(m.Tag)
-			if err != nil {
-				return nil, fmt.Errorf("create virtiofs device %s: %w", m.Tag, err)
-			}
-			fsDevice.SetDirectoryShare(share)
-			fsDevices = append(fsDevices, fsDevice)
+	// Read-only fixture images, each attached the same way as the seed (ADR-0015).
+	// The guest mounts each by its volume LABEL, so attachment order is irrelevant.
+	for _, p := range cfg.FixturePaths {
+		fixtureAttachment, err := vz.NewDiskImageStorageDeviceAttachment(p, true)
+		if err != nil {
+			return nil, fmt.Errorf("create fixture attachment %s: %w", p, err)
 		}
-		vmConfig.SetDirectorySharingDevicesVirtualMachineConfiguration(fsDevices)
+		fixtureConfig, err := vz.NewVirtioBlockDeviceConfiguration(fixtureAttachment)
+		if err != nil {
+			return nil, fmt.Errorf("create fixture config %s: %w", p, err)
+		}
+		storageDevices = append(storageDevices, fixtureConfig)
 	}
+
+	vmConfig.SetStorageDevicesVirtualMachineConfiguration(storageDevices)
 
 	// Network: vmnet SharedMode on macOS 26+ (ADR-0008), VZ NAT on older
 	// releases (ADR-0012). The attachment differs; everything downstream

@@ -152,36 +152,38 @@ _ = vm.Stop(ctx)                  // graceful shutdown, disk preserved
 ```
 
 `Start` is idempotent: call it again with the same name and it boots the existing VM
-instead of recreating it. State lives under `~/.fleetbox/vms/<name>/` and survives reboots
+instead of recreating it. State lives under `~/.fleetbox/clusters/<cluster>/<name>/` and survives reboots
 — `Destroy` (or `fleetbox rm`) is the only thing that deletes a disk. Full API on
 [pkg.go.dev](https://pkg.go.dev/github.com/pilat/fleetbox).
 
-### Sharing a folder
+### Handing a VM a directory
 
-`WithMount` shares a host directory straight into the guest as a live, read-write
-folder — the testcontainers bind mount, for a real VM. Edits on either side show up on
-the other immediately, so it's the natural way to hand a VM your build output or fixtures
-without copying:
+`WithFixture` packs a host directory into the guest as a read-only fixture — the natural
+way to hand a VM your test data, config, or build output without a daemon. It works
+identically on macOS and Linux: at boot the directory is snapshotted into an ext4 image,
+attached read-only, and mounted by the guest at the path you give:
 
 ```go
 dir := t.TempDir()
-vm := fleetboxtest.Start(t, fleetbox.Debian12, fleetbox.WithMount(dir, "/work"))
-
 os.WriteFile(filepath.Join(dir, "input.json"), payload, 0o644)
-out, _ := vm.SSH(context.Background(), "cat /work/input.json")  // sees it live
+
+vm := fleetboxtest.Start(t, fleetbox.Debian12, fleetbox.WithFixture(dir, "/work"))
+out, _ := vm.SSH(context.Background(), "cat /work/input.json")  // reads the snapshot
 ```
 
-From the CLI it's a repeatable `--mount host:guest` flag:
+From the CLI it's a repeatable `--fixture host:guest` flag:
 
 ```bash
-./bin/fleetbox up dev --mount ./src:/work --mount ./fixtures:/data
+./bin/fleetbox up dev --fixture ./src:/work --fixture ./fixtures:/data
 ```
 
-Host-owned files line up with the guest login user (fleetbox pins the guest user's uid to
-your host uid), so `git`, `chown`-to-self, and `ls` all behave inside the share. Mounts
-are set when the VM is first created and re-applied on every boot; to change them, `rm` and
-recreate. The guest path must be absolute, and host paths must not contain colons (the
-value is split on the last colon).
+The fixture is **read-only** and **world-readable** (every file `0444`, every dir `0555`,
+owned by root), so any guest user can read it; host permission and exec bits are not
+preserved. The set of fixtures is frozen when the VM is first created (change it with `rm` +
+recreate), but the content is re-snapshotted from the host directory on every boot — so a
+reboot picks up host-side changes, though never live within a single boot. To get data back
+out of the guest, use `fleetbox cp` / scp. The guest path must be absolute, and host paths
+must not contain colons (the value is split on the last colon).
 
 ### From the command line
 
@@ -242,10 +244,12 @@ way, the decision log lives in [docs/adr/](docs/adr/).
 Both the library (`StartN`) and the CLI (`up -n N`) boot interconnected clusters whose
 VMs reach each other by IP. Mind the sharp edges:
 
-- **Mounts are macOS-only, read-write, and frozen at creation.** `WithMount` / `--mount`
-  gives a live shared folder on macOS (virtiofs); the Linux backend rejects mounts for now
-  (virtio-fs is a follow-up). A read-only variant isn't exposed yet, and you can't add or
-  change a VM's mounts after it's created — `rm` and recreate. The CLI has `cp` over scp.
+- **Fixtures are read-only and frozen at creation.** `WithFixture` / `--fixture` copies a
+  host directory into the guest read-only (an ext4 image), on both macOS and Linux. There is
+  no live read-write share — edits inside the guest don't flow back to the host; use `cp` /
+  scp for the output direction. The set of fixtures is fixed when the VM is created (`rm` and
+  recreate to change it), though the content re-snapshots on every boot. Files arrive
+  world-readable, owned by root; host permission and exec bits aren't preserved.
 - **A CLI cluster shares one holder process.** All members of a cluster live in one process
   to share one network, so a holder crash takes the whole cluster down (a single VM is
   unaffected); on Linux a SIGKILL'd holder also leaves its bridge/taps behind. Members
@@ -265,14 +269,14 @@ locally via `make test-vm`, while CI sticks to lint, build, and unit tests.
 
 Roughly in priority order:
 
-- **Read-only mounts.** A read-only variant of `WithMount` for fixtures you don't want the
-  guest to modify.
-- **Programmatic file copy** for the cases a mount doesn't fit.
+- **Programmatic file copy** — a library-side copy in/out for cases a fixture doesn't fit
+  (the CLI already has `cp` over scp).
+- **Preserve host permissions** in fixtures (they currently arrive world-readable, uid 0).
 
-Done recently: live read-write folder mounts (virtiofs) via `WithMount` / `--mount`;
-VM-to-VM networking over a real network (vmnet SharedMode); and CLI clustering
-(`fleetbox up node -n 3`) — boot an actual cluster (kubeadm, etcd, a Raft group) on real
-interconnected nodes, not mocks or a single-host simulation.
+Done recently: read-only host→guest fixtures (`WithFixture` / `--fixture`, an ext4 payload,
+identical on macOS and Linux); VM-to-VM networking over a real network (vmnet SharedMode);
+and CLI clustering (`fleetbox up node -n 3`) — boot an actual cluster (kubeadm, etcd, a Raft
+group) on real interconnected nodes, not mocks or a single-host simulation.
 
 ## License
 

@@ -50,16 +50,18 @@ internal/backend/cloudhypervisor cloud-hypervisor implementation, linux (the onl
 internal/fetch                  shared download → verify(sha256) → atomic-cache primitive
 internal/image                  cloud image download/verify/qcow2→raw/cache (per-arch catalog)
 internal/seed                   cloud-init NoCloud seed ISO + static network-config (via pilat/cloudiso)
-internal/store                  ~/.fleetbox/{vms,images,bin}/ state, config.json, locking
+internal/fixture                host dir → read-only ext4 payload image (via pilat/go-ext4fs); fixtures (ADR-0015)
+internal/store                  ~/.fleetbox/{clusters,images,bin}/ state, config.json, locking; cluster-rooted layout clusters/<cluster>/<member>/ (ADR-0014)
 internal/dhcp                   /var/db/dhcpd_leases parsing (hostname → IP); darwin-only
 internal/sshkey                 keypair + x/crypto/ssh client
 internal/runner                 CLI-mode VM holder process (re-exec, pidfile, socket)
 cmd/fleetbox                    CLI: up/down/ls/ssh/cp/ssh-config/rm
 ```
 
-Key external deps: `Code-Hex/vz/v3` (macOS), `pilat/cloudiso`, `go-qcow2reader`,
-`golang.org/x/crypto/ssh`. The Linux path is pure Go (cloud-hypervisor is a subprocess
-controlled over its unix socket with stdlib) — no new module dep, no cgo.
+Key external deps: `Code-Hex/vz/v3` (macOS), `pilat/cloudiso` (seed ISO),
+`pilat/go-ext4fs` (fixture ext4 payload), `go-qcow2reader`,
+`golang.org/x/crypto/ssh`. The Linux path stays pure Go (cloud-hypervisor is a subprocess
+controlled over its unix socket with stdlib; go-ext4fs is pure Go too) — no cgo.
 
 ## Build & test notes
 
@@ -98,8 +100,21 @@ at the caller. Every exported symbol gets a doc comment — this is a library.
   checksum-pinned cloud-hypervisor binary + firmware (cached in `~/.fleetbox/bin/`),
   run as a subprocess and controlled over its unix-socket REST API with stdlib — pure
   Go, no cgo. Linux networking is a shared bridge + per-VM tap with static IPs injected
-  via cloud-init `network-config`; mounts (virtio-fs) are deferred on Linux. IP
-  discovery moved behind the backend (`backend.VM.WaitForIP`). See `docs/adr/0011`.
+  via cloud-init `network-config`. IP discovery moved behind the backend
+  (`backend.VM.WaitForIP`). See `docs/adr/0011`.
+
+- **Read-only fixtures replace live mounts (cross-platform).** ADR-0010's macOS-only,
+  live read-write `WithMount` (virtiofs) is gone — deleted, no alias. In its place
+  `WithFixture(hostDir, guestPath)` packs a host dir into a read-only ext4 image
+  (`internal/fixture` via `pilat/go-ext4fs`), attaches it read-only on both backends (the
+  way `seed.iso` is attached), and the stock guest mounts it by `LABEL=FBFIX<i>` via
+  cloud-init `mounts:`. cloud-hypervisor has no daemon-free *live* share (no built-in
+  virtio-fs, no clean static `virtiofsd` to pin), so rather than add a host daemon on Linux
+  to mirror macOS's free virtio-fs, live mounts were dropped on both platforms. Fixtures are
+  world-readable (`0444`/`0555`, uid 0), per-member (`clusters/<c>/<m>/fixture-<i>.img`,
+  wiped by `store.Delete`), the set frozen at create but rebuilt from the host dir every
+  boot (no cache). The `--fixture host:guest` CLI flag mirrors the old `--mount`. See
+  `docs/adr/0015` (supersedes `0010`).
 
 - **Platform matrix: clusters need macOS 26+ or Linux; single VM works on macOS <26.**
   vmnet SharedMode (VM↔VM) is macOS 26+ only; below 26 the vz backend uses a resurrected
@@ -122,6 +137,15 @@ at the caller. Every exported symbol gets a doc comment — this is a library.
   dhcpd_leases (hw_address=ff,...) instead of traditional MAC format. cloud-init sets
   the hostname via DHCP, so we look up by hostname instead. Retained unchanged under
   vmnet SharedMode — it rides the same bootpd/bridge machinery as NAT did (ADR-0007).
+
+- **Cluster-rooted store ("always a cluster").** State is no longer flat
+  `~/.fleetbox/vms/<name>/`; every VM is a member under
+  `~/.fleetbox/clusters/<cluster>/<member>/`, with `<cluster>` derived from the member name
+  (strip a trailing `-<digits>`; solo VM = cluster of one). The holder's control socket and
+  pidfile moved into the member dir (`sock`/`pid`) — no more loose `sock-*`/`pid-*` in the
+  base dir. Store method signatures are unchanged (bodies only); the public API is
+  unchanged. Breaking, no migration (pre-release: delete `~/.fleetbox` by hand). See
+  `docs/adr/0014`.
 
 ## Related projects (same author, reuse experience)
 

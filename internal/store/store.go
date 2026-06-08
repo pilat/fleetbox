@@ -1,4 +1,5 @@
-// Package store manages VM state directories under ~/.fleetbox/vms/.
+// Package store manages VM state directories under
+// ~/.fleetbox/clusters/<cluster>/<member>/.
 package store
 
 import (
@@ -6,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -19,7 +21,7 @@ type VM struct {
 	DiskMB    int       `json:"disk_mb"`
 	Image     string    `json:"image"`
 	CreatedAt time.Time `json:"created_at"`
-	Mounts    []Mount   `json:"mounts,omitempty"`
+	Fixtures  []Fixture `json:"fixtures,omitempty"`
 	// IP is the static IPv4 address assigned at first create on backends that
 	// allocate from a known subnet (Linux/cloud-hypervisor). It is the persisted
 	// source of truth so a rebooted VM keeps its address and a re-joining cluster
@@ -27,15 +29,16 @@ type VM struct {
 	IP string `json:"ip,omitempty"`
 }
 
-// Mount is a persisted host↔guest shared directory. HostPath is absolute, Tag is
-// the stable virtiofs tag assigned at first creation (fbm<i>, i = position in the
-// mount list). The tag is the single source of truth shared between the host
-// virtiofs device and the guest fstab entry, so it is computed once and persisted
-// here rather than re-derived elsewhere.
-type Mount struct {
+// Fixture is a persisted read-only host directory packed into the guest at boot.
+// HostPath is absolute; Label is the stable ext4 volume label assigned at first
+// creation (FBFIX<i>, i = position in the fixture list). The label is the single
+// source of truth shared between the image's volume label and the guest's
+// cloud-init LABEL= mount line, so it is computed once and persisted here rather
+// than re-derived in two places (ADR-0015).
+type Fixture struct {
 	HostPath  string `json:"host_path"`
 	GuestPath string `json:"guest_path"`
-	Tag       string `json:"tag"`
+	Label     string `json:"label"`
 }
 
 // Store manages VM storage.
@@ -56,7 +59,7 @@ func New() (*Store, error) {
 func NewAt(baseDir string) (*Store, error) {
 	dirs := []string{
 		baseDir,
-		filepath.Join(baseDir, "vms"),
+		filepath.Join(baseDir, "clusters"),
 		filepath.Join(baseDir, "images"),
 	}
 	for _, dir := range dirs {
@@ -72,9 +75,24 @@ func (s *Store) BaseDir() string {
 	return s.baseDir
 }
 
-// VMDir returns the directory for a VM.
+// VMDir returns the member directory for a VM, nested under its cluster:
+// <baseDir>/clusters/<cluster>/<member>/. The cluster segment is derived from
+// the member name (see clusterName), so a solo VM "dev" lives at
+// clusters/dev/dev/ and a cluster member "web-2" at clusters/web/web-2/.
 func (s *Store) VMDir(name string) string {
-	return filepath.Join(s.baseDir, "vms", name)
+	return filepath.Join(s.baseDir, "clusters", clusterName(name), name)
+}
+
+// EnsureDir creates the member directory (and its cluster parent) for a VM.
+// It is idempotent and is the single place member directories are created, so
+// the holder (which serves a member's socket/pidfile before the VM boots) and
+// Create both go through it.
+func (s *Store) EnsureDir(name string) error {
+	if err := os.MkdirAll(s.VMDir(name), 0o755); err != nil {
+		return fmt.Errorf("create vm dir: %w", err)
+	}
+
+	return nil
 }
 
 // ImagesDir returns the images cache directory.
@@ -113,10 +131,8 @@ func (s *Store) Exists(name string) bool {
 
 // Create creates a new VM directory and writes its config.
 func (s *Store) Create(vm *VM) error {
-	vmDir := s.VMDir(vm.Name)
-
-	if err := os.MkdirAll(vmDir, 0o755); err != nil {
-		return fmt.Errorf("create vm dir: %w", err)
+	if err := s.EnsureDir(vm.Name); err != nil {
+		return err
 	}
 
 	return s.Save(vm)
@@ -155,7 +171,8 @@ func (s *Store) Load(name string) (*VM, error) {
 	return &vm, nil
 }
 
-// Delete removes a VM directory and all its contents.
+// Delete removes a VM's member directory and all its contents, then drops the
+// parent cluster directory if it is now empty.
 func (s *Store) Delete(name string) error {
 	vmDir := s.VMDir(name)
 
@@ -163,26 +180,51 @@ func (s *Store) Delete(name string) error {
 		return fmt.Errorf("vm %q does not exist", name)
 	}
 
+	// RemoveAll on the MEMBER dir is correct — it must wipe disk.raw, config.json,
+	// seed.iso, sock/pid, etc. (The NEVER-RemoveAll rule below applies only to the
+	// shared parent cluster dir, which may hold sibling members.)
 	if err := os.RemoveAll(vmDir); err != nil {
 		return fmt.Errorf("remove vm dir: %w", err)
 	}
 
+	// Drop the now-maybe-empty cluster directory. os.Remove (NEVER RemoveAll)
+	// refuses a non-empty directory, which is exactly the "siblings still
+	// present, keep it" case; the error is ignored unconditionally
+	// (non-empty, not-exist, perm — all benign here).
+	clusterDir := filepath.Join(s.baseDir, "clusters", clusterName(name))
+	_ = os.Remove(clusterDir)
+
 	return nil
 }
 
-// List returns the names of all stored VMs.
+// List returns the names of all stored VM members, walking the two-level
+// clusters/<cluster>/<member>/ tree and returning the flat list of member
+// names (the unit every caller works in). Results are cluster-sorted then
+// member-sorted (os.ReadDir sorts each level), not creation order.
 func (s *Store) List() ([]string, error) {
-	vmsDir := filepath.Join(s.baseDir, "vms")
+	clustersDir := filepath.Join(s.baseDir, "clusters")
 
-	entries, err := os.ReadDir(vmsDir)
+	clusters, err := os.ReadDir(clustersDir)
 	if err != nil {
-		return nil, fmt.Errorf("read vms dir: %w", err)
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read clusters dir: %w", err)
 	}
 
 	var names []string
-	for _, e := range entries {
-		if e.IsDir() {
-			names = append(names, e.Name())
+	for _, c := range clusters {
+		if !c.IsDir() {
+			continue
+		}
+		members, err := os.ReadDir(filepath.Join(clustersDir, c.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("read cluster dir %s: %w", c.Name(), err)
+		}
+		for _, m := range members {
+			if m.IsDir() {
+				names = append(names, m.Name())
+			}
 		}
 	}
 
@@ -199,19 +241,31 @@ func (s *Store) SeedPath(name string) string {
 	return filepath.Join(s.VMDir(name), "seed.iso")
 }
 
+// FixturePath returns the path to the i-th fixture's ext4 image inside the VM's
+// member directory (fixture-<i>.img). It is per-member, not cluster-level, so the
+// existing Delete → RemoveAll(memberDir) wipes it for free with no extra teardown
+// (ADR-0015).
+func (s *Store) FixturePath(name string, i int) string {
+	return filepath.Join(s.VMDir(name), fmt.Sprintf("fixture-%d.img", i))
+}
+
 // EFIPath returns the path to the VM's EFI variable store.
 func (s *Store) EFIPath(name string) string {
 	return filepath.Join(s.VMDir(name), "efi.nvram")
 }
 
-// PidfilePath returns the path to the VM's pidfile (in baseDir, not vmDir).
+// PidfilePath returns the path to the VM's holder pidfile, inside its member
+// directory. Every member served by one holder writes the same PID (os.Getpid)
+// into its own pidfile.
 func (s *Store) PidfilePath(name string) string {
-	return filepath.Join(s.baseDir, "pid-"+name)
+	return filepath.Join(s.VMDir(name), "pid")
 }
 
-// SocketPath returns the path to the VM's control socket (in baseDir, not vmDir).
+// SocketPath returns the path to the VM's holder control socket, inside its
+// member directory. The filename is kept short ("sock") to stay under the
+// macOS 104-byte sun_path limit.
 func (s *Store) SocketPath(name string) string {
-	return filepath.Join(s.baseDir, "sock-"+name)
+	return filepath.Join(s.VMDir(name), "sock")
 }
 
 // SerialLogPath returns the path to the VM's serial log.
@@ -252,4 +306,33 @@ func (l *Lock) Unlock() error {
 	}
 
 	return nil
+}
+
+// clusterName derives a member's cluster name by stripping a single trailing
+// "-<digits>" group. It is the inverse-free mapping that lets a member's
+// directory be located from its name alone, with no persisted cluster field:
+//
+//	web-3    → web    (normal cluster member)
+//	web-12   → web    (multi-digit index)
+//	dev      → dev    (no dash: its own cluster)
+//	web-1-2  → web-1  (only the last -N is stripped)
+//	node-2024→ node   (accepted consequence: a solo VM ending in -<digits>)
+//	web-     → web-   (trailing dash, no digits: unchanged)
+//	web-x    → web-x  (non-digit suffix: unchanged)
+//	-5       → -5     (empty prefix guarded: no empty path segment)
+func clusterName(name string) string {
+	i := strings.LastIndex(name, "-")
+	if i <= 0 {
+		return name // no dash, or dash at index 0 ("-5") → name as-is
+	}
+	suffix := name[i+1:]
+	if suffix == "" {
+		return name // trailing dash, no digits ("web-") → "web-"
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return name // any non-digit ("web-x") → name as-is
+		}
+	}
+	return name[:i] // strip "-<digits>"
 }

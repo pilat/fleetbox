@@ -1,7 +1,16 @@
 # ADR: Folder Mounts via VZ virtiofs
 
 **Date:** 2026-06-04
-**Status:** Accepted
+**Status:** Superseded by ADR-0015
+
+> **Superseded by [ADR-0015](0015-fixture-payload-ext4.md).** The live read-write
+> `WithMount` virtiofs share described here was removed wholesale and replaced by a
+> read-only, snapshot-at-boot `WithFixture` (ext4 image attached read-only) that works
+> identically on macOS and Linux. cloud-hypervisor has no daemon-free live-share path, so
+> rather than take a `virtiofsd` host dependency on Linux just to mirror macOS's free
+> virtio-fs, live mounts were dropped on both platforms. This document is retained as
+> historical rationale only — `WithMount`, `Mount`, the `fbm<i>` tag scheme, and the
+> uid-alignment hack no longer exist in the code.
 
 ## Context
 
