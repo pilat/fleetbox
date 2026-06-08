@@ -1,3 +1,5 @@
+//go:build darwin
+
 package xpc
 
 /*
@@ -10,7 +12,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // MARK: - Object: Untyped XPC Object

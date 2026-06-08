@@ -288,9 +288,9 @@ Rules:
 
 ## B.2 The public API
 
-- **B.2.1 — Backend-neutral, forever.** No type from `Code-Hex/vz` (or any future
-  hypervisor SDK) appears in an exported signature. Enforced by depguard; violations
-  are bugs (ADR-0002).
+- **B.2.1 — Backend-neutral, forever.** No type from the vendored vz fork
+  (`third_party/vz`, or any future hypervisor SDK) appears in an exported signature.
+  Enforced by depguard; violations are bugs (ADR-0002).
 - **B.2.2 — Functional options.** VM configuration is expressed as `Option` funcs
   (`WithCPUs`, `WithMemoryGB`). Adding a knob = adding a `WithXxx` — never a config
   struct parameter, never a yaml file.

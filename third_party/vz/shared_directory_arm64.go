@@ -15,7 +15,7 @@ import (
 	"runtime/cgo"
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // LinuxRosettaAvailability represents an availability of Rosetta support for Linux binaries.

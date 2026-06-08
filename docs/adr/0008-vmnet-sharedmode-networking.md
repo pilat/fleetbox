@@ -102,3 +102,11 @@ builds for any dev and in CI.
 - Hostname IP discovery (ADR-0007) and the backend-neutral API (ADR-0002) are both
   upheld unchanged — `vmnet`/`vz` types never appear in exported signatures or in
   the neutral `backend` package; only `internal/backend/vz` imports the vz module.
+
+**Update (ADR-0016): the dependency-wiring mechanism is superseded.** The vendored
+fork is no longer a separate module behind a relative `replace` — that `replace` is
+ignored by downstream consumers, so `go get` failed to build on macOS. `third_party/vz`
+is now vendored in-module (renamed import path, `//go:build darwin` throughout, no
+`go.mod`), regenerated from the same pinned sources by `make vendor-vz`. This ADR's
+networking decision (vmnet SharedMode as the sole macOS path) stands; only the `replace`
+wiring and the "drop the replace" exit criterion are replaced. See ADR-0016.

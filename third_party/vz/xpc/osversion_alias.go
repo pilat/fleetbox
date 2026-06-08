@@ -1,7 +1,9 @@
+//go:build darwin
+
 package xpc
 
 import (
-	"github.com/Code-Hex/vz/v3/internal/osversion"
+	"github.com/pilat/fleetbox/third_party/vz/internal/osversion"
 )
 
 var macOSAvailable = osversion.MacOSAvailable

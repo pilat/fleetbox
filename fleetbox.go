@@ -98,10 +98,15 @@ type Cluster struct {
 
 // Options configures VM creation.
 type Options struct {
-	Image    string
-	CPUs     int
-	MemGB    int
-	DiskGB   int
+	// Image is the image alias (e.g. "debian-12") or a direct raw/qcow2 image URL.
+	Image string
+	// CPUs is the number of virtual CPUs.
+	CPUs int
+	// MemGB is the memory size, in gigabytes.
+	MemGB int
+	// DiskGB is the disk size, in gigabytes.
+	DiskGB int
+	// Fixtures are read-only host directories packed into the guest at boot (see Fixture).
 	Fixtures []Fixture
 }
 

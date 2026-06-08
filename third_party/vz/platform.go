@@ -1,3 +1,5 @@
+//go:build darwin
+
 package vz
 
 /*
@@ -13,7 +15,7 @@ import (
 	"os"
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // PlatformConfiguration is an interface for a platform configuration.

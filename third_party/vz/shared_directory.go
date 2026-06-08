@@ -1,3 +1,5 @@
+//go:build darwin
+
 package vz
 
 /*
@@ -11,7 +13,7 @@ import "C"
 import (
 	"os"
 
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // DirectorySharingDeviceConfiguration for a directory sharing device configuration.

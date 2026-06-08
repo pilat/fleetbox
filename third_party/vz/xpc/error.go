@@ -1,3 +1,5 @@
+//go:build darwin
+
 package xpc
 
 /*
@@ -8,7 +10,7 @@ import "C"
 import (
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // RichError represents an XPC rich error. ([XPC_TYPE_RICH_ERROR]) [TypeRichError]

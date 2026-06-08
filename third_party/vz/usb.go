@@ -1,3 +1,5 @@
+//go:build darwin
+
 package vz
 
 /*
@@ -10,7 +12,7 @@ import (
 	"runtime/cgo"
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // NewUSBMassStorageDevice initialize the runtime USB Mass Storage device object.

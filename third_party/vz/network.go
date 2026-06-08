@@ -1,3 +1,5 @@
+//go:build darwin
+
 package vz
 
 /*
@@ -14,8 +16,8 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/Code-Hex/vz/v3/internal/objc"
-	"github.com/Code-Hex/vz/v3/vmnet"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/vmnet"
 )
 
 // BridgedNetwork defines a network interface that bridges a physical interface with a virtual machine.

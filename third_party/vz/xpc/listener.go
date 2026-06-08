@@ -1,3 +1,5 @@
+//go:build darwin
+
 package xpc
 
 /*
@@ -9,8 +11,8 @@ import "C"
 import (
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/cgohandler"
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/cgohandler"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // Listener represents an XPC listener. (macOS 14.0+)

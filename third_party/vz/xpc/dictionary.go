@@ -1,3 +1,5 @@
+//go:build darwin
+
 package xpc
 
 /*
@@ -12,8 +14,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/cgohandler"
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/cgohandler"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // Dictionary represents an XPC dictionary ([XPC_TYPE_DICTIONARY]) object. [TypeDictionary]

@@ -1,3 +1,5 @@
+//go:build darwin
+
 package xpc
 
 /*
@@ -11,8 +13,8 @@ import (
 	"runtime/cgo"
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/cgohandler"
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/cgohandler"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // Session represents an [xpc_session_t]. (macOS 13.0+)

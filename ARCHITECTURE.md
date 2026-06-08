@@ -28,9 +28,9 @@ Two consumers, one API:
 
 - **Library mode** — `fleetbox.Start()` / `fleetboxtest.Start(t, ...)` inside a Go test
   process. The test process owns the VMs; when it exits, the VMs die.
-- **CLI mode** — `fleetbox up/down/ls/ssh/cp/ssh-config/rm` for manual work. Because a VZ
-  VM lives only as long as its owning process, the CLI re-execs itself as a background
-  *runner* process per VM (§4.4).
+- **CLI mode** — `fleetbox up/down/ls/ssh/cp/ssh-config/rm` for manual work. Because a VM
+  lives only as long as its owning process, the CLI re-execs itself as a background
+  *holder* process per `up` group — a single VM or a whole cluster sharing one network (§4.4).
 
 Everything the CLI does goes through the public Go API. The library is the product; the
 CLI is a wrapper (see ADR-0001).
@@ -67,6 +67,7 @@ Where the canonical version of each thing lives. When two files disagree, the So
 | Architecture (current state) | `ARCHITECTURE.md` (this file) | Descriptive. |
 | Design decisions & rationale | `docs/adr/` | One file per decision, sequentially numbered. |
 | Build & signing recipe | `Makefile` + `entitlements.plist` | `com.apple.security.virtualization` entitlement. |
+| Vendored vz provenance & regen | `third_party/vz/NOTICE` + `hack/vendor-vz.sh` | Pinned upstream + vmnet-patch SHAs; `make vendor-vz` regenerates (ADR-0008, ADR-0016). |
 | CI behavior | `.github/workflows/ci.yml` | Lint + build + unit tests only; no VM boots on CI. |
 | Working specs (local only) | `ai/tasks/` | Gitignored. Durable decisions must graduate to ADRs. |
 
@@ -446,15 +447,17 @@ When a PR changes any of these fields for a package, update its section.
 - Owns: the `vz.VirtualMachine` object and the serial-console copy goroutine; the
   `vzNetwork` wrapper around a vmnet logical network; the process-wide reserved-subnet
   set used by the subnet detector.
-- Depends on: `internal/backend`, `github.com/Code-Hex/vz/v3` and its
-  `.../vz/v3/vmnet` subpackage (both vendored under `third_party/vz`, ADR-0008).
+- Depends on: `internal/backend` and the vendored vz fork
+  `github.com/pilat/fleetbox/third_party/vz` + its `.../third_party/vz/vmnet`
+  subpackage — the import-path-renamed Code-Hex/vz, vendored in-module under
+  `third_party/vz` (no separate go.mod; `//go:build darwin` throughout, ADR-0008).
 - Public API (internal): `New() *Backend`; `Backend` (`CreateNetwork`, `Create`,
   `NestedVirtSupported`, `SupportsClustering`) and `VM`/`vzNetwork` satisfy the backend
   interfaces (`var _` checks present). `VM.WaitForIP` discovers the IP via
   `dhcp.LookupByHostname` + a TCP:22 probe; `vzNetwork.Subnet` returns "" (DHCP).
 - Invariants:
-  - **The only package in the module that imports `Code-Hex/vz`** and its `vmnet`
-    subpackage (ADR-0002; enforced by the depguard rule in `.golangci.yml`).
+  - **The only package in the module that imports the vendored vz fork** and its
+    `vmnet` subpackage (ADR-0002; enforced by the depguard rule in `.golangci.yml`).
   - All vz/vmnet types/states are translated to `backend` types at this boundary;
     nothing vz leaks upward. The `vmnet.Network` lives behind the opaque
     `backend.Network`.
@@ -719,8 +722,8 @@ Edges that exist (verified by `go list -f '{{.Imports}}'`):
   (`backend_darwin_arm64.go` → `internal/backend/vz`; `backend_linux.go` →
   `internal/backend/cloudhypervisor` + `internal/store` for the bin dir)
 - `internal/backend/vz` (darwin/arm64) → `internal/backend`, `internal/dhcp`, and
-  `Code-Hex/vz` + its `vmnet` subpackage (the only vz imports; vendored under
-  `third_party/vz` via a relative `replace`, ADR-0008)
+  the vendored vz fork `github.com/pilat/fleetbox/third_party/vz` + its `vmnet`
+  subpackage (the only vz imports; vendored in-module under `third_party/vz`, ADR-0008)
 - `internal/backend/cloudhypervisor` (linux) → `internal/backend`, `internal/fetch`,
   stdlib only (the only CH import site; no third-party module, no cgo)
 - `internal/image` → `internal/fetch`, `go-qcow2reader`
@@ -742,8 +745,9 @@ CLAUDE.md as checkable rules):
 1. **Library-first.** Every capability exists in the Go API; the CLI only wraps it.
    Check: `cmd/fleetbox` and `internal/runner` import `fleetbox`, never the reverse.
 2. **Backend-neutral public API.** No hypervisor type appears in an exported signature.
-   `Code-Hex/vz` is imported only by `internal/backend/vz` (depguard rule `vz-isolation`
-   in `.golangci.yml`; `make lint` fails on violation); cloud-hypervisor specifics live
+   the vendored vz fork (`third_party/vz`) is imported only by `internal/backend/vz`
+   (depguard rule `vz-isolation` in `.golangci.yml`; `make lint` fails on violation);
+   cloud-hypervisor specifics live
    only in `internal/backend/cloudhypervisor` (a convention, mirroring vz-isolation).
 3. **Nothing of ours inside the guest.** The only artifact fleetbox produces for a
    guest is a cloud-init NoCloud seed ISO. No agent, no helper binary, no host↔guest
@@ -822,11 +826,16 @@ After implementation changes, verify:
 - **Backend contract**: `internal/backend/backend.go` interfaces match §5.4.
 - **State layout**: path methods in `internal/store/store.go` match the §4.2 tree.
 - **Dependencies**: direct requires in `go.mod` match the deps named in §5 module
-  sections (currently: Code-Hex/vz, pilat/cloudiso, pilat/go-ext4fs, go-qcow2reader,
-  x/crypto).
-  Code-Hex/vz is vendored under `third_party/vz` and resolved via a relative `replace`
-  pending upstream release of PR #205 (ADR-0008); `third_party/` is excluded from lint
-  and is its own module (skipped by `go ... ./...`).
+  sections (currently: pilat/cloudiso, pilat/go-ext4fs, go-qcow2reader, x/crypto, plus
+  go-infinity-channel + x/mod + x/sys pulled in by the in-module vendored vz). The vz
+  fork itself is not a require — it is vendored in-module (see below).
+  The vz fork is the import-path-renamed Code-Hex/vz + norio-nomura's unreleased
+  vmnet patch (PR #205), regenerated from pinned sources by `make vendor-vz`. It is
+  vendored in-module under `third_party/vz` — no separate go.mod, so a downstream
+  `go get` builds it like our own package — with every file constrained to
+  `//go:build darwin`, so non-darwin `go build ./...` skips it (ADR-0008).
+  `third_party/` is excluded from lint; provenance and the regen recipe are in
+  `third_party/vz/NOTICE` and `hack/vendor-vz.sh`.
 - **Invariants**: `make lint` passes (depguard enforces invariant #2); the rest of §6
   is spot-checked by reading the named files.
 - **New design decisions**: anything decided in a spec under `ai/tasks/` that changed

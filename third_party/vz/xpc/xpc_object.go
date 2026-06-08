@@ -1,3 +1,5 @@
+//go:build darwin
+
 package xpc
 
 /*
@@ -9,7 +11,7 @@ import (
 	"runtime"
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 type pointer = objc.Pointer

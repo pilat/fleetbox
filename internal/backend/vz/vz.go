@@ -18,11 +18,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Code-Hex/vz/v3"
-	"github.com/Code-Hex/vz/v3/vmnet"
-
 	"github.com/pilat/fleetbox/internal/backend"
 	"github.com/pilat/fleetbox/internal/dhcp"
+	"github.com/pilat/fleetbox/third_party/vz"
+	"github.com/pilat/fleetbox/third_party/vz/vmnet"
 )
 
 // reservedSubnets records every /24 handed out by detectFreeIPv4Subnet in this

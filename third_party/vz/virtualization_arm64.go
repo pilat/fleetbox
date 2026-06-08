@@ -23,8 +23,8 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/objc"
-	"github.com/Code-Hex/vz/v3/internal/progress"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/progress"
 )
 
 // WithStartUpFromMacOSRecovery is an option to specifiy whether to start up

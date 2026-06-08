@@ -1,3 +1,5 @@
+//go:build darwin
+
 package sliceutil
 
 // FindValueByIndex returns the value of the index in s,

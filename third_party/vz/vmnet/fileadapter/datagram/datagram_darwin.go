@@ -6,8 +6,8 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/Code-Hex/vz/v3/vmnet"
-	"github.com/Code-Hex/vz/v3/vmnet/fileadapter"
+	"github.com/pilat/fleetbox/third_party/vz/vmnet"
+	"github.com/pilat/fleetbox/third_party/vz/vmnet/fileadapter"
 )
 
 // MARK: - FileAdapterForInterface

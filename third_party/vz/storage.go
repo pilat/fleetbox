@@ -1,3 +1,5 @@
+//go:build darwin
+
 package vz
 
 /*
@@ -17,7 +19,7 @@ import (
 	"unsafe"
 
 	infinity "github.com/Code-Hex/go-infinity-channel"
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 type baseStorageDeviceAttachment struct{}

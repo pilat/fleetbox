@@ -10,7 +10,7 @@ package vz
 */
 import "C"
 import (
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // MacKeyboardConfiguration is a struct that defines the configuration

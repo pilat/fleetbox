@@ -7,7 +7,7 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/Code-Hex/vz/v3/vmnet"
+	"github.com/pilat/fleetbox/third_party/vz/vmnet"
 )
 
 // FilePair creates a pair of connected *[os.File] using [syscall.Socketpair].

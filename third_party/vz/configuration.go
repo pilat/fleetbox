@@ -1,3 +1,5 @@
+//go:build darwin
+
 package vz
 
 /*
@@ -10,7 +12,7 @@ package vz
 */
 import "C"
 import (
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // VirtualMachineConfiguration defines the configuration of a VirtualMachine.

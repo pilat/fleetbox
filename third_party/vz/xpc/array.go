@@ -1,3 +1,5 @@
+//go:build darwin
+
 package xpc
 
 /*
@@ -11,8 +13,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/cgohandler"
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/cgohandler"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // Array represents an XPC array([XPC_TYPE_ARRAY]) object. [TypeArray]

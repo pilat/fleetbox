@@ -26,8 +26,9 @@ Module: `github.com/pilat/fleetbox`
 
 - **Library-first.** Every capability exists in the Go API; the CLI only wraps it.
 - **Backend-neutral public API.** Hypervisor types must never appear in exported
-  signatures. `Code-Hex/vz` is allowed only in `internal/backend/vz`; cloud-hypervisor
-  specifics only in `internal/backend/cloudhypervisor`.
+  signatures. The vendored vz fork (`third_party/vz`) is allowed only in
+  `internal/backend/vz`; cloud-hypervisor specifics only in
+  `internal/backend/cloudhypervisor`.
 - **Nothing of ours inside the guest.** No agent, no helper binary, no host↔guest
   protocol. The guest is a stock distro configured once by cloud-init.
 - **No port forwarding.** VMs get directly routable IPs — vmnet SharedMode on macOS 26+,
@@ -58,7 +59,7 @@ internal/runner                 CLI-mode VM holder process (re-exec, pidfile, so
 cmd/fleetbox                    CLI: up/down/ls/ssh/cp/ssh-config/rm
 ```
 
-Key external deps: `Code-Hex/vz/v3` (macOS), `pilat/cloudiso` (seed ISO),
+Key external deps: the vendored vz fork `third_party/vz` (macOS), `pilat/cloudiso` (seed ISO),
 `pilat/go-ext4fs` (fixture ext4 payload), `go-qcow2reader`,
 `golang.org/x/crypto/ssh`. The Linux path stays pure Go (cloud-hypervisor is a subprocess
 controlled over its unix socket with stdlib; go-ext4fs is pure Go too) — no cgo.
@@ -81,7 +82,8 @@ controlled over its unix socket with stdlib; go-ext4fs is pure Go too) — no cg
   Unlike VZ, the cloud-hypervisor backend *is* CI-testable on Linux runners with KVM — a
   future win, out of v1 scope.
 - Commands: `make test` (unit), `make test-vm` (boots real VMs), `make lint`,
-  `make build` (compile + codesign the CLI). No generic sign-test target — signing a VM
+  `make build` (compile + codesign the CLI), `make vendor-vz` (regenerate the vendored
+  vz fork from pinned sources — maintenance only). No generic sign-test target — signing a VM
   test binary for another package is a manual `go test -c` + `codesign`.
 
 ## Go style

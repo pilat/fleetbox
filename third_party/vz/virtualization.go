@@ -1,3 +1,5 @@
+//go:build darwin
+
 package vz
 
 /*
@@ -16,8 +18,8 @@ import (
 	"unsafe"
 
 	infinity "github.com/Code-Hex/go-infinity-channel"
-	"github.com/Code-Hex/vz/v3/internal/objc"
-	"github.com/Code-Hex/vz/v3/internal/sliceutil"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/sliceutil"
 )
 
 // VirtualMachineState represents execution state of the virtual machine.
@@ -205,7 +207,6 @@ func (v *VirtualMachine) USBControllers() []*USBController {
 	}
 	return usbControllers
 }
-
 
 //export changeStateOnObserver
 func changeStateOnObserver(newStateRaw C.int, cgoHandleUintptr C.uintptr_t) {

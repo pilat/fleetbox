@@ -1,5 +1,5 @@
-//go:build !go1.18
-// +build !go1.18
+//go:build darwin && !go1.18
+// +build darwin,!go1.18
 
 package objc
 

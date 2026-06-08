@@ -1,0 +1,30 @@
+fleetbox vendors a patched copy of Code-Hex/vz in this directory.
+
+WHAT
+  third_party/vz is Code-Hex/vz (Go bindings for Apple Virtualization.framework)
+  plus norio-nomura's not-yet-released "VZVmnetNetworkDeviceAttachment" change
+  (PR #205), which fleetbox needs for macOS 26 vmnet SharedMode VM-to-VM networking.
+
+WHY IT LIVES HERE
+  The vmnet patch is unreleased upstream. A separate module + replace directive
+  would not resolve for a downstream `go get`, so the code lives here as part of
+  the fleetbox module and builds like our own package.
+
+WHAT WE CHANGED (mechanically — see hack/vendor-vz.sh; nothing edited by hand)
+  - import path renamed: github.com/Code-Hex/vz/v3 -> github.com/pilat/fleetbox/third_party/vz
+  - every .go constrained to //go:build darwin (darwin-only cgo) so the package is
+    skipped by 'go build ./...' on non-darwin platforms
+  - upstream go.mod/go.sum, tests, dev tools, examples and CI scaffolding removed
+  Regenerate with: make vendor-vz
+
+SOURCES (pinned)
+  base:  https://github.com/Code-Hex/vz @ 0d35cf3a3a8b834ee3b5bf61e4946971b2c0d61a
+  patch: https://github.com/norio-nomura/vz @ e27a5fb55e5936b69a62590f4ce326d8772641a9 (PR #205)
+
+LICENSE
+  MIT, (c) 2025 codehex — retained verbatim in LICENSE. The vendored patch is a
+  contribution to that MIT-licensed project, under the same license.
+
+EXIT
+  When PR #205 (or a successor) is released upstream, delete third_party/vz and
+  hack/vendor-vz.sh and depend on the released Code-Hex/vz directly. See docs/adr/0008.

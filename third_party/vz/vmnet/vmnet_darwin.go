@@ -15,10 +15,10 @@ import (
 	"runtime/cgo"
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/cgohandler"
-	"github.com/Code-Hex/vz/v3/internal/objc"
-	"github.com/Code-Hex/vz/v3/internal/osversion"
-	"github.com/Code-Hex/vz/v3/xpc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/cgohandler"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/osversion"
+	"github.com/pilat/fleetbox/third_party/vz/xpc"
 	"golang.org/x/sys/unix"
 )
 

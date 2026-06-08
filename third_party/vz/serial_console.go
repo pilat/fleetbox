@@ -1,3 +1,5 @@
+//go:build darwin
+
 package vz
 
 /*
@@ -9,7 +11,7 @@ import "C"
 import (
 	"os"
 
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // SerialPortAttachment interface for a serial port attachment.

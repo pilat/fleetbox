@@ -44,9 +44,10 @@ fleetbox takes the opposite line:
 - **Real VMs, not containers.** It EFI-boots unmodified cloud images through their own
   bootloader. Real kernel, real init, and nested virtualization on M3+ — you can run KVM
   *inside* the guest.
-- **Every VM gets a routable IP.** Virtualization.framework's NAT drops each VM onto a
-  bridge with a real DHCP address. No port forwarding, no `-p` flags, no tunnel daemon —
-  call `vm.IP()` and connect.
+- **Every VM gets a routable IP.** On macOS 26+ each VM joins a vmnet SharedMode network;
+  on Linux it gets a static address on a shared bridge — a real, directly reachable IP
+  either way. No port forwarding, no `-p` flags, no tunnel daemon — call `vm.IP()` and
+  connect.
 - **Nothing of ours runs in the guest.** No agent, no helper binary, no host↔guest
   protocol. A VM is configured exactly once by cloud-init; after that it's a plain distro
   you reach over SSH.
@@ -123,9 +124,9 @@ func TestNeedsARealKernel(t *testing.T) {
 
 `fleetboxtest.Start` registers `t.Cleanup` to destroy the VM, derives a collision-safe name
 from the test name (parallel-test friendly), and skips automatically when the hardware can't
-run it. `SkipIfShort` opts a test out under `go test -short`. `StartN` boots several
-independent VMs at once — though note they can't reach each other yet
-([Limitations](#limitations)).
+run it. `SkipIfShort` opts a test out under `go test -short`. `StartN` boots an
+interconnected cluster — several VMs on one shared network that reach each other by IP
+(where clustering is supported; see [Limitations](#limitations)).
 
 ### As a library (no testing.T)
 

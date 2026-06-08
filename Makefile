@@ -1,4 +1,4 @@
-.PHONY: all build test test-vm lint clean
+.PHONY: all build test test-vm lint vendor-vz clean
 
 # Default target
 all: build
@@ -29,6 +29,13 @@ test-vm:
 # Run linter
 lint:
 	golangci-lint run ./...
+
+# Regenerate the vendored Code-Hex/vz fork under third_party/vz from pinned
+# sources: stock vz + the vmnet-SharedMode patch (PR #205), renamed into this
+# module's import path. The output is committed; rerun only to re-sync upstream,
+# then commit the result. Pins and recipe live in hack/vendor-vz.sh.
+vendor-vz:
+	./hack/vendor-vz.sh
 
 # Clean build artifacts
 clean:

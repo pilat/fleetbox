@@ -82,18 +82,20 @@ func StartN(t testing.TB, prefix string, n int, opts ...fleetbox.Option) []*flee
 	return vms
 }
 
-// skipIfUnsupported skips the test if running on an unsupported platform. The
-// fixtures currently target darwin/arm64; Linux (cloud-hypervisor) fixtures are
-// a follow-up, so non-darwin/arm64 hosts skip rather than attempt a boot.
+// skipIfUnsupported skips the test on platforms fleetbox does not support, or
+// when the host cannot boot a VM. Supported platforms are darwin/arm64 (Apple
+// Virtualization) and linux/{amd64,arm64} (cloud-hypervisor).
 func skipIfUnsupported(t testing.TB) {
 	t.Helper()
 
-	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
-		t.Skip("fleetboxtest currently supports darwin/arm64 only (Linux fixtures are a follow-up)")
+	darwinARM := runtime.GOOS == "darwin" && runtime.GOARCH == "arm64"
+	linux := runtime.GOOS == "linux" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64")
+	if !darwinARM && !linux {
+		t.Skipf("fleetbox supports darwin/arm64 and linux/{amd64,arm64}, not %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 
 	if !fleetbox.NestedVirtSupported() {
-		t.Skip("nested virtualization not supported (requires M3+ and macOS 15+)")
+		t.Skip("host lacks nested virtualization (macOS: Apple Silicon M3+; Linux: /dev/kvm access)")
 	}
 }
 

@@ -1,3 +1,5 @@
+//go:build darwin
+
 package vz
 
 /*
@@ -11,7 +13,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // BootLoader is the interface of boot loader definitions.

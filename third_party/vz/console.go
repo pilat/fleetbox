@@ -1,3 +1,5 @@
+//go:build darwin
+
 package vz
 
 /*
@@ -9,7 +11,7 @@ import "C"
 import (
 	"unsafe"
 
-	"github.com/Code-Hex/vz/v3/internal/objc"
+	"github.com/pilat/fleetbox/third_party/vz/internal/objc"
 )
 
 // ConsoleDeviceConfiguration interface for an console device configuration.

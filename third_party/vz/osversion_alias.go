@@ -1,6 +1,8 @@
+//go:build darwin
+
 package vz
 
-import "github.com/Code-Hex/vz/v3/internal/osversion"
+import "github.com/pilat/fleetbox/third_party/vz/internal/osversion"
 
 var (
 	// ErrUnsupportedOSVersion is returned when calling a method which is only
