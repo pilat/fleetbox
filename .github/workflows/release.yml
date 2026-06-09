@@ -1,0 +1,36 @@
+name: Release
+
+# Publishes the product: the pure-Go CLI (cmd/fleetbox). It links no hypervisor
+# and needs no codesign, so it builds cross-platform on Linux via GoReleaser. The
+# tagged commit already carries the helper's url+sha256 in internal/helperdist, so
+# `go get <module>@<tag>` ships a catalog that resolves the published helper.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,30 @@
+version: 2
+
+# Product release config: the pure-Go fleetbox CLI. No cgo, no codesign — the VM
+# helper is a separate artifact published by release-helper.yml (ADR-0017).
+builds:
+  - id: fleetbox
+    main: ./cmd/fleetbox
+    binary: fleetbox
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # Intel macOS is unsupported (Apple Virtualization needs Apple Silicon).
+      - goos: darwin
+        goarch: amd64
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  draft: false

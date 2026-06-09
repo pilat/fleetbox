@@ -24,6 +24,9 @@ import (
 	"github.com/pilat/fleetbox"
 )
 
+// fallbackName is the VM name used when a test name sanitizes to an empty string.
+const fallbackName = "test"
+
 // Start creates a VM and registers cleanup to destroy it when the test completes.
 // The VM name is derived from the test name to ensure uniqueness in parallel tests.
 func Start(t testing.TB, image string, opts ...fleetbox.Option) *fleetbox.VM {
@@ -125,7 +128,7 @@ func safeName(testName string) string {
 	name = strings.Trim(name, "-")
 
 	if name == "" {
-		name = "test"
+		name = fallbackName
 	}
 
 	return name

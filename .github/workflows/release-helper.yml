@@ -1,0 +1,63 @@
+name: Release helper
+
+# Builds, ad-hoc-signs and publishes the macOS VM helper — the only binary that
+# links Apple Virtualization.framework, so the only one that needs the
+# com.apple.security.virtualization entitlement and a macOS runner to codesign.
+# Versioned independently from the product (CLI) so the two artifacts coexist
+# (ADR-0017 R5): tag `helper-v0.1.0` here, then wire the printed url+sha256 into
+# internal/helperdist and tag the product release `v0.1.0`.
+on:
+  push:
+    tags: ['helper-v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release-helper:
+    runs-on: macos-26
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build helper (darwin/arm64)
+        run: go build -o fleetbox-helper-darwin-arm64 ./cmd/fleetbox-helper
+
+      - name: Ad-hoc sign with virtualization entitlement
+        run: codesign --entitlements entitlements.plist --force -s - fleetbox-helper-darwin-arm64
+
+      - name: Checksum
+        id: sum
+        run: |
+          shasum -a 256 fleetbox-helper-darwin-arm64 > fleetbox-helper-darwin-arm64.sha256
+          cat fleetbox-helper-darwin-arm64.sha256
+          sha=$(awk '{print $1}' fleetbox-helper-darwin-arm64.sha256)
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "## fleetbox-helper ${GITHUB_REF_NAME}"
+            echo
+            echo "Wire this into \`internal/helperdist/helperdist.go\`:"
+            echo '```go'
+            echo "url:     \"https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/fleetbox-helper-darwin-arm64\","
+            echo "sha256:  \"${sha}\","
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            fleetbox-helper-darwin-arm64 \
+            fleetbox-helper-darwin-arm64.sha256 \
+            --title "fleetbox-helper $GITHUB_REF_NAME" \
+            --notes "fleetbox-helper for darwin/arm64, ad-hoc signed with \`com.apple.security.virtualization\`.
+
+          sha256: \`${{ steps.sum.outputs.sha256 }}\`
+
+          Next: wire url + sha256 into \`internal/helperdist\`, then tag the product release \`v0.1.0\`."
