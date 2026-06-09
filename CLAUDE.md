@@ -42,9 +42,14 @@ Module: `github.com/pilat/fleetbox`
 ## Architecture summary
 
 ```
-fleetbox.go                     public API: Start/StartN, VM, Cluster, Options, NestedVirtSupported
-backend_{darwin_arm64,linux,unsupported}.go  compile-time backend selection per platform
+fleetbox.go                     public API (neutral): VM, Cluster, Options/Option/Fixture (aliases to opts), With*, StartN/StartCluster, NestedVirtSupported, Prune, ErrClustersUnsupported
+fleetbox_{linux,darwin_arm64,unsupported}.go  per-platform Start/NewCluster/prune/nestedVirtSupported + the VM/Cluster impl behind the build-tagged seam (linux: wraps orchestrator in-process; darwin: a pure-Go client driving the helper) (ADR-0017)
 fleetboxtest/                   testing.TB fixtures: Start(t, image), StartN, SkipIfShort
+internal/opts                   backend-free option data + Encode/Decode for the helper boundary (ADR-0017)
+internal/control                backend-free CLIENT half of the holder protocol: Spawn/Status/WaitMembers/Stop/AddMember + bound-mode bind/version handshake (ADR-0017)
+internal/orchestrator           VM-owning logic (resolveStartDeps/startOnNetwork/allocateIP/fixtures/Cluster) + compile-time backend selection; the ONLY package that links a backend (ADR-0017)
+internal/holder                 SERVER half of the holder protocol (Run/holder/bootMember) + bound-lifetime teardown; in cmd/fleetbox-helper on darwin, reached by CLI re-exec on linux (ADR-0017)
+internal/helperdist             macOS helper catalog + download/verify/quarantine-strip + FLEETBOX_HELPER override (ADR-0017)
 internal/backend                Backend interface (CreateNetwork/Create/NestedVirtSupported/SupportsClustering)
 internal/backend/vz             VZ implementation, darwin/arm64 (the only vz import site)
 internal/backend/cloudhypervisor cloud-hypervisor implementation, linux (the only CH import site)
@@ -55,20 +60,27 @@ internal/fixture                host dir → read-only ext4 payload image (via p
 internal/store                  ~/.fleetbox/{clusters,images,bin}/ state, config.json, locking; cluster-rooted layout clusters/<cluster>/<member>/ (ADR-0014)
 internal/dhcp                   /var/db/dhcpd_leases parsing (hostname → IP); darwin-only
 internal/sshkey                 keypair + x/crypto/ssh client
-internal/runner                 CLI-mode VM holder process (re-exec, pidfile, socket)
-cmd/fleetbox                    CLI: up/down/ls/ssh/cp/ssh-config/rm
+cmd/fleetbox                    CLI: up/down/ls/ssh/cp/ssh-config/rm (pure-Go client; on darwin drives the helper, on linux re-execs itself as the holder)
+cmd/fleetbox-helper             darwin VM host: links vz, signed, downloaded; runs internal/holder (ADR-0017)
 ```
 
-Key external deps: the vendored vz fork `third_party/vz` (macOS), `pilat/cloudiso` (seed ISO),
-`pilat/go-ext4fs` (fixture ext4 payload), `go-qcow2reader`,
-`golang.org/x/crypto/ssh`. The Linux path stays pure Go (cloud-hypervisor is a subprocess
-controlled over its unix socket with stdlib; go-ext4fs is pure Go too) — no cgo.
+On darwin the importable package and the CLI are pure Go — they link neither `vz` nor
+`internal/orchestrator`; the only darwin binary that links vz is `cmd/fleetbox-helper`
+(`GOOS=darwin GOARCH=arm64 go list -deps` of root/fleetboxtest/cmd-fleetbox excludes
+`internal/backend/vz` and `third_party/vz`, and they build with `CGO_ENABLED=0`).
+
+Key external deps: the vendored vz fork `third_party/vz` (macOS, helper only), `pilat/cloudiso`
+(seed ISO), `pilat/go-ext4fs` (fixture ext4 payload), `go-qcow2reader`, `golang.org/x/crypto/ssh`,
+`golang.org/x/sys/unix` (sysctl probes, quarantine xattr). The Linux path and the darwin client
+stay pure Go — no cgo; cgo lives only in the darwin helper.
 
 ## Build & test notes
 
-- **macOS** binaries (CLI and test binaries) need the `com.apple.security.virtualization`
-  entitlement — ad-hoc codesign is enough for dev. Use the Makefile targets (`make build`
-  skips codesign on Linux); never run unsigned VM tests on macOS and wonder why they fail.
+- **macOS** user binaries (CLI and test binaries) are pure Go and need NO entitlement and
+  NO codesign — that's the ADR-0017 sever. Only `cmd/fleetbox-helper` carries the
+  `com.apple.security.virtualization` entitlement (ad-hoc codesign). For dev/VM tests,
+  `make helper` builds+signs it and `make test-vm` points the library at it via
+  `FLEETBOX_HELPER`; the published helper auto-downloads once Task-7 publishing lands.
 - The module compiles on `darwin/arm64`, `linux/amd64`, and `linux/arm64`. Other targets
   (incl. `darwin/amd64`) compile but error at runtime with "unsupported platform". Unit
   tests (`make test`) and `make lint` run on darwin/arm64; lint the Linux code with
@@ -81,10 +93,11 @@ controlled over its unix socket with stdlib; go-ext4fs is pure Go too) — no cg
   Do not switch the macOS CI to ubuntu (it must keep building/linting the darwin code).
   Unlike VZ, the cloud-hypervisor backend *is* CI-testable on Linux runners with KVM — a
   future win, out of v1 scope.
-- Commands: `make test` (unit), `make test-vm` (boots real VMs), `make lint`,
-  `make build` (compile + codesign the CLI), `make vendor-vz` (regenerate the vendored
-  vz fork from pinned sources — maintenance only). No generic sign-test target — signing a VM
-  test binary for another package is a manual `go test -c` + `codesign`.
+- Commands: `make test` (unit), `make build` (compile the pure-Go CLI, no signing),
+  `make helper` (build + ad-hoc-sign `cmd/fleetbox-helper`, darwin only), `make test-vm`
+  (builds+signs the helper, exports `FLEETBOX_HELPER`, boots real VMs), `make lint`,
+  `make vendor-vz` (regenerate the vendored vz fork — maintenance only). No test binary is
+  ever signed now — the sever moved the entitlement into the helper.
 
 ## Go style
 
@@ -95,10 +108,25 @@ at the caller. Every exported symbol gets a doc comment — this is a library.
 
 ## Known deviations from spec
 
+- **macOS signed-helper sever: the importable package is pure Go (no cgo, no codesign).**
+  All Virtualization.framework work moved out of the importable package into a separately
+  distributed, ad-hoc-signed `cmd/fleetbox-helper` that the library downloads at first use
+  (like cloud-hypervisor on Linux) and drives over a unix socket. The darwin root package
+  and CLI are thin pure-Go clients: they spawn the helper, hand it `Options`, poll for the
+  IP, then dial the VM's IP directly for SSH/cp (the helper protocol never proxies SSH).
+  Library mode spawns the helper *bound* (attached + parent-PID watch + control-conn EOF) so
+  it reaps itself and its in-process VMs when the test process dies, even on `kill -9`; the
+  CLI keeps the detached/persistent holder. Linux stays in-process (nothing to sign; CH is
+  already the downloaded VMM) with a `/dev/kvm`+`CAP_NET_ADMIN` preflight. The public API is
+  unchanged; `VM`/`Cluster` are defined once over a build-tagged unexported impl, and
+  `Options`/`Option`/`Fixture`/`With*` are aliases over `internal/opts`. Supersedes ADR-0006
+  and ADR-0009 on macOS (both still in force on Linux). Until the signed helper is published,
+  dev/CI use the `FLEETBOX_HELPER` override. See `docs/adr/0017`.
+
 - **Cross-platform: macOS (VZ) + Linux (cloud-hypervisor) behind one API.** The module
   is no longer `darwin && arm64`-only. The backend is selected at compile time per
-  platform (`backend_darwin_arm64.go` → vz, `backend_linux.go` → cloud-hypervisor,
-  `backend_unsupported.go` → clear error). On Linux the VMM is a downloaded,
+  platform (now inside `internal/orchestrator`: `backend_darwin_arm64.go` → vz,
+  `backend_linux.go` → cloud-hypervisor, `backend_unsupported.go` → clear error). On Linux the VMM is a downloaded,
   checksum-pinned cloud-hypervisor binary + firmware (cached in `~/.fleetbox/bin/`),
   run as a subprocess and controlled over its unix-socket REST API with stdlib — pure
   Go, no cgo. Linux networking is a shared bridge + per-VM tap with static IPs injected

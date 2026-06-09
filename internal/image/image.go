@@ -74,6 +74,13 @@ func Ensure(cacheDir, urlOrAlias string) (string, error) {
 		return rawPath, nil
 	}
 
+	// Not cached: a multi-hundred-MB download is about to start, so announce it
+	// rather than let a first run look like a hung test (ADR-0017, R11). In the
+	// macOS helper and the Linux CLI holder this line goes to the holder log (the
+	// client surfaces its own "pulling…" line); on the in-process Linux library
+	// path it reaches the user directly.
+	fmt.Fprintf(os.Stderr, "Pulling cloud image %q (first run, this can take a few minutes)...\n", urlOrAlias)
+
 	// A raw source needs no conversion: fetch it (verified) straight to its raw
 	// cache name and we are done.
 	if !isQcow2 {

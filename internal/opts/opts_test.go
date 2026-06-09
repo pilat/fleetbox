@@ -1,30 +1,44 @@
-package runner
+package opts
 
 import (
 	"strings"
 	"testing"
-
-	"github.com/pilat/fleetbox"
 )
 
+func TestWithFixtureAppliesToOptions(t *testing.T) {
+	var o Options
+	WithFixture("a", "/b")(&o)
+	WithFixture("c", "/d")(&o)
+
+	want := []Fixture{{HostPath: "a", GuestPath: "/b"}, {HostPath: "c", GuestPath: "/d"}}
+	if len(o.Fixtures) != len(want) {
+		t.Fatalf("Fixtures len = %d, want %d", len(o.Fixtures), len(want))
+	}
+	for i := range want {
+		if o.Fixtures[i] != want[i] {
+			t.Errorf("Fixtures[%d] = %+v, want %+v", i, o.Fixtures[i], want[i])
+		}
+	}
+}
+
 func TestEncodeDecodeOptionsFixtures(t *testing.T) {
-	opts := []fleetbox.Option{
-		fleetbox.WithImage("debian-12"),
-		fleetbox.WithCPUs(4),
-		fleetbox.WithFixture("/abs/host", "/work"),
-		fleetbox.WithFixture("/abs/host2", "/data"),
+	options := []Option{
+		WithImage("debian-12"),
+		WithCPUs(4),
+		WithFixture("/abs/host", "/work"),
+		WithFixture("/abs/host2", "/data"),
 	}
 
-	encoded, err := encodeOptions(opts)
+	encoded, err := Encode(options)
 	if err != nil {
-		t.Fatalf("encodeOptions: %v", err)
+		t.Fatalf("Encode: %v", err)
 	}
-	decoded, err := decodeOptions(encoded)
+	decoded, err := Decode(encoded)
 	if err != nil {
-		t.Fatalf("decodeOptions: %v", err)
+		t.Fatalf("Decode: %v", err)
 	}
 
-	var o fleetbox.Options
+	var o Options
 	for _, opt := range decoded {
 		opt(&o)
 	}
@@ -36,7 +50,7 @@ func TestEncodeDecodeOptionsFixtures(t *testing.T) {
 		t.Errorf("CPUs = %d, want 4", o.CPUs)
 	}
 
-	want := []fleetbox.Fixture{
+	want := []Fixture{
 		{HostPath: "/abs/host", GuestPath: "/work"},
 		{HostPath: "/abs/host2", GuestPath: "/data"},
 	}
@@ -51,9 +65,9 @@ func TestEncodeDecodeOptionsFixtures(t *testing.T) {
 }
 
 func TestEncodeOptionsNoFixturesOmitsKey(t *testing.T) {
-	encoded, err := encodeOptions([]fleetbox.Option{fleetbox.WithImage("debian-12")})
+	encoded, err := Encode([]Option{WithImage("debian-12")})
 	if err != nil {
-		t.Fatalf("encodeOptions: %v", err)
+		t.Fatalf("Encode: %v", err)
 	}
 	if strings.Contains(encoded, "fixtures") {
 		t.Errorf("encoded options should omit fixtures when empty: %s", encoded)

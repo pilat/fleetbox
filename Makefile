@@ -1,15 +1,25 @@
-.PHONY: all build test test-vm lint vendor-vz clean
+.PHONY: all build helper test test-vm lint vendor-vz clean
 
 # Default target
 all: build
 
-# Build the CLI. On macOS the binary needs the virtualization entitlement
-# (ad-hoc codesign); on Linux there is nothing to sign, so codesign is skipped.
+# Build the CLI. It is a pure-Go client on every platform now — it drives the VM
+# holder over a socket and links no hypervisor — so there is nothing to codesign
+# here. The virtualization entitlement lives only in the helper (ADR-0017).
 build:
 	go build -o bin/fleetbox ./cmd/fleetbox
-	@if [ "$$(uname)" = "Darwin" ]; then \
-		codesign --entitlements entitlements.plist --force -s - bin/fleetbox; \
-	fi
+
+# Build and ad-hoc-sign the macOS VM helper: the only binary that links Apple
+# Virtualization.framework, so the only one that needs the
+# com.apple.security.virtualization entitlement. darwin/arm64 only.
+#
+# Distribution uses this same ad-hoc signature — the entitlement is unrestricted,
+# so an ad-hoc signature carries it on any Mac (ADR-0017). For a shop whose policy
+# refuses an unquarantined ad-hoc binary, re-sign the same binary with a Developer
+# ID and notarize it; nothing else changes.
+helper:
+	go build -o bin/fleetbox-helper ./cmd/fleetbox-helper
+	codesign --entitlements entitlements.plist --force -s - bin/fleetbox-helper
 
 # Run unit tests (no VMs, works on any machine).
 # -short skips VM-boot tests (they call fleetboxtest.SkipIfShort), so this stays
@@ -17,14 +27,14 @@ build:
 test:
 	go test -short ./...
 
-# Run VM integration tests (requires darwin/arm64, M3+, macOS 26+)
-# These tests boot real VMs and require the virtualization entitlement.
-# Timeout is well above Go's 10m default: a cluster test boots several VMs across
-# back-to-back StartN calls (each budgeting n*5m), which can exceed 10m.
-test-vm:
-	go test -c -o bin/fleetbox.test ./fleetboxtest
-	codesign --entitlements entitlements.plist --force -s - bin/fleetbox.test
-	./bin/fleetbox.test -test.v -test.timeout 30m -test.run TestVM
+# Run VM integration tests (requires darwin/arm64, M3+, macOS 26+).
+# Builds and ad-hoc-signs the helper, then points the library at it via
+# FLEETBOX_HELPER. The test binary itself links no hypervisor and needs neither
+# cgo nor codesign — that is the whole point of the sever (ADR-0017).
+# Timeout is well above Go's 10m default: a cluster test boots several VMs.
+test-vm: helper
+	FLEETBOX_HELPER=$(CURDIR)/bin/fleetbox-helper \
+		go test -count=1 -v -timeout 30m -run TestVM ./fleetboxtest
 
 # Run linter
 lint:
@@ -40,4 +50,3 @@ vendor-vz:
 # Clean build artifacts
 clean:
 	rm -rf bin/
-	rm -f fleetbox.test

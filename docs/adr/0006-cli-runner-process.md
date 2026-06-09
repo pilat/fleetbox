@@ -1,7 +1,7 @@
 # ADR: CLI Mode Uses a Re-Exec'd Runner Process per VM
 
 **Date:** 2026-06-03
-**Status:** Accepted
+**Status:** Accepted (superseded on macOS by ADR-0017; still in force on Linux)
 
 ## Context
 

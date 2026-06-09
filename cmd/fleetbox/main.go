@@ -12,17 +12,18 @@ import (
 	"time"
 
 	"github.com/pilat/fleetbox"
-	"github.com/pilat/fleetbox/internal/runner"
+	"github.com/pilat/fleetbox/internal/control"
 	"github.com/pilat/fleetbox/internal/store"
 )
 
 func main() {
-	// Check if we're running as a background VM holder
-	if runner.IsRunner() {
-		if err := runner.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "runner error: %v\n", err)
-			os.Exit(1)
-		}
+	// On Linux the CLI re-execs itself as an in-process holder; on macOS the
+	// holder is the separate downloaded fleetbox-helper and this never fires
+	// (ADR-0017, R9).
+	if ran, err := maybeRunHolder(); err != nil {
+		fmt.Fprintf(os.Stderr, "runner error: %v\n", err)
+		os.Exit(1)
+	} else if ran {
 		return
 	}
 
@@ -137,7 +138,7 @@ func cmdUp(args []string) error {
 		return fmt.Errorf("init store: %w", err)
 	}
 
-	opts := []fleetbox.Option{
+	options := []fleetbox.Option{
 		fleetbox.WithImage(*image),
 		fleetbox.WithCPUs(*cpus),
 		fleetbox.WithMemoryGB(*mem),
@@ -145,16 +146,16 @@ func cmdUp(args []string) error {
 	}
 
 	// Resolve host paths to absolute here, against the CLI's cwd, before they
-	// cross into the holder process (which re-execs and may not share the cwd).
+	// cross into the holder process (which may not share the cwd).
 	for _, fv := range fixtures {
 		host, guest, err := parseFixture(fv)
 		if err != nil {
 			return err
 		}
-		opts = append(opts, fleetbox.WithFixture(host, guest))
+		options = append(options, fleetbox.WithFixture(host, guest))
 	}
 
-	return upMembers(st, members, opts)
+	return upMembers(st, members, options)
 }
 
 // parseFixture splits a --fixture value into an absolute host path and a guest
@@ -226,10 +227,10 @@ func clusterMembers(names []string, count int) ([]string, error) {
 // fresh holder process when none is running, or — when some members already run
 // in one holder — adding the missing members to that live network so a re-upped
 // node re-joins the cluster instead of getting an isolated network of its own.
-func upMembers(st *store.Store, members []string, opts []fleetbox.Option) error {
+func upMembers(st *store.Store, members []string, options []fleetbox.Option) error {
 	var running, missing []string
 	for _, m := range members {
-		if runner.IsRunning(st, m) {
+		if control.IsRunning(st, m) {
 			running = append(running, m)
 		} else {
 			missing = append(missing, m)
@@ -243,7 +244,7 @@ func upMembers(st *store.Store, members []string, opts []fleetbox.Option) error 
 
 	if len(running) == 0 {
 		fmt.Printf("Starting %s...\n", strings.Join(missing, ", "))
-		if _, err := runner.Spawn(st, missing, opts); err != nil {
+		if err := spawnHolder(st, missing, options); err != nil {
 			return fmt.Errorf("start cluster: %w", err)
 		}
 		printMembers(st, members)
@@ -258,11 +259,29 @@ func upMembers(st *store.Store, members []string, opts []fleetbox.Option) error 
 	}
 	for _, m := range missing {
 		fmt.Printf("Adding %s to the cluster...\n", m)
-		if err := runner.AddMember(st, sibling, m); err != nil {
+		if err := control.AddMember(st, sibling, m); err != nil {
 			return fmt.Errorf("add %s: %w", m, err)
 		}
 	}
 	printMembers(st, members)
+	return nil
+}
+
+// spawnHolder launches a fresh detached holder for the given members and waits
+// for them all to come up. The holder is the downloaded fleetbox-helper on macOS
+// and the re-exec'd CLI on Linux (holderExe); either way its VMs are persistent
+// and outlive this command (ADR-0017, R9).
+func spawnHolder(st *store.Store, names []string, options []fleetbox.Option) error {
+	exe, err := holderExe(st)
+	if err != nil {
+		return err
+	}
+	if _, err := control.Spawn(st, control.SpawnConfig{Exe: exe, Names: names, Options: options}); err != nil {
+		return fmt.Errorf("spawn holder: %w", err)
+	}
+	if _, err := control.WaitMembers(st, names, 5*time.Minute); err != nil {
+		return fmt.Errorf("wait for members: %w", err)
+	}
 	return nil
 }
 
@@ -272,7 +291,7 @@ func upMembers(st *store.Store, members []string, opts []fleetbox.Option) error 
 func soleHolder(st *store.Store, running []string) (string, error) {
 	pid := -1
 	for _, m := range running {
-		status, err := runner.GetStatus(st, m)
+		status, err := control.GetStatus(st, m)
 		if err != nil {
 			return "", fmt.Errorf("status %s: %w", m, err)
 		}
@@ -290,7 +309,7 @@ func soleHolder(st *store.Store, running []string) (string, error) {
 
 func printMembers(st *store.Store, members []string) {
 	for _, m := range members {
-		status, err := runner.GetStatus(st, m)
+		status, err := control.GetStatus(st, m)
 		if err != nil || status.IP == "" {
 			fmt.Printf("  %s: (no IP)\n", m)
 			continue
@@ -329,18 +348,18 @@ func cmdDown(args []string) error {
 	// Sweep up anything a crashed holder left behind (orphaned bridges, taps,
 	// firewall rules) before stopping — cleanup is automatic on down as well as
 	// up, never the user's job (ADR-0013). Best-effort: a failure must not block
-	// the shutdown the user asked for.
+	// the shutdown the user asked for. No-op on macOS.
 	if err := fleetbox.Prune(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: cleanup of orphaned resources failed: %v\n", err)
 	}
 
 	for _, name := range names {
-		if !runner.IsRunning(st, name) {
+		if !control.IsRunning(st, name) {
 			fmt.Printf("%s is not running\n", name)
 			continue
 		}
 		fmt.Printf("Stopping %s...\n", name)
-		if err := runner.Stop(st, name); err != nil {
+		if err := control.Stop(st, name); err != nil {
 			return fmt.Errorf("stop %s: %w", name, err)
 		}
 		fmt.Printf("  stopped\n")
@@ -377,7 +396,7 @@ func cmdList(_ []string) error {
 		ip := "-"
 		state := "stopped"
 
-		status, err := runner.GetStatus(st, name)
+		status, err := control.GetStatus(st, name)
 		if err == nil && status.Running {
 			state = "running"
 			ip = status.IP
@@ -416,7 +435,7 @@ func cmdSSH(args []string) error {
 		return fmt.Errorf("VM %q does not exist", name)
 	}
 
-	status, err := runner.GetStatus(st, name)
+	status, err := control.GetStatus(st, name)
 	if err != nil {
 		return fmt.Errorf("get status: %w", err)
 	}
@@ -473,7 +492,7 @@ func cmdCopy(args []string) error {
 		return fmt.Errorf("VM %q does not exist", name)
 	}
 
-	status, err := runner.GetStatus(st, name)
+	status, err := control.GetStatus(st, name)
 	if err != nil {
 		return fmt.Errorf("get status: %w", err)
 	}
@@ -522,7 +541,7 @@ func cmdSSHConfig(_ []string) error {
 	}
 
 	for _, name := range names {
-		status, err := runner.GetStatus(st, name)
+		status, err := control.GetStatus(st, name)
 		if err != nil || !status.Running {
 			continue // Only show running VMs
 		}
@@ -595,9 +614,9 @@ func cmdRemove(args []string) error {
 
 	for _, name := range toDelete {
 		fmt.Printf("Removing %s...\n", name)
-		// Stop runner if running
-		if runner.IsRunning(st, name) {
-			if err := runner.Stop(st, name); err != nil {
+		// Stop holder if running
+		if control.IsRunning(st, name) {
+			if err := control.Stop(st, name); err != nil {
 				return fmt.Errorf("stop %s: %w", name, err)
 			}
 		}

@@ -1,34 +1,19 @@
-package fleetbox
+package orchestrator
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/pilat/fleetbox/internal/opts"
 	"github.com/pilat/fleetbox/internal/seed"
 	"github.com/pilat/fleetbox/internal/store"
 )
 
-func TestWithFixtureAppliesToOptions(t *testing.T) {
-	var o Options
-	WithFixture("a", "/b")(&o)
-	WithFixture("c", "/d")(&o)
-
-	want := []Fixture{{HostPath: "a", GuestPath: "/b"}, {HostPath: "c", GuestPath: "/d"}}
-	if len(o.Fixtures) != len(want) {
-		t.Fatalf("Fixtures len = %d, want %d", len(o.Fixtures), len(want))
-	}
-	for i := range want {
-		if o.Fixtures[i] != want[i] {
-			t.Errorf("Fixtures[%d] = %+v, want %+v", i, o.Fixtures[i], want[i])
-		}
-	}
-}
-
 func TestToStoreFixturesAssignsLabelsAndAbsolutizes(t *testing.T) {
 	d0, d1 := t.TempDir(), t.TempDir()
 
-	got, err := toStoreFixtures([]Fixture{
+	got, err := toStoreFixtures([]opts.Fixture{
 		{HostPath: d0, GuestPath: "/work"},
 		{HostPath: d1, GuestPath: "/data"},
 	})
@@ -54,7 +39,7 @@ func TestToStoreFixturesAssignsLabelsAndAbsolutizes(t *testing.T) {
 func TestToStoreFixturesAbsolutizesRelativeHostPath(t *testing.T) {
 	// "." is the working directory, which always exists and is a dir — a relative
 	// host path must be absolutized, not rejected.
-	got, err := toStoreFixtures([]Fixture{{HostPath: ".", GuestPath: "/work"}})
+	got, err := toStoreFixtures([]opts.Fixture{{HostPath: ".", GuestPath: "/work"}})
 	if err != nil {
 		t.Fatalf("toStoreFixtures: %v", err)
 	}
@@ -64,14 +49,14 @@ func TestToStoreFixturesAbsolutizesRelativeHostPath(t *testing.T) {
 }
 
 func TestToStoreFixturesRejectsRelativeGuestPath(t *testing.T) {
-	if _, err := toStoreFixtures([]Fixture{{HostPath: t.TempDir(), GuestPath: "work"}}); err == nil {
+	if _, err := toStoreFixtures([]opts.Fixture{{HostPath: t.TempDir(), GuestPath: "work"}}); err == nil {
 		t.Fatal("expected error for relative guest path")
 	}
 }
 
 func TestToStoreFixturesRejectsMissingHostPath(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "nope")
-	if _, err := toStoreFixtures([]Fixture{{HostPath: missing, GuestPath: "/work"}}); err == nil {
+	if _, err := toStoreFixtures([]opts.Fixture{{HostPath: missing, GuestPath: "/work"}}); err == nil {
 		t.Fatal("expected error for missing host path")
 	}
 }
@@ -81,14 +66,14 @@ func TestToStoreFixturesRejectsFileHostPath(t *testing.T) {
 	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
-	if _, err := toStoreFixtures([]Fixture{{HostPath: file, GuestPath: "/work"}}); err == nil {
+	if _, err := toStoreFixtures([]opts.Fixture{{HostPath: file, GuestPath: "/work"}}); err == nil {
 		t.Fatal("expected error for host path that is a file, not a directory")
 	}
 }
 
 func TestToStoreFixturesRejectsDuplicateGuestPath(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := toStoreFixtures([]Fixture{
+	if _, err := toStoreFixtures([]opts.Fixture{
 		{HostPath: dir, GuestPath: "/work"},
 		{HostPath: dir, GuestPath: "/work"},
 	}); err == nil {

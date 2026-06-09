@@ -79,6 +79,21 @@ linters:
           deny:
             - pkg: github.com/pilat/fleetbox/third_party/vz
               desc: vz (incl. vmnet/xpc) is only allowed in internal/backend/vz (backend-neutral API invariant)
+        # The sever's backend-free client half: internal/opts and internal/control
+        # are the pure-Go pieces the darwin library client and CLI link, so they
+        # must never pull in a hypervisor or the VM-owning orchestrator. Enforced
+        # mechanically here (ADR-0017, R1).
+        backend-free-client:
+          list-mode: lax
+          files:
+            - "**/internal/opts/**"
+            - "**/internal/control/**"
+            - "**/internal/helperdist/**"
+          deny:
+            - pkg: github.com/pilat/fleetbox/internal/backend
+              desc: opts/control must stay backend-free (ADR-0017 sever — keeps the darwin client cgo/codesign-free)
+            - pkg: github.com/pilat/fleetbox/internal/orchestrator
+              desc: opts/control must not import the orchestrator (ADR-0017 sever)
     revive:
       rules:
         - name: blank-imports
@@ -101,6 +116,7 @@ linters:
       excludes:
         - G104  # unhandled errors — errcheck handles this
         - G304  # file path from variable — VM/image paths come from our own store
+        - G703  # path traversal taint — same as G304: FLEETBOX_HELPER is an explicit user-provided path
         - G204  # subprocess with variable — CLI execs ssh/scp by design
         - G702  # command injection taint — same as G204, ssh/scp args are the CLI's job
         - G106  # InsecureIgnoreHostKey — ephemeral test VMs, host keys are meaningless

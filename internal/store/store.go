@@ -3,6 +3,8 @@
 package store
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -61,6 +63,11 @@ func NewAt(baseDir string) (*Store, error) {
 		baseDir,
 		filepath.Join(baseDir, "clusters"),
 		filepath.Join(baseDir, "images"),
+		// run/ holds the holder control sockets. They live here, not in the deeply
+		// nested member dir, because a unix socket path must fit the 104-byte
+		// sun_path limit, which clusters/<cluster>/<member>/ blows past for long
+		// names (amends ADR-0014; see SocketPath).
+		filepath.Join(baseDir, "run"),
 	}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -181,11 +188,17 @@ func (s *Store) Delete(name string) error {
 	}
 
 	// RemoveAll on the MEMBER dir is correct — it must wipe disk.raw, config.json,
-	// seed.iso, sock/pid, etc. (The NEVER-RemoveAll rule below applies only to the
+	// seed.iso, pid, etc. (The NEVER-RemoveAll rule below applies only to the
 	// shared parent cluster dir, which may hold sibling members.)
 	if err := os.RemoveAll(vmDir); err != nil {
 		return fmt.Errorf("remove vm dir: %w", err)
 	}
+
+	// The control sockets live in run/, not the member dir, so RemoveAll above did
+	// not touch them. A live holder retires its own socket on stop; this best-effort
+	// sweep clears one a crashed holder may have left behind.
+	_ = os.Remove(s.SocketPath(name))
+	_ = os.Remove(s.ControlSocketPath(name))
 
 	// Drop the now-maybe-empty cluster directory. os.Remove (NEVER RemoveAll)
 	// refuses a non-empty directory, which is exactly the "siblings still
@@ -261,11 +274,32 @@ func (s *Store) PidfilePath(name string) string {
 	return filepath.Join(s.VMDir(name), "pid")
 }
 
-// SocketPath returns the path to the VM's holder control socket, inside its
-// member directory. The filename is kept short ("sock") to stay under the
-// macOS 104-byte sun_path limit.
+// SocketPath returns the path to a member's holder control socket. It lives in
+// ~/.fleetbox/run/ under a hash of the name, NOT in the member directory: a unix
+// socket path must fit the 104-byte sun_path limit, and the nested member dir
+// (clusters/<cluster>/<member>/) plus a long name and a long home dir blows past
+// it. The hash keeps the path short and bounded regardless of name length
+// (amends ADR-0014, which had placed it in the member dir).
 func (s *Store) SocketPath(name string) string {
-	return filepath.Join(s.VMDir(name), "sock")
+	return filepath.Join(s.baseDir, "run", sockHash(name)+".sock")
+}
+
+// ControlSocketPath returns the path to a bound helper's holder-wide control
+// socket. It is distinct from the per-member SocketPath: the library client holds
+// one long-lived connection to it for the helper's lifetime, and the helper
+// treats that connection's EOF as "parent gone — tear everything down"
+// (ADR-0017, R4). Like SocketPath it lives in run/ under a name hash to stay
+// under the sun_path limit.
+func (s *Store) ControlSocketPath(primary string) string {
+	return filepath.Join(s.baseDir, "run", sockHash(primary)+".ctl")
+}
+
+// sockHash maps a VM name to a short, filesystem-safe token (the first 16 hex of
+// its SHA-256) so the unix socket path stays well under the 104-byte sun_path
+// limit no matter how long the name or home directory is.
+func sockHash(name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return hex.EncodeToString(sum[:8])
 }
 
 // SerialLogPath returns the path to the VM's serial log.

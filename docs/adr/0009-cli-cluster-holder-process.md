@@ -1,7 +1,7 @@
 # ADR: CLI Clusters Run in One Holder Process (Shared In-Process Network)
 
 **Date:** 2026-06-04
-**Status:** Accepted
+**Status:** Accepted (superseded on macOS by ADR-0017; still in force on Linux)
 
 ## Context
 

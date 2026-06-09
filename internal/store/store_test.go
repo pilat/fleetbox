@@ -207,7 +207,9 @@ func TestStorePaths(t *testing.T) {
 	if st.PidfilePath(name) != filepath.Join(vmDir, "pid") {
 		t.Errorf("PidfilePath wrong: %s", st.PidfilePath(name))
 	}
-	if st.SocketPath(name) != filepath.Join(vmDir, "sock") {
+	// The control socket lives in run/ under a name hash, not the member dir, to
+	// stay under the sun_path limit.
+	if st.SocketPath(name) != filepath.Join(tmpDir, "run", sockHash(name)+".sock") {
 		t.Errorf("SocketPath wrong: %s", st.SocketPath(name))
 	}
 	if st.SerialLogPath(name) != filepath.Join(vmDir, "serial.log") {
@@ -218,8 +220,27 @@ func TestStorePaths(t *testing.T) {
 	if st.DiskPath("web-2") != filepath.Join(tmpDir, "clusters", "web", "web-2", "disk.raw") {
 		t.Errorf("DiskPath(web-2) wrong: %s", st.DiskPath("web-2"))
 	}
-	if st.SocketPath("dev") != filepath.Join(tmpDir, "clusters", "dev", "dev", "sock") {
+	if st.SocketPath("dev") != filepath.Join(tmpDir, "run", sockHash("dev")+".sock") {
 		t.Errorf("SocketPath(dev) wrong: %s", st.SocketPath("dev"))
+	}
+}
+
+// TestSocketPathUnderSunPathLimit guards the fix for the 104-byte sun_path limit:
+// a long cluster-member name under a realistic home dir must still yield a socket
+// path that net.Listen("unix", ...) can bind. The member-dir layout (ADR-0014)
+// blew past it for names like this; the run/ + hash layout keeps it short.
+func TestSocketPathUnderSunPathLimit(t *testing.T) {
+	st, err := NewAt("/Users/some.long.username/.fleetbox")
+	if err != nil {
+		// NewAt may fail to create dirs under a non-existent home in CI; the path
+		// math is what matters, so build the store directly for the check.
+		st = &Store{baseDir: "/Users/some.long.username/.fleetbox"}
+	}
+	const longName = "testvmclusterconnectivity-node-1"
+	for _, p := range []string{st.SocketPath(longName), st.ControlSocketPath(longName)} {
+		if len(p) >= 104 {
+			t.Errorf("socket path %q is %d bytes, must be < 104 (sun_path limit)", p, len(p))
+		}
 	}
 }
 

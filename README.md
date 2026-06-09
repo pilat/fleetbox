@@ -63,10 +63,13 @@ One of:
 
 - **macOS, Apple Silicon** — clusters (VM↔VM) need macOS 26+ (vmnet SharedMode); macOS
   below 26 runs a single VM via VZ NAT. Nested virtualization (`/dev/kvm` in the guest)
-  needs M3 or newer. Intel Macs are not supported.
+  needs M3 or newer. Intel Macs are not supported. All VM work runs in a small signed
+  `fleetbox-helper` that fleetbox downloads to `~/.fleetbox/bin/` on first use — **your test
+  binary stays pure Go and needs no codesign** (see [First run](#first-run)).
 - **Linux, amd64 or arm64** — needs `/dev/kvm` (be in the `kvm` group) and `CAP_NET_ADMIN`
-  (to create the bridge and taps). The cloud-hypervisor binary and firmware are downloaded
-  and checksum-pinned to `~/.fleetbox/bin/` on first use.
+  (to create the bridge and taps). fleetbox preflight-checks both and fails with a one-line
+  fix if either is missing, rather than a cryptic boot error. The cloud-hypervisor binary
+  and firmware are downloaded and checksum-pinned to `~/.fleetbox/bin/` on first use.
 
 Plus **Go 1.24+**. The module compiles on `darwin/arm64` and `linux/{amd64,arm64}`; other
 targets build but return a clear "unsupported platform" error.
@@ -77,20 +80,28 @@ targets build but return a clear "unsupported platform" error.
 go get github.com/pilat/fleetbox
 ```
 
-### The entitlement (don't skip this)
+### First run
 
-Any binary that boots a VM — *including your `go test` binary* — must carry the
-`com.apple.security.virtualization` entitlement or it dies on launch. Ad-hoc codesigning is
-enough for local dev:
+Your binary that boots a VM links no hypervisor and needs no codesign — that is the whole
+point. The Virtualization.framework work lives in a small, separately signed
+`fleetbox-helper`, fetched once and cached, the same way the Linux backend already fetches
+cloud-hypervisor.
 
-```bash
-go test -c -o bin/mypkg.test ./mypkg
-codesign --entitlements entitlements.plist --force -s - bin/mypkg.test
-./bin/mypkg.test -test.v
-```
+- **macOS:** the helper is downloaded to `~/.fleetbox/bin/` (checksum-pinned) on first use.
+  Until the first tagged release publishes that artifact, build it locally and point
+  fleetbox at it with `FLEETBOX_HELPER`:
 
-The repo ships an `entitlements.plist`; `make test-vm` does the compile-sign-run dance for
-its own suite if you want a reference.
+  ```bash
+  make helper                                    # builds + ad-hoc-signs ./bin/fleetbox-helper
+  FLEETBOX_HELPER=$PWD/bin/fleetbox-helper go test ./...
+  ```
+
+  `FLEETBOX_HELPER` is also the offline / air-gapped escape hatch once the download exists.
+- **Linux:** nothing to sign; cloud-hypervisor downloads to `~/.fleetbox/bin/` on first use.
+
+On both platforms the cloud image downloads once to `~/.fleetbox/images/`. A first run that
+pulls a multi-hundred-MB image (and, on macOS, the helper) prints a progress line so it
+doesn't look like a hung test.
 
 ## Usage
 
@@ -191,7 +202,7 @@ must not contain colons (the value is split on the last colon).
 The CLI wraps the same library for manual work:
 
 ```bash
-make build                                   # compiles + signs ./bin/fleetbox
+make build                                   # compiles ./bin/fleetbox (pure Go, nothing to sign)
 
 ./bin/fleetbox up web                        # create & boot a VM
 ./bin/fleetbox up node -n 3                  # interconnected cluster: node-1, node-2, node-3
@@ -233,9 +244,13 @@ paths.
 generate a cloud-init seed ISO → boot the VM (macOS: EFI on a vmnet SharedMode NIC; Linux:
 cloud-hypervisor with a tap on a shared bridge) → get the VM's IP (macOS: from
 `/var/db/dhcpd_leases` by hostname; Linux: the statically assigned address) → wait for SSH.
-No daemon: in library mode the test process owns its VMs; the CLI re-execs a tiny holder
-process per `up` group (a single VM, or a whole cluster sharing one network) so they
-outlive the command.
+On Linux that pipeline runs in-process; on macOS it runs in the downloaded, signed
+`fleetbox-helper` subprocess — the only thing that links Virtualization.framework — which
+the library spawns *bound* to the test process, so the helper and its VMs are reaped when
+the test exits (even on `kill -9`). In CLI mode a detached holder per `up` group (a single
+VM, or a whole cluster sharing one network) outlives the command: on macOS that holder is
+the helper, on Linux the re-exec'd CLI. SSH and `cp` dial the VM's IP directly either way —
+the helper protocol never proxies them.
 
 For the full picture, read [ARCHITECTURE.md](ARCHITECTURE.md); for *why* it's built this
 way, the decision log lives in [docs/adr/](docs/adr/).
@@ -253,9 +268,15 @@ VMs reach each other by IP. Mind the sharp edges:
   world-readable, owned by root; host permission and exec bits aren't preserved.
 - **A CLI cluster shares one holder process.** All members of a cluster live in one process
   to share one network, so a holder crash takes the whole cluster down (a single VM is
-  unaffected); on Linux a SIGKILL'd holder also leaves its bridge/taps behind. Members
+  unaffected); on Linux a SIGKILL'd holder also leaves its bridge/taps behind (swept on the
+  next `up`/`down`). On macOS the holder *is* the downloaded `fleetbox-helper`. Members
   started by separate `up` commands have separate networks and can't be merged into one
   cluster afterwards — bring a cluster up together.
+- **First run downloads, then caches.** The cloud image (both platforms) and, on macOS, the
+  signed `fleetbox-helper` are fetched once into `~/.fleetbox` and reused. Until the first
+  tagged release publishes the helper, build it locally (`make helper`) and set
+  `FLEETBOX_HELPER` — which is also the offline override. In CI, cache `~/.fleetbox/{bin,images}`
+  so cold runs don't re-download.
 - **Platform matrix.** macOS Apple Silicon 26+ (clusters), macOS Apple Silicon <26 (single
   VM only), Linux amd64/arm64 (clusters); Intel macOS unsupported. On Linux, a stopped VM
   brought back up needs its `/24` to still be free — on a contended host the auto-picked
@@ -263,8 +284,29 @@ VMs reach each other by IP. Mind the sharp edges:
   Linux boot via rust-hypervisor-firmware is not yet validated on hardware.
 - **v0 API.** Expect breaking changes until it stabilizes.
 
-CI note: GitHub-hosted macOS runners can't nest virtualization, so VM-boot tests run
-locally via `make test-vm`, while CI sticks to lint, build, and unit tests.
+### CI
+
+GitHub-hosted **macOS** runners can't nest-virtualize, so the macOS CI does lint, build, and
+unit tests; VM-boot tests run locally via `make test-vm`. But GitHub-hosted **x86-64 Linux**
+runners *do* expose `/dev/kvm`, so the Linux backend's VM-boot tests can run in CI after a
+one-time udev tweak that lets the runner user open it (and a cache so the image + VMM aren't
+re-downloaded every run):
+
+```yaml
+- run: |
+    echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+    sudo udevadm control --reload-rules && sudo udevadm trigger
+- uses: actions/cache@v4
+  with:
+    path: |
+      ~/.fleetbox/bin
+      ~/.fleetbox/images
+    key: fleetbox-${{ runner.os }}
+```
+
+arm64 hosted Linux runners do **not** have KVM ("not supported for this sku"); use an
+x86-64 runner for VM-boot CI. This is the "develop on a Mac, run in cheap x86-64 hosted
+Linux CI" story.
 
 ## Roadmap
 
