@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "pilat-marketplace": {
+      "source": {
+        "source": "github",
+        "repo": "pilat/pilat-marketplace"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "pilat@pilat-marketplace": true
+  }
+}

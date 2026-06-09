@@ -1,0 +1,45 @@
+name: VM boot (Linux)
+
+# Proves the Linux backend end-to-end in CI: x86-64 GitHub-hosted runners expose
+# /dev/kvm, so the cloud-hypervisor backend can boot a real VM after a one-time
+# udev tweak. Bridge/tap creation needs CAP_NET_ADMIN, so the compiled test binary
+# runs as root with the runner's HOME preserved (so ~/.fleetbox caching still
+# applies). arm64 hosted runners have no KVM, so this is amd64 only.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  vm-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Enable KVM for the runner
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Cache fleetbox downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.fleetbox/bin
+            ~/.fleetbox/images
+          key: fleetbox-linux-${{ hashFiles('**/go.sum') }}
+          restore-keys: fleetbox-linux-
+
+      - name: Boot a real VM (TestVMConformance)
+        run: |
+          go test -c -o /tmp/fleetboxtest ./fleetboxtest
+          sudo -E env "HOME=$HOME" "PATH=$PATH" \
+            /tmp/fleetboxtest -test.run TestVMConformance -test.v -test.timeout 15m

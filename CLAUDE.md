@@ -80,7 +80,8 @@ stay pure Go — no cgo; cgo lives only in the darwin helper.
   NO codesign — that's the ADR-0017 sever. Only `cmd/fleetbox-helper` carries the
   `com.apple.security.virtualization` entitlement (ad-hoc codesign). For dev/VM tests,
   `make helper` builds+signs it and `make test-vm` points the library at it via
-  `FLEETBOX_HELPER`; the published helper auto-downloads once Task-7 publishing lands.
+  `FLEETBOX_HELPER`. The published helper (release `helper-v0.1.0`, a separate release
+  channel from the product `v0.1.0`) auto-downloads on first use, no override needed.
 - The module compiles on `darwin/arm64`, `linux/amd64`, and `linux/arm64`. Other targets
   (incl. `darwin/amd64`) compile but error at runtime with "unsupported platform". Unit
   tests (`make test`) and `make lint` run on darwin/arm64; lint the Linux code with
@@ -89,10 +90,12 @@ stay pure Go — no cgo; cgo lives only in the darwin helper.
   tests need a host with `/dev/kvm` + `CAP_NET_ADMIN` (a real Linux box, a Lima VM with
   `nestedVirtualization: true`, or a KVM-enabled CI runner) — not the macOS dev box and
   not Docker Desktop (no `/dev/kvm`).
-- CI (macos-26 GitHub runner) cannot boot VZ VMs — it runs lint + build + unit tests only.
-  Do not switch the macOS CI to ubuntu (it must keep building/linting the darwin code).
-  Unlike VZ, the cloud-hypervisor backend *is* CI-testable on Linux runners with KVM — a
-  future win, out of v1 scope.
+- CI (macos-26 GitHub runner) cannot boot VZ VMs — `ci.yml` runs lint + build + unit tests
+  only. Do not switch the macOS CI to ubuntu (it must keep building/linting the darwin code).
+  Unlike VZ, the cloud-hypervisor backend *is* CI-testable on Linux runners with KVM:
+  `vm-linux.yml` boots a real VM on an x86-64 ubuntu runner (arm64 hosted runners have no KVM).
+  Releases run on tags: `release-helper.yml` (helper, macOS, codesign) and `release.yml`
+  (CLI, goreleaser) — two independent channels (`helper-v*` / `v*`).
 - Commands: `make test` (unit), `make build` (compile the pure-Go CLI, no signing),
   `make helper` (build + ad-hoc-sign `cmd/fleetbox-helper`, darwin only), `make test-vm`
   (builds+signs the helper, exports `FLEETBOX_HELPER`, boots real VMs), `make lint`,
@@ -120,8 +123,9 @@ at the caller. Every exported symbol gets a doc comment — this is a library.
   already the downloaded VMM) with a `/dev/kvm`+`CAP_NET_ADMIN` preflight. The public API is
   unchanged; `VM`/`Cluster` are defined once over a build-tagged unexported impl, and
   `Options`/`Option`/`Fixture`/`With*` are aliases over `internal/opts`. Supersedes ADR-0006
-  and ADR-0009 on macOS (both still in force on Linux). Until the signed helper is published,
-  dev/CI use the `FLEETBOX_HELPER` override. See `docs/adr/0017`.
+  and ADR-0009 on macOS (both still in force on Linux). The signed helper is published as
+  release `helper-v0.1.0` and auto-downloads on first use; `FLEETBOX_HELPER` overrides it for
+  dev/offline. See `docs/adr/0017`.
 
 - **Cross-platform: macOS (VZ) + Linux (cloud-hypervisor) behind one API.** The module
   is no longer `darwin && arm64`-only. The backend is selected at compile time per

@@ -87,16 +87,14 @@ point. The Virtualization.framework work lives in a small, separately signed
 `fleetbox-helper`, fetched once and cached, the same way the Linux backend already fetches
 cloud-hypervisor.
 
-- **macOS:** the helper is downloaded to `~/.fleetbox/bin/` (checksum-pinned) on first use.
-  Until the first tagged release publishes that artifact, build it locally and point
-  fleetbox at it with `FLEETBOX_HELPER`:
+- **macOS:** the helper is downloaded to `~/.fleetbox/bin/` (checksum-pinned) on first use —
+  nothing to build, nothing to sign. To run against a locally built helper instead
+  (development, or an offline / air-gapped host), point fleetbox at one with `FLEETBOX_HELPER`:
 
   ```bash
   make helper                                    # builds + ad-hoc-signs ./bin/fleetbox-helper
   FLEETBOX_HELPER=$PWD/bin/fleetbox-helper go test ./...
   ```
-
-  `FLEETBOX_HELPER` is also the offline / air-gapped escape hatch once the download exists.
 - **Linux:** nothing to sign; cloud-hypervisor downloads to `~/.fleetbox/bin/` on first use.
 
 On both platforms the cloud image downloads once to `~/.fleetbox/images/`. A first run that
@@ -273,10 +271,9 @@ VMs reach each other by IP. Mind the sharp edges:
   started by separate `up` commands have separate networks and can't be merged into one
   cluster afterwards — bring a cluster up together.
 - **First run downloads, then caches.** The cloud image (both platforms) and, on macOS, the
-  signed `fleetbox-helper` are fetched once into `~/.fleetbox` and reused. Until the first
-  tagged release publishes the helper, build it locally (`make helper`) and set
-  `FLEETBOX_HELPER` — which is also the offline override. In CI, cache `~/.fleetbox/{bin,images}`
-  so cold runs don't re-download.
+  signed `fleetbox-helper` are fetched once into `~/.fleetbox` and reused. `FLEETBOX_HELPER`
+  overrides the helper download with a locally built one (development / offline). In CI, cache
+  `~/.fleetbox/{bin,images}` so cold runs don't re-download.
 - **Platform matrix.** macOS Apple Silicon 26+ (clusters), macOS Apple Silicon <26 (single
   VM only), Linux amd64/arm64 (clusters); Intel macOS unsupported. On Linux, a stopped VM
   brought back up needs its `/24` to still be free — on a contended host the auto-picked

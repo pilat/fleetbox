@@ -75,7 +75,9 @@ Where the canonical version of each thing lives. When two files disagree, the So
 | Design decisions & rationale | `docs/adr/` | One file per decision, sequentially numbered. |
 | Build & signing recipe | `Makefile` + `entitlements.plist` | `com.apple.security.virtualization` entitlement. |
 | Vendored vz provenance & regen | `third_party/vz/NOTICE` + `hack/vendor-vz.sh` | Pinned upstream + vmnet-patch SHAs; `make vendor-vz` regenerates (ADR-0008, ADR-0016). |
-| CI behavior | `.github/workflows/ci.yml` | Lint + build + unit tests only; no VM boots on CI. |
+| CI behavior | `.github/workflows/ci.yml` | macOS: lint + linux/darwin build + unit tests (no VZ boot). |
+| Linux VM-boot CI | `.github/workflows/vm-linux.yml` | Boots a real VM on an x86-64 KVM runner. |
+| Release pipelines | `.github/workflows/{release-helper,release}.yml` + `.goreleaser.yaml` | Two channels: helper (`helper-v*`, macOS, codesign) and CLI (`v*`, goreleaser). |
 | Working specs (local only) | `ai/tasks/` | Gitignored. Durable decisions must graduate to ADRs. |
 
 ## §4. System Model
@@ -319,8 +321,9 @@ The support matrix and how it is realized in build tags:
   test binary and the CLI link no vz and need neither cgo nor codesign. `make build`
   compiles the pure-Go CLI (no signing, any platform); `make helper` builds + ad-hoc-signs
   the helper; `make test-vm` builds+signs the helper and points the library at it via
-  `FLEETBOX_HELPER`. The published helper auto-downloads, checksum-pinned, once the release
-  pipeline fills the `internal/helperdist` catalog; until then `FLEETBOX_HELPER` is the path.
+  `FLEETBOX_HELPER`. The published helper (release `helper-v0.1.0`) auto-downloads,
+  checksum-pinned via the `internal/helperdist` catalog; `FLEETBOX_HELPER` overrides it for
+  dev/offline.
 - **Linux host prerequisites** (not provisionable; probed with clear errors): `/dev/kvm`
   present and accessible (user in the `kvm` group) and `CAP_NET_ADMIN` (to make the
   bridge and taps). The cloud-hypervisor binary and firmware are downloaded and
