@@ -55,7 +55,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             fleetbox-helper-darwin-arm64 \
             fleetbox-helper-darwin-arm64.sha256 \
-            --title "fleetbox-helper $GITHUB_REF_NAME" \
+            --title "fleetbox-helper ${GITHUB_REF_NAME#helper-}" \
             --notes "fleetbox-helper for darwin/arm64, ad-hoc signed with \`com.apple.security.virtualization\`.
 
           sha256: \`${{ steps.sum.outputs.sha256 }}\`

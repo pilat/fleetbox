@@ -42,8 +42,8 @@ type catalogEntry struct {
 var catalog = map[string]catalogEntry{
 	"darwin/arm64": {
 		version: "0.1.0",
-		url:     "",
-		sha256:  "",
+		url:     "https://github.com/pilat/fleetbox/releases/download/helper-v0.1.0/fleetbox-helper-darwin-arm64",
+		sha256:  "83abc51a704509f3a1b2d5a73774c8ac0bddd7f498012e4bda39a62b8b3ae0ef",
 	},
 }
 

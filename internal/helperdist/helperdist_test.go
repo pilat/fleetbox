@@ -3,6 +3,7 @@ package helperdist
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -48,12 +49,25 @@ func TestEnsureOverrideDirFails(t *testing.T) {
 	}
 }
 
-// TestEnsureWithoutOverrideRefusesUnverified pins R5: with no override, the
-// client must not fetch+run an unverified helper. Until the signed artifact is
-// published (its catalog sha256 is empty) Ensure errors and points at the
-// override, on every platform.
+// TestEnsureWithoutOverrideRefusesUnverified pins R5: with no override and no
+// pinned checksum, the client must not fetch and run an unverified helper —
+// Ensure errors and points at the override instead.
 func TestEnsureWithoutOverrideRefusesUnverified(t *testing.T) {
 	t.Setenv(EnvHelper, "")
+	// Blank this platform's catalog entry to simulate the unverifiable state (no
+	// pinned sha256), independent of whether a real helper is published, so Ensure
+	// must refuse rather than fetch an unchecked binary.
+	key := runtime.GOOS + "/" + runtime.GOARCH
+	saved, had := catalog[key]
+	catalog[key] = catalogEntry{version: saved.version}
+	t.Cleanup(func() {
+		if had {
+			catalog[key] = saved
+		} else {
+			delete(catalog, key)
+		}
+	})
+
 	_, err := Ensure(newStore(t))
 	if err == nil {
 		t.Fatal("Ensure without override = nil error, want refusal to run unverified helper")
