@@ -1,0 +1,63 @@
+name: Refresh image catalog
+
+# Keeps the pinned cloud-image catalog (internal/image/catalog.json) current.
+# contrib/catalog re-resolves each alias to the newest upstream snapshot and its
+# per-arch SHA256; when anything moved, this job opens a PR with just the value
+# changes (ADR-0019). The human-authored keys (which OSes exist) are never touched.
+#
+# Monthly is plenty: the point of pinning is reproducibility, not chasing every
+# daily build. Trigger it by hand via workflow_dispatch for an out-of-cycle bump.
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 03:00 UTC on the 1st of every month.
+    - cron: "0 3 1 * *"
+
+# The PR is opened with a PAT/App token (see CATALOG_REFRESH_TOKEN below), so these
+# permissions cover the in-repo git push the action performs before that.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Resolves Debian by streaming each .raw through the hashers (Debian
+      # publishes no sha256), so this step downloads several GB on a month it
+      # finds new snapshots — acceptable for a monthly maintenance run; disk stays
+      # bounded because nothing is persisted.
+      - name: Refresh catalog
+        run: go run ./contrib/catalog
+
+      - name: Open PR if the catalog moved
+        uses: peter-evans/create-pull-request@v7
+        with:
+          # A PAT or GitHub App token, NOT the default GITHUB_TOKEN: a PR opened
+          # with GITHUB_TOKEN does not trigger pull_request workflows, so CI —
+          # including TestCatalogValid, the safety net that catches a malformed
+          # refresh — would never run on this PR. The token needs contents +
+          # pull-requests write scope.
+          token: ${{ secrets.CATALOG_REFRESH_TOKEN }}
+          add-paths: internal/image/catalog.json
+          branch: chore/refresh-image-catalog
+          delete-branch: true
+          commit-message: "chore(images): refresh pinned cloud-image snapshots"
+          title: "chore(images): refresh pinned cloud-image snapshots"
+          body: |
+            Automated refresh of `internal/image/catalog.json` by
+            `contrib/catalog` (the monthly catalog-refresh workflow).
+
+            Upstream has published newer dated snapshots, so the pinned snapshot,
+            per-arch URLs, and SHA256 digests were updated. Only value fields
+            changed; the human-authored keys are untouched.
+
+            `TestCatalogValid` gates this PR — merge once it is green.

@@ -1,0 +1,101 @@
+{
+  "debian-11": {
+    "distro": "debian",
+    "version": "11",
+    "codename": "bullseye",
+    "snapshot": "20260601-2496",
+    "bumped_at": "2026-06-10",
+    "arch": {
+      "amd64": {
+        "url": "https://cloud.debian.org/images/cloud/bullseye/20260601-2496/debian-11-generic-amd64-20260601-2496.raw",
+        "sha256": "14be48708cb4ef832f61d7b32fe048f5e21e130a508d084b8fd5b6c60c73730e"
+      },
+      "arm64": {
+        "url": "https://cloud.debian.org/images/cloud/bullseye/20260601-2496/debian-11-generic-arm64-20260601-2496.raw",
+        "sha256": "21c2759a0d47db4d994771284e5d38bca58c11dc3dd0cd4794cdb339efc7e46a"
+      }
+    }
+  },
+  "debian-12": {
+    "distro": "debian",
+    "version": "12",
+    "codename": "bookworm",
+    "snapshot": "20260601-2496",
+    "bumped_at": "2026-06-10",
+    "arch": {
+      "amd64": {
+        "url": "https://cloud.debian.org/images/cloud/bookworm/20260601-2496/debian-12-generic-amd64-20260601-2496.raw",
+        "sha256": "9e8f5e8092e23dd9ea2fd5d90d712b788c523923ad20e134a0c1ad9f93376d2f"
+      },
+      "arm64": {
+        "url": "https://cloud.debian.org/images/cloud/bookworm/20260601-2496/debian-12-generic-arm64-20260601-2496.raw",
+        "sha256": "f2129ef388de16925990fb295dfcae35f1cc25291390c15113bb1a208479c6dc"
+      }
+    }
+  },
+  "debian-13": {
+    "distro": "debian",
+    "version": "13",
+    "codename": "trixie",
+    "snapshot": "20260601-2496",
+    "bumped_at": "2026-06-10",
+    "arch": {
+      "amd64": {
+        "url": "https://cloud.debian.org/images/cloud/trixie/20260601-2496/debian-13-generic-amd64-20260601-2496.raw",
+        "sha256": "53ec1c8d78ed31f0ac50ad54663f990f2faa908b7ec7580c7370f9843e345944"
+      },
+      "arm64": {
+        "url": "https://cloud.debian.org/images/cloud/trixie/20260601-2496/debian-13-generic-arm64-20260601-2496.raw",
+        "sha256": "ab14c45b6819fb171d283ccd35301a2821d2d3db7bafa0916915f72d4192232b"
+      }
+    }
+  },
+  "ubuntu-22.04": {
+    "distro": "ubuntu",
+    "version": "22.04",
+    "snapshot": "release-20260515",
+    "bumped_at": "2026-06-10",
+    "arch": {
+      "amd64": {
+        "url": "https://cloud-images.ubuntu.com/releases/jammy/release-20260515/ubuntu-22.04-server-cloudimg-amd64.img",
+        "sha256": "f6729b53d930d7f0c6691eb553cfa6be7109de9412125bf1bf2dc6747de8a44d"
+      },
+      "arm64": {
+        "url": "https://cloud-images.ubuntu.com/releases/jammy/release-20260515/ubuntu-22.04-server-cloudimg-arm64.img",
+        "sha256": "0b77a1a7e708723c8e7aef4fe9fca84f0e8845c0d66b1bbd612a5b43bf916bda"
+      }
+    }
+  },
+  "ubuntu-24.04": {
+    "distro": "ubuntu",
+    "version": "24.04",
+    "snapshot": "release-20260518",
+    "bumped_at": "2026-06-10",
+    "arch": {
+      "amd64": {
+        "url": "https://cloud-images.ubuntu.com/releases/noble/release-20260518/ubuntu-24.04-server-cloudimg-amd64.img",
+        "sha256": "53fdde898feed8b027d94baa9cfe8229867f330a1d9c49dc7d84465ee7f229f7"
+      },
+      "arm64": {
+        "url": "https://cloud-images.ubuntu.com/releases/noble/release-20260518/ubuntu-24.04-server-cloudimg-arm64.img",
+        "sha256": "6a61b967ba4a27dd1966f835a67643073ed55c2860ce3dc1cb0517282e6b8bec"
+      }
+    }
+  },
+  "ubuntu-26.04": {
+    "distro": "ubuntu",
+    "version": "26.04",
+    "snapshot": "release-20260520",
+    "bumped_at": "2026-06-10",
+    "arch": {
+      "amd64": {
+        "url": "https://cloud-images.ubuntu.com/releases/resolute/release-20260520/ubuntu-26.04-server-cloudimg-amd64.img",
+        "sha256": "dced94c031cc1f23dee14419a3723a5b110df9938de0ac31913a2bfd07c755b4"
+      },
+      "arm64": {
+        "url": "https://cloud-images.ubuntu.com/releases/resolute/release-20260520/ubuntu-26.04-server-cloudimg-arm64.img",
+        "sha256": "5e091e27d60116efbb0c743b8dd5cb2d15618e414ef04db0817ed43c8e2d7c7b"
+      }
+    }
+  }
+}

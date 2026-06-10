@@ -30,7 +30,7 @@ func TestVMConformance(t *testing.T) {
 	defer cancel()
 
 	const name = "fbconformance"
-	vm, err := fleetbox.Start(ctx, name, fleetbox.WithImage(fleetbox.Debian12))
+	vm, err := fleetbox.Start(ctx, name, fleetbox.WithImage("debian-12"))
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}

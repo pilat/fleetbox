@@ -1,72 +1,103 @@
 // Package image handles cloud image download, verification, and conversion.
+//
+// The catalog is an embedded JSON file (catalog.json) keyed by alias; each alias
+// pins a dated upstream snapshot and, per GOARCH, a download URL plus the SHA256
+// fetch verifies before use. The snapshot is stamped into the cache filename (for
+// both the source and the converted raw) so an upstream bump is a cache miss, not
+// a stale hit — images are pinned the way the VMM binary and firmware are
+// (ADR-0011, ADR-0019).
 package image
 
 import (
+	_ "embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/lima-vm/go-qcow2reader"
 
 	"github.com/pilat/fleetbox/internal/fetch"
 )
 
-// Catalog maps image aliases to a per-GOARCH URL and an optional SHA256. The
-// arch tokens in the URLs (amd64/arm64) match Go's GOARCH, so the same alias
-// resolves to the right image on macOS Apple Silicon and on Linux amd64/arm64.
-var Catalog = map[string]ImageInfo{
-	"debian-12": {
-		URLs: map[string]string{
-			"amd64": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.raw",
-			"arm64": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.raw",
-		},
-		SHA256: "", // Skip verification for latest
-	},
-	"ubuntu-24.04": {
-		URLs: map[string]string{
-			"amd64": "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img",
-			"arm64": "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img",
-		},
-		SHA256: "",
-	},
+//go:embed catalog.json
+var catalogJSON []byte
+
+var (
+	catalogOnce sync.Once
+	catalogData map[string]ImageInfo
+	catalogErr  error
+)
+
+// ImageInfo describes a pinned cloud image: a dated upstream snapshot and, per
+// GOARCH, the snapshot-stamped download URL plus the SHA256 fetch verifies before
+// use. The arch keys (amd64/arm64) match Go's GOARCH, so one alias resolves to
+// the right image on macOS Apple Silicon and on Linux amd64/arm64.
+//
+// Distro/Version/Codename/BumpedAt are inputs for the contrib/catalog refresher
+// (the only writer of Snapshot/Arch values) and are ignored at runtime: the
+// library reads only Snapshot (for the cache filename) and Arch (URL + SHA256).
+type ImageInfo struct {
+	Distro   string               `json:"distro"`
+	Version  string               `json:"version"`
+	Codename string               `json:"codename,omitempty"`
+	Snapshot string               `json:"snapshot"`
+	BumpedAt string               `json:"bumped_at,omitempty"`
+	Arch     map[string]ArchImage `json:"arch"`
 }
 
-// ImageInfo describes a cloud image: a URL per GOARCH and an optional SHA256
-// (empty means "latest, unverified").
-type ImageInfo struct {
-	URLs   map[string]string
-	SHA256 string
+// ArchImage is the per-architecture pinned download: the snapshot-stamped URL and
+// the SHA256 fetch verifies the downloaded source against before it is cached.
+type ArchImage struct {
+	URL    string `json:"url"`
+	SHA256 string `json:"sha256"`
 }
 
 // Ensure downloads and prepares an image, returning the path to the raw disk.
-// If the image is already cached and verified, returns immediately.
-// If url is a known alias (e.g., "debian-12"), uses the catalog.
+// If the image is already cached it returns immediately. If urlOrAlias is a
+// known catalog alias (e.g. "debian-12") the per-GOARCH entry is used: the source
+// is fetched under a snapshot-stamped name, SHA256-verified, and converted (when
+// it is a qcow2/.img) to the snapshot-stamped raw name. A non-alias is treated as
+// a literal URL — unverified, with a basename-derived cache name (the BYO escape
+// hatch, unchanged).
 func Ensure(cacheDir, urlOrAlias string) (string, error) {
-	// Resolve an alias to the URL for the current architecture; a non-alias is
-	// treated as a literal URL (unverified).
-	url := urlOrAlias
-	sha := ""
-	if info, ok := Catalog[urlOrAlias]; ok {
-		archURL, ok := info.URLs[runtime.GOARCH]
+	catalog, err := loadCatalog()
+	if err != nil {
+		return "", fmt.Errorf("load catalog: %w", err)
+	}
+
+	// Resolve the source URL, the verifying SHA256, and the cache filenames. An
+	// alias pins all three from the catalog and snapshot-stamps the names; a
+	// literal URL derives them from its basename, unverified (unchanged).
+	var url, sha, srcFilename, rawFilename string
+	if info, ok := catalog[urlOrAlias]; ok {
+		arch, ok := info.Arch[runtime.GOARCH]
 		if !ok {
 			return "", fmt.Errorf("image %q has no URL for %s", urlOrAlias, runtime.GOARCH)
 		}
-		url = archURL
-		sha = info.SHA256
+		url = arch.URL
+		sha = arch.SHA256
+		rawFilename = cacheName(urlOrAlias, info.Snapshot, runtime.GOARCH)
+		// The source name carries the snapshot too, with the URL's real extension,
+		// so a leftover old-snapshot source is never served stale by fetch's
+		// name-keyed cache and the .img conversion below still triggers. For a raw
+		// source (Debian) the source and raw names coincide → one verified fetch.
+		srcFilename = strings.TrimSuffix(rawFilename, ".raw") + path.Ext(url)
+	} else {
+		url = urlOrAlias
+		urlParts := strings.Split(url, "/")
+		srcFilename = urlParts[len(urlParts)-1]
+		rawFilename = strings.TrimSuffix(srcFilename, ".qcow2")
+		rawFilename = strings.TrimSuffix(rawFilename, ".img")
+		rawFilename += ".raw"
 	}
 
-	// Determine filename and format from URL
-	urlParts := strings.Split(url, "/")
-	filename := urlParts[len(urlParts)-1]
-	isQcow2 := strings.HasSuffix(filename, ".qcow2") || strings.HasSuffix(filename, ".img")
-
-	// Raw filename (what we'll use)
-	rawFilename := strings.TrimSuffix(filename, ".qcow2")
-	rawFilename = strings.TrimSuffix(rawFilename, ".img")
-	rawFilename += ".raw"
+	isQcow2 := strings.HasSuffix(srcFilename, ".qcow2") || strings.HasSuffix(srcFilename, ".img")
 	rawPath := filepath.Join(cacheDir, rawFilename)
 
 	// If raw already exists, return it
@@ -84,57 +115,28 @@ func Ensure(cacheDir, urlOrAlias string) (string, error) {
 	// A raw source needs no conversion: fetch it (verified) straight to its raw
 	// cache name and we are done.
 	if !isQcow2 {
-		path, err := fetch.Ensure(cacheDir, rawFilename, url, sha)
+		dest, err := fetch.Ensure(cacheDir, rawFilename, url, sha)
 		if err != nil {
 			return "", fmt.Errorf("fetch image: %w", err)
 		}
-		return path, nil
+		return dest, nil
 	}
 
 	// A qcow2/img source is fetched (verified) under its own name, converted to
-	// raw, then removed so only the raw image stays cached.
-	srcPath, err := fetch.Ensure(cacheDir, filename, url, sha)
+	// raw, then removed so only the raw image stays cached. On a convert failure
+	// remove the source too, so it can't be reused unverified next run.
+	srcPath, err := fetch.Ensure(cacheDir, srcFilename, url, sha)
 	if err != nil {
 		return "", fmt.Errorf("fetch image: %w", err)
 	}
 	if err := convertQcow2ToRaw(srcPath, rawPath); err != nil {
 		_ = os.Remove(rawPath)
+		_ = os.Remove(srcPath)
 		return "", fmt.Errorf("convert qcow2: %w", err)
 	}
 	_ = os.Remove(srcPath)
 
 	return rawPath, nil
-}
-
-func convertQcow2ToRaw(qcow2Path, rawPath string) error {
-	// Open qcow2 file
-	f, err := os.Open(qcow2Path)
-	if err != nil {
-		return fmt.Errorf("open qcow2: %w", err)
-	}
-	defer func() { _ = f.Close() }()
-
-	// Read qcow2 image
-	img, err := qcow2reader.Open(f)
-	if err != nil {
-		return fmt.Errorf("read qcow2: %w", err)
-	}
-
-	// Create output file
-	out, err := os.Create(rawPath)
-	if err != nil {
-		return fmt.Errorf("create raw: %w", err)
-	}
-	defer func() { _ = out.Close() }()
-
-	// Create section reader and copy
-	reader := io.NewSectionReader(img, 0, img.Size())
-	if _, err := io.Copy(out, reader); err != nil {
-		_ = os.Remove(rawPath)
-		return fmt.Errorf("convert: %w", err)
-	}
-
-	return nil
 }
 
 // CopyDisk copies the source disk image to the destination with the given size.
@@ -174,6 +176,58 @@ func CopyDisk(src, dst string, sizeBytes int64) error {
 			_ = os.Remove(dst)
 			return fmt.Errorf("truncate: %w", err)
 		}
+	}
+
+	return nil
+}
+
+// loadCatalog parses the embedded catalog.json once and caches the result. It
+// returns a wrapped error on malformed JSON rather than panicking in package
+// init — this is a library, so a bad catalog must surface as an ordinary error to
+// the caller of Ensure.
+func loadCatalog() (map[string]ImageInfo, error) {
+	catalogOnce.Do(func() {
+		catalogErr = json.Unmarshal(catalogJSON, &catalogData)
+	})
+	if catalogErr != nil {
+		return nil, fmt.Errorf("parse embedded catalog: %w", catalogErr)
+	}
+	return catalogData, nil
+}
+
+// cacheName returns the snapshot-stamped raw cache filename for a catalog alias:
+// <alias>-<snapshot>-<goarch>.raw. The snapshot in the name makes an upstream bump
+// a cache miss, the same trick the version-stamped VMM binary names use.
+func cacheName(alias, snapshot, goarch string) string {
+	return fmt.Sprintf("%s-%s-%s.raw", alias, snapshot, goarch)
+}
+
+func convertQcow2ToRaw(qcow2Path, rawPath string) error {
+	// Open qcow2 file
+	f, err := os.Open(qcow2Path)
+	if err != nil {
+		return fmt.Errorf("open qcow2: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	// Read qcow2 image
+	img, err := qcow2reader.Open(f)
+	if err != nil {
+		return fmt.Errorf("read qcow2: %w", err)
+	}
+
+	// Create output file
+	out, err := os.Create(rawPath)
+	if err != nil {
+		return fmt.Errorf("create raw: %w", err)
+	}
+	defer func() { _ = out.Close() }()
+
+	// Create section reader and copy
+	reader := io.NewSectionReader(img, 0, img.Size())
+	if _, err := io.Copy(out, reader); err != nil {
+		_ = os.Remove(rawPath)
+		return fmt.Errorf("convert: %w", err)
 	}
 
 	return nil

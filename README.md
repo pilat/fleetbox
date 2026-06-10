@@ -13,7 +13,7 @@ get a whole machine: real kernel, real systemd, real `/dev/kvm`.
 
 ```go
 func TestAgainstRealLinux(t *testing.T) {
-	vm := fleetboxtest.Start(t, fleetbox.Debian12)
+	vm := fleetboxtest.Start(t, "debian-12")
 
 	out, err := vm.SSH(context.Background(), "uname -a")
 	if err != nil {
@@ -102,7 +102,7 @@ import (
 )
 
 func TestNeedsARealKernel(t *testing.T) {
-	vm := fleetboxtest.Start(t, fleetbox.Debian12,
+	vm := fleetboxtest.Start(t, "debian-12",
 		fleetbox.WithCPUs(2),
 		fleetbox.WithMemoryGB(4),
 	)
@@ -128,7 +128,7 @@ each other by IP (see [Limitations](#limitations) for where clustering is suppor
 
 ```go
 vm, err := fleetbox.Start(ctx, "builder",
-	fleetbox.WithImage(fleetbox.Ubuntu2404),
+	fleetbox.WithImage("ubuntu-24.04"),
 	fleetbox.WithCPUs(4),
 	fleetbox.WithMemoryGB(8),
 	fleetbox.WithDiskGB(40),
@@ -164,7 +164,7 @@ and mounted in the guest at the path you give:
 dir := t.TempDir()
 os.WriteFile(filepath.Join(dir, "input.json"), payload, 0o644)
 
-vm := fleetboxtest.Start(t, fleetbox.Debian12, fleetbox.WithFixture(dir, "/work"))
+vm := fleetboxtest.Start(t, "debian-12", fleetbox.WithFixture(dir, "/work"))
 out, _ := vm.SSH(context.Background(), "cat /work/input.json")  // reads the snapshot
 ```
 
@@ -206,21 +206,27 @@ address each member by name.
 
 ## Images
 
-Use a built-in alias or any direct URL to a raw / qcow2 cloud image:
+Pass a built-in alias or any direct URL to a raw / qcow2 cloud image:
 
 | Alias | Image |
 |-------|-------|
-| `debian-12` *(default)* | Debian 12 generic cloud (amd64/arm64, per host) |
-| `ubuntu-24.04` | Ubuntu 24.04 server cloud (amd64/arm64, per host) |
+| `debian-11` | Debian 11 generic cloud (amd64/arm64, per host) |
+| `debian-12` *(default)* | Debian 12 generic cloud |
+| `debian-13` | Debian 13 generic cloud |
+| `ubuntu-22.04` | Ubuntu 22.04 server cloud |
+| `ubuntu-24.04` | Ubuntu 24.04 server cloud |
+| `ubuntu-26.04` | Ubuntu 26.04 server cloud |
 
 ```go
-fleetboxtest.Start(t, fleetbox.Debian12)
+fleetboxtest.Start(t, "debian-12")
 fleetboxtest.Start(t, "https://example.com/my-cloud-image.qcow2")
 ```
 
-Images are downloaded and cached once in `~/.fleetbox/images/`, with qcow2 converted to
-raw on the way in. Adding a distro is adding a catalog entry; there are no per-distro
-code paths.
+Each alias is pinned to a dated upstream snapshot and verified by SHA256 on download, so
+a given alias boots the same image on every machine and every run. A direct URL is taken
+as-is (unverified) — the escape hatch for a custom or bleeding-edge image. Images are
+downloaded and cached once in `~/.fleetbox/images/`, with qcow2 converted to raw on the
+way in. Adding a distro is adding a catalog entry; there are no per-distro code paths.
 
 ## How it works
 

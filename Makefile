@@ -1,4 +1,4 @@
-.PHONY: all build helper test test-fake test-vm lint lint-fake vendor-vz clean
+.PHONY: all build helper test test-fake test-vm lint lint-fake catalog vendor-vz clean
 
 # Default target
 all: build
@@ -54,6 +54,15 @@ test-fake:
 test-vm: helper
 	FLEETBOX_HELPER=$(CURDIR)/bin/fleetbox-helper \
 		go test -count=1 -v -timeout 30m -run TestVM ./fleetboxtest
+
+# Refresh the pinned cloud-image catalog (internal/image/catalog.json). The
+# human-authored keys decide which OSes exist; the tool only refreshes the values
+# — dated snapshot, snapshot-stamped per-arch URLs, and SHA256. A scheduled CI job
+# runs the same tool and opens a PR when upstream moves (ADR-0019). A Debian
+# refresh streams the images through the hashers to compute the sha256 Debian does
+# not publish; nothing is persisted.
+catalog:
+	go run ./contrib/catalog
 
 # Run linter
 lint:

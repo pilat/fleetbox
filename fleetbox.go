@@ -32,12 +32,6 @@ import (
 	"github.com/pilat/fleetbox/internal/opts"
 )
 
-// Image aliases for common distributions.
-const (
-	Debian12   = "debian-12"
-	Ubuntu2404 = "ubuntu-24.04"
-)
-
 // ErrClustersUnsupported is returned when a second cluster member is requested
 // on a backend that cannot interconnect VMs — macOS older than 26, where VZ NAT
 // isolates VMs from one another (ADR-0008, ADR-0012). A single VM still works.

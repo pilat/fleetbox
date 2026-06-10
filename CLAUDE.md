@@ -34,7 +34,10 @@ Module: `github.com/pilat/fleetbox`
 - **No port forwarding.** VMs get directly routable IPs — vmnet SharedMode on macOS 26+,
   a shared Linux bridge + tap on Linux.
 - **No yaml, no templates, no per-distro code paths.** Flags, defaults, and a dumb
-  alias→URL image map.
+  alias→data image map (embedded `internal/image/catalog.json`). Carve (ADR-0019): that
+  JSON is *internal data compiled into the binary* — not user-side config — so it does
+  not violate "no yaml"; per-distro logic lives only in the build-time `contrib/catalog`
+  tool, never in the runtime library.
 - **Clusters are a naming convention** (`prefix-N`), never an entity with state.
 - **Cattle with persistence.** `up` is idempotent, disks survive reboots, `rm` is the
   only destructive command.
@@ -54,7 +57,7 @@ internal/backend                Backend interface (CreateNetwork/Create/NestedVi
 internal/backend/vz             VZ implementation, darwin/arm64 (the only vz import site)
 internal/backend/cloudhypervisor cloud-hypervisor implementation, linux (the only CH import site)
 internal/fetch                  shared download → verify(sha256) → atomic-cache primitive
-internal/image                  cloud image download/verify/qcow2→raw/cache (per-arch catalog)
+internal/image                  cloud image download/verify/qcow2→raw/cache; pinned per-arch catalog as embedded JSON (catalog.json, snapshot-stamped cache names) (ADR-0019)
 internal/seed                   cloud-init NoCloud seed ISO + static network-config (via pilat/cloudiso)
 internal/fixture                host dir → read-only ext4 payload image (via pilat/go-ext4fs); fixtures (ADR-0015)
 internal/store                  ~/.fleetbox/{clusters,images,bin}/ state, config.json, locking; cluster-rooted layout clusters/<cluster>/<member>/ (ADR-0014)
@@ -62,6 +65,7 @@ internal/dhcp                   /var/db/dhcpd_leases parsing (hostname → IP); 
 internal/sshkey                 keypair + x/crypto/ssh client
 cmd/fleetbox                    CLI: up/down/ls/ssh/cp/ssh-config/rm (pure-Go client; on darwin drives the helper, on linux re-execs itself as the holder)
 cmd/fleetbox-helper             darwin VM host: links vz, signed, downloaded; runs internal/holder (ADR-0017)
+contrib/catalog                 build-time tool (not in any runtime binary): refreshes internal/image/catalog.json — newest dated snapshot + per-arch URL/sha256; run via `make catalog` + monthly CI (ADR-0019)
 ```
 
 On darwin the importable package and the CLI are pure Go — they link neither `vz` nor
@@ -99,6 +103,9 @@ stay pure Go — no cgo; cgo lives only in the darwin helper.
 - Commands: `make test` (unit), `make build` (compile the pure-Go CLI, no signing),
   `make helper` (build + ad-hoc-sign `cmd/fleetbox-helper`, darwin only), `make test-vm`
   (builds+signs the helper, exports `FLEETBOX_HELPER`, boots real VMs), `make lint`,
+  `make catalog` (refresh the pinned image catalog — `go run ./contrib/catalog`;
+  streams the Debian images through the hashers to compute the sha256 Debian does not
+  publish, so it pulls several GB when snapshots move; maintenance/CI only),
   `make vendor-vz` (regenerate the vendored vz fork — maintenance only). No test binary is
   ever signed now — the sever moved the entitlement into the helper.
 

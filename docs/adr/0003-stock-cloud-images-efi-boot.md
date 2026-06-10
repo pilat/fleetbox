@@ -1,7 +1,10 @@
 # ADR: Stock Cloud Images, EFI Boot, and a Dumb Image Catalog
 
 **Date:** 2026-06-03
-**Status:** Accepted
+**Status:** Accepted (superseded in part by [ADR-0019](0019-pin-cloud-images.md) —
+images are now pinned to dated snapshots with per-arch SHA256; the "latest, optional
+sha256" model below no longer holds, and the catalog is embedded JSON data, not a Go
+map. The rest — stock images, EFI boot, qcow2→raw, one code path — stands.)
 
 ## Context
 
@@ -44,5 +47,7 @@ the moving part this project exists to remove.
   Distros that don't, don't — there is no escape hatch, by design.
 - First boot of a new image pays a download (and possibly a qcow2→raw conversion);
   subsequent boots hit the cache in `~/.fleetbox/images/`.
-- Checksums are only verified when the catalog entry has one; "latest" URLs can't have
-  stable checksums. Accepted trade-off for tracking distro updates automatically.
+- Catalog images are pinned to dated snapshots and always SHA256-verified; only a
+  literal `WithImage(url)` stays unverified. *(Originally this point read "checksums
+  are only verified when the catalog entry has one; latest URLs can't have stable
+  checksums" — reversed by [ADR-0019](0019-pin-cloud-images.md).)*
