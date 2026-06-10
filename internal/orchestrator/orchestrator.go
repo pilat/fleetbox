@@ -337,11 +337,15 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 	}
 	vm.ip = ip
 
-	// Wait for SSH
-	if err := vm.waitForSSH(ctx, 2*time.Minute); err != nil {
-		_ = backendVM.Stop(ctx)
-		_ = serialLog.Close()
-		return nil, fmt.Errorf("wait for ssh: %w", err)
+	// Wait for SSH. Skipped only under the fleetbox_fake build tag (skipSSHWait),
+	// where the fake backend's unroutable IP would make the real dial block for the
+	// full timeout; production builds always run it (ADR-0018).
+	if !skipSSHWait() {
+		if err := vm.waitForSSH(ctx, 2*time.Minute); err != nil {
+			_ = backendVM.Stop(ctx)
+			_ = serialLog.Close()
+			return nil, fmt.Errorf("wait for ssh: %w", err)
+		}
 	}
 
 	return vm, nil

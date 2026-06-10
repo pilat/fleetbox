@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && !fleetbox_fake
 
 package orchestrator
 

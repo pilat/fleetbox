@@ -109,6 +109,22 @@ const→var→type→exported→unexported, `var _ Iface = (*impl)(nil)`, New() 
 flat error handling with `fmt.Errorf("context: %w", err)`, sentinel errors caught once
 at the caller. Every exported symbol gets a doc comment — this is a library.
 
+## Git conventions
+
+Commits follow **Conventional Commits** (`<type>[(scope)][!]: <description>`):
+
+- **Type:** `feat` and `fix` are the two the spec mandates; we also use the standard
+  Angular/commitlint set — `chore`, `docs`, `test`, `refactor`, `ci`, `build`, `perf`,
+  `style`. Pick the one matching the change's PRIMARY intent.
+- **Scope** is optional and in parentheses: `feat(backend): …`.
+- **Breaking changes** are flagged with `!` before the colon (`feat!:`, `feat(api)!:`).
+  Our subjects are a single line, so we do NOT use the multi-line `BREAKING CHANGE:` footer.
+- **Branches** are not part of Conventional Commits, but we prefix them with the same
+  type vocabulary plus a short kebab-case description: `feat/cluster-prune`,
+  `test/fake-backend-coordination-tests`, `fix/holder-reap-race`.
+- PRs are **squash-only** (`gh pr merge --squash`); the squash subject is itself a
+  Conventional Commit.
+
 ## Known deviations from spec
 
 - **macOS signed-helper sever: the importable package is pure Go (no cgo, no codesign).**
