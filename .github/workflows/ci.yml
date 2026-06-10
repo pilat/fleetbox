@@ -34,6 +34,15 @@ jobs:
         env:
           GOOS: linux
 
+      # Lint the files behind the fleetbox_fake build tag (the fake backend, the
+      # ssh-wait seam, the tagged tests), invisible to the default lint above —
+      # equivalent to `make lint-fake` (ADR-0018).
+      - name: Lint (fake backend)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+          args: --build-tags fleetbox_fake
+
       - name: Build (darwin, incl. signed VM helper)
         run: go build ./...
 
@@ -44,3 +53,11 @@ jobs:
 
       - name: Unit tests
         run: make test
+
+      # The pre-merge gate for teardown + the holder protocol: the cross-process
+      # coordination layer runs against the build-tagged fake backend, with no VM
+      # boot and no codesign, so a teardown/protocol regression fails the PR here
+      # rather than slipping through (the VM-boot suites do not run on PRs). See
+      # ADR-0018; note vm-linux.yml is still push:[main]-only (out of scope here).
+      - name: Coordination tests (fake backend)
+        run: make test-fake

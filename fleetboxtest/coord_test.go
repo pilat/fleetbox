@@ -1,0 +1,238 @@
+//go:build darwin && arm64
+
+// coord_test.go exercises the macOS cross-process coordination layer — the real
+// pure-Go client driving a SEPARATELY-BUILT fake helper (cmd/fleetbox-helper
+// -tags fleetbox_fake) over the holder protocol — without booting a real VZ VM.
+// It is the only pre-merge gate for the bound-helper teardown that the whole fake
+// backend exists to protect (ADR-0018).
+//
+// BANNER: this proves COORDINATION, not that a VM boots. Green here is NOT "VMs
+// work" — real boot/SSH/IP discovery stay covered by `make test-vm` (M3+/26+) and
+// vm-linux.yml. The fake helper's Stop is a no-op; only the spawn/reap/EOF logic
+// around it is tested here.
+//
+// It is built into the normal (non-fake-tag) fleetboxtest binary and gated at
+// RUNTIME on FLEETBOX_FAKE_HELPER (set by `make test-fake`). Critically it uses
+// the public fleetbox.Start directly, NOT fleetboxtest.Start — the latter skips
+// on a host without nested virt, which on a GitHub macos-26 runner would silently
+// turn this gate into a no-op (the exact failure this plan prevents).
+package fleetboxtest_test
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/pilat/fleetbox"
+	"github.com/pilat/fleetbox/internal/store"
+)
+
+// coordImageURL resolves in image.Ensure to the cache filename "fbtiny.raw" (URL
+// basename, .qcow2/.img stripped, ".raw" appended), which shortHome pre-seeds so
+// the spawned fake helper finds it cached and never downloads.
+const coordImageURL = "https://invalid.test/fbtiny"
+
+const coordBanner = `coordination test: proves the client<->helper<->holder coordination and ` +
+	`teardown, NOT that a VM boots (the helper is fake; real boot is make test-vm / vm-linux.yml)`
+
+// TestCoordHappyPath drives the full client path — fleetbox.Start → exec fake
+// helper → holder → fake backend → WaitMembers — then normal teardown, asserting
+// the helper's socket/pidfile come up and are retired and the helper process
+// exits. It never SSHes: the fake IP is unroutable and a dial would hang.
+func TestCoordHappyPath(t *testing.T) {
+	requireFakeHelper(t)
+	t.Log(coordBanner)
+
+	home, st := shortHome(t)
+	t.Setenv("HOME", home) // this process's fleetbox.Start (and the helper it execs) share it
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	vm, err := fleetbox.Start(ctx, "solo", fleetbox.WithImage(coordImageURL), fleetbox.WithDiskGB(1))
+	if err != nil {
+		t.Fatalf("fleetbox.Start: %v", err)
+	}
+
+	if vm.IP() == nil {
+		t.Error("VM came up without an IP")
+	}
+	if got := vm.State(); got != "running" {
+		t.Errorf("State() = %q, want running", got)
+	}
+	assertExists(t, st.PidfilePath("solo"))
+	assertExists(t, st.SocketPath("solo"))
+	helperPID := readPID(t, st.PidfilePath("solo"))
+
+	// Normal teardown: Destroy stops the sole member (helper exits) and removes the
+	// store files. Assert the coordination artifacts and the process are gone.
+	if err := vm.Destroy(ctx); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	assertPathGoneWithin(t, st.PidfilePath("solo"), 5*time.Second)
+	assertPathGoneWithin(t, st.SocketPath("solo"), 5*time.Second)
+	assertProcessDeadWithin(t, helperPID, 5*time.Second)
+}
+
+// TestCoordReapOnKillNine is the crown jewel: it kills the spawning process with
+// SIGKILL — no cleanup runs — and asserts the bound helper reaps itself and its
+// (fake) VM anyway, via its reparent poll and control-connection EOF. A leaked
+// helper here is the cardinal sin for a "VMs as fixtures" library. It uses the
+// standard os/exec helper-process pattern: it re-execs this test binary as a
+// child (TestCoordHelperChild) that calls fleetbox.Start and blocks.
+func TestCoordReapOnKillNine(t *testing.T) {
+	requireFakeHelper(t)
+	t.Log(coordBanner)
+
+	home, st := shortHome(t)
+
+	// Re-exec self as the blocking child. It shares HOME (so the helper finds the
+	// pre-seeded image and writes its pidfile where we can read it) and inherits
+	// FLEETBOX_HELPER / FLEETBOX_FAKE_HELPER from the make environment.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCoordHelperChild$", "-test.v")
+	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1", "HOME="+home)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	// The pidfile carries the HELPER's PID (holder.WritePidfile), written before
+	// boot — so it appears quickly once the child has spawned the helper.
+	helperPID := pollHelperPID(t, st, "solo", 30*time.Second)
+
+	// SIGKILL the child: it cannot run any cleanup, so only the helper's own
+	// parent-death watch can reap it.
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill child: %v", err)
+	}
+	_ = cmd.Wait() // reap the child and drain its output pipes
+
+	// Window comfortably exceeds the 1s watchParent poll; the control-conn EOF is
+	// faster still. If the helper survives this, teardown leaked.
+	assertProcessDeadWithin(t, helperPID, 10*time.Second)
+	assertPathGoneWithin(t, st.PidfilePath("solo"), 10*time.Second)
+	assertPathGoneWithin(t, st.SocketPath("solo"), 10*time.Second)
+	if t.Failed() {
+		t.Logf("child output:\n%s", out.String())
+	}
+}
+
+// TestCoordHelperChild is the re-exec'd child of TestCoordReapOnKillNine, not a
+// standalone test: it runs its body only when GO_WANT_HELPER_PROCESS=1, calls
+// fleetbox.Start, and blocks until the parent SIGKILLs it. In any normal run
+// (including the parent's own -run TestCoord sweep) it returns immediately.
+func TestCoordHelperChild(_ *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	vm, err := fleetbox.Start(context.Background(), "solo",
+		fleetbox.WithImage(coordImageURL), fleetbox.WithDiskGB(1))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "child fleetbox.Start: %v\n", err)
+		os.Exit(3)
+	}
+	fmt.Fprintf(os.Stderr, "child up: ip=%s\n", vm.IP())
+	select {} // hold the VM (and the bound session) until the parent kills us
+}
+
+func requireFakeHelper(t *testing.T) {
+	t.Helper()
+	if os.Getenv("FLEETBOX_FAKE_HELPER") == "" {
+		t.Skip("coordination test requires the fake helper; run via `make test-fake`")
+	}
+}
+
+// shortHome creates a short /tmp-rooted HOME, builds a store rooted at it, and
+// pre-seeds the tiny image. The base must be short because the holder's unix
+// socket paths (run/<hash>.sock|.ctl) must fit the 104-byte sun_path limit, which
+// macOS's $TMPDIR (/var/folders/...) blows past. The returned store points at the
+// same HOME/.fleetbox the spawned helper computes from the HOME env.
+func shortHome(t *testing.T) (string, *store.Store) {
+	t.Helper()
+	home, err := os.MkdirTemp("/tmp", "fbhome")
+	if err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	st, err := store.NewAt(filepath.Join(home, ".fleetbox"))
+	if err != nil {
+		t.Fatalf("store.NewAt: %v", err)
+	}
+	raw := filepath.Join(st.ImagesDir(), "fbtiny.raw")
+	if err := os.WriteFile(raw, []byte("fleetbox-fake-tiny-image\n"), 0o644); err != nil {
+		t.Fatalf("seed image %s: %v", raw, err)
+	}
+	return home, st
+}
+
+func assertExists(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected %s to exist: %v", path, err)
+	}
+}
+
+func readPID(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read pidfile %s: %v", path, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatalf("parse pidfile %s = %q: %v", path, data, err)
+	}
+	return pid
+}
+
+// pollHelperPID waits for the member's pidfile to appear and returns the PID it
+// holds (the helper process's PID).
+func pollHelperPID(t *testing.T, st *store.Store, name string, timeout time.Duration) int {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(st.PidfilePath(name)); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("pidfile for %q never appeared within %s", name, timeout)
+	return 0
+}
+
+func assertProcessDeadWithin(t *testing.T, pid int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("helper process %d still alive after %s (teardown leaked)", pid, timeout)
+}
+
+func assertPathGoneWithin(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("%s still present after %s", path, timeout)
+}

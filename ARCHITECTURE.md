@@ -67,6 +67,7 @@ Where the canonical version of each thing lives. When two files disagree, the So
 | Pinned VMM binaries | `internal/backend/cloudhypervisor/binaries.go` | cloud-hypervisor + firmware: version + per-arch URL + sha256. |
 | macOS helper catalog | `internal/helperdist/helperdist.go` `catalog` map | fleetbox-helper: version + per-arch URL + sha256; `FLEETBOX_HELPER` override (ADR-0017). |
 | Holder protocol | `internal/control/control.go` (client) + `internal/holder/holder.go` (server) | Wire commands + states + bound-mode bind/version handshake. |
+| Coordination test seam | `internal/backend/fake` + the `fleetbox_fake` build tag | Fake backend so CI gates teardown + the holder protocol with no VM boot; `make test-fake`/`make lint-fake` (ADR-0018). |
 | Network teardown records & reconcile | `internal/backend/cloudhypervisor/netstate.go` | Write-ahead bridge/tap records + `ip_forward` marker under `~/.fleetbox/networks/`; crash recovery (ADR-0013). |
 | Guest provisioning contract | `internal/seed/seed.go` (user-data / meta-data) | One user, one SSH key, hostname, fixture mount lines. Nothing else. |
 | Fixture payload format | `internal/fixture/fixture.go` | Host dir → read-only ext4 image (go-ext4fs), attached read-only, mounted by LABEL (ADR-0015). |
@@ -297,7 +298,10 @@ The support matrix and how it is realized in build tags:
 - **The module compiles on `darwin/arm64`, `linux/amd64`, and `linux/arm64`.** Backend
   selection is three build-tagged files in `internal/orchestrator`: `backend_darwin_arm64.go`
   (→ vz), `backend_linux.go` (→ cloud-hypervisor), `backend_unsupported.go` (everything
-  else). `newBackend() (backend.Backend, error)`; the unsupported stub returns
+  else) — each now also tagged `!fleetbox_fake` so a fourth, test-only `backend_fake.go`
+  (→ the fake backend) wins under `-tags fleetbox_fake` for CI coordination tests, with a
+  duplicate `newBackend` self-catching a forgotten `!fleetbox_fake` (ADR-0018).
+  `newBackend() (backend.Backend, error)`; the unsupported stub returns
   `"fleetbox: unsupported platform (<GOOS>/<GOARCH>)"`, so `darwin/amd64` et al. build and
   fail cleanly rather than as an opaque link error. The root package is build-tagged too
   (ADR-0017): `fleetbox_linux.go` wraps the orchestrator in-process, `fleetbox_darwin_arm64.go`
@@ -333,7 +337,12 @@ The support matrix and how it is realized in build tags:
   availability; `fleetboxtest` skips when unsupported.
 - **CI.** The `macos-26` runner cannot boot VZ VMs (no nested virtualization): it runs
   lint + build + unit tests; `make test` passes `-short` so it stays VM-free even on
-  capable hardware. Unlike VZ, the cloud-hypervisor backend *is* CI-testable on a GitHub
+  capable hardware. It additionally runs the **fake-backend coordination tests**
+  (`make test-fake` + a `fleetbox_fake`-tagged lint pass): a build-tagged fake backend
+  lets the whole cross-process control↔holder↔orchestrator path — teardown and the holder
+  protocol — gate pre-merge with no VM boot and no codesign, the one VM-free check of the
+  bound-helper reap (ADR-0018). Everything runs under `-race`. Unlike VZ, the
+  cloud-hypervisor backend *is* CI-testable on a GitHub
   x86-64 Linux runner, which does expose `/dev/kvm` (after a one-time udev rule so the
   runner user can open it) — the "develop on a Mac, run in cheap hosted Linux CI" path
   (ADR-0017); arm64 hosted Linux runners have no KVM. Not yet wired. Do not switch the
@@ -762,8 +771,9 @@ When a PR changes any of these fields for a package, update its section.
   (ADR-0017).
 - Owns: the `VM`/`Cluster` runtime objects, the per-VM serial-log handle, the shared
   `backend.Network` reference (kept so the network is not GC'd while a member lives),
-  compile-time backend selection (`newBackend`), and the per-platform `preflight` /
-  `nestedVirtSupported`.
+  compile-time backend selection (`newBackend`), the per-platform `preflight` /
+  `nestedVirtSupported`, and the `skipSSHWait` build-tag seam (`sshwait.go` /
+  `sshwait_fake.go`) that lets the fake test build short-circuit the real SSH wait.
 - Depends on: `internal/backend` (+ `internal/backend/vz` on darwin/arm64,
   `internal/backend/cloudhypervisor` on linux), `internal/{opts,image,seed,sshkey,fixture,store}`.
 - Public API (internal): `Start`, `NewCluster`, `Prune`, `NestedVirtSupported`; `VM`
@@ -774,6 +784,11 @@ When a PR changes any of these fields for a package, update its section.
   - The clustering gate and `ErrClustersUnsupported` live in the root package, not here:
     `Cluster.Add` boots unconditionally (the caller is expected to have gated). `Destroy`
     is idempotent (skips delete when the store entry is already gone).
+  - Under `-tags fleetbox_fake`, `backend_fake.go` replaces the three platform selectors
+    (which carry `!fleetbox_fake`): `newBackend` → `internal/backend/fake`, `preflight`/
+    `nestedVirtSupported` → nil/true, and `skipSSHWait` → true. This is a CI test seam,
+    physically absent from a normal `go build ./...`; a forgotten `!fleetbox_fake` on a
+    platform file self-catches as a duplicate `newBackend` (ADR-0018, §5.20).
 
 ### §5.17 `internal/holder`
 
@@ -822,6 +837,32 @@ When a PR changes any of these fields for a package, update its section.
   - Ad-hoc-signed with `entitlements.plist` (`make helper`), downloaded + cached by the
     client, launched with `--fleetbox-runner` + `FLEETBOX_OPTS` (+ `FLEETBOX_PARENT_PID` in
     bound mode). The user's test/CLI binary never links it (ADR-0017).
+
+### §5.20 `internal/backend/fake`
+
+- Purpose: a dumb, instant, pure-Go implementation of the backend interfaces used to
+  exercise the cross-process coordination layer (control ↔ holder ↔ orchestrator) in CI
+  with no VM boot and no codesign (ADR-0018). **Test-only:** linked only by the
+  orchestrator's `backend_fake.go` selector under the `fleetbox_fake` build tag, never by a
+  normal `go build ./...`.
+- Owns: mutex-guarded package-global test state — recorded `backend.Config`s, stopped
+  member names, the network-close count, the per-VM IP counter, and the `FailCreate` fault.
+- Depends on: `internal/backend`, stdlib only.
+- Public API (internal): `New() *Backend` (satisfies `backend.Backend`; its `VM`/`Network`
+  satisfy the rest); inspection/fault hooks `Reset`, `Created`, `Stopped`, `NetworksClosed`,
+  `FailCreate`; constant `EnvFailCreate` (`FLEETBOX_FAKE_FAIL_CREATE`, the cross-process
+  fault the spawned fake helper reads).
+- Invariants:
+  - Never linked into a no-tag binary (the carrier `backend_fake.go` is `//go:build
+    fleetbox_fake`); the package compiles under `go list ./...` but a `go list -deps` of the
+    real artifacts without the tag must not contain it.
+  - Trivial by design — `Start`/`Stop` are no-ops, `WaitForIP` returns an unroutable
+    TEST-NET-3 address, `Subnet` is "" (the DHCP path). It proves *coordination*, not that a
+    VM boots; tests assert recorded `backend.Config`s and on-disk artifacts, never a value
+    the fake itself invents. No latency simulation or fault matrix (ADR-0018).
+  - All globals are mutex-guarded (tests and the fake helper's goroutines run under `-race`);
+    tests `Reset` between sub-tests, since every orchestrator entry point builds a fresh
+    `fake.New` over the same globals.
 
 ### Dependency graph
 
@@ -917,9 +958,10 @@ CLAUDE.md as checkable rules):
    `store.Delete`.
 8. **Platform gating is compile-time.** Backend selection happens via build-tagged files
    in `internal/orchestrator` (`backend_darwin_arm64.go`, `backend_linux.go`,
-   `backend_unsupported.go`), never via runtime config. (The *macOS version* branch within
-   the vz backend is a runtime detail of one compile-time-selected backend, not backend
-   selection — ADR-0012.)
+   `backend_unsupported.go`, plus a test-only `backend_fake.go` under the `fleetbox_fake`
+   tag — still compile-time, never via runtime config or an env-selected backend, ADR-0018).
+   (The *macOS version* branch within the vz backend is a runtime detail of one
+   compile-time-selected backend, not backend selection — ADR-0012.)
 9. **macOS sever: the user's binary is pure Go (ADR-0017).** The importable `fleetbox`
    package, `fleetboxtest`, and `cmd/fleetbox` link no hypervisor on darwin — only the
    downloaded `cmd/fleetbox-helper` does. Check: `GOOS=darwin GOARCH=arm64 go list -deps`

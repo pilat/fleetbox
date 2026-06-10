@@ -6,11 +6,10 @@
 ![Platform](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20linux%20amd64%2Farm64-black)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-fleetbox boots stock Linux cloud images — on macOS (Apple Silicon) through Apple's
-Virtualization.framework, on Linux through cloud-hypervisor — hands them to your tests
-over SSH, and tears them down when the test ends. Think testcontainers — except instead
-of a container you get a whole machine: real kernel, real systemd, real `/dev/kvm`. The
-Go API is the same on both platforms.
+fleetbox boots stock Linux cloud images and hands them to your tests over SSH. On macOS
+(Apple Silicon) it drives Apple's Virtualization.framework; on Linux, cloud-hypervisor.
+The Go API is identical on both. Think testcontainers, except instead of a container you
+get a whole machine: real kernel, real systemd, real `/dev/kvm`.
 
 ```go
 func TestAgainstRealLinux(t *testing.T) {
@@ -24,55 +23,47 @@ func TestAgainstRealLinux(t *testing.T) {
 }
 ```
 
-One line gets you a booted Debian box, reachable over SSH (fleetbox generates its own
-keypair — it never touches your `~/.ssh`). The VM is destroyed automatically when the test
-returns.
+One line gets you a booted Debian box, reachable over SSH with a keypair fleetbox
+generates itself (it never touches your `~/.ssh`). When the test returns, the VM is
+destroyed.
 
 > **Status: v0.** It works, but the API will change and there are no compatibility
 > promises yet. See [Limitations](#limitations).
 
 ## Why
 
-Containers are wonderful right up until you need to test something a container can't give
-you — a kernel module, a systemd unit, an nftables ruleset, `kubeadm`, a VPN, anything
-that wants `/dev/kvm`. The usual fallback is a VM tool that comes with a yaml file, a
-background agent forwarding SSH ports, and patched images. That's a lot of moving parts to
-keep working.
+Containers are wonderful right up until you need to test something a container can't
+give you: a kernel module, a systemd unit, an nftables ruleset, `kubeadm`, a VPN,
+anything that wants `/dev/kvm`. The usual fallback is a VM tool that arrives with a yaml
+dialect, a background agent forwarding SSH ports, and patched images. That is a lot of
+machinery, and all of it has to keep working.
 
-fleetbox takes the opposite line:
+fleetbox keeps the machinery small and refuses to grow it:
 
 - **Real VMs, not containers.** It EFI-boots unmodified cloud images through their own
-  bootloader. Real kernel, real init, and nested virtualization on M3+ — you can run KVM
-  *inside* the guest.
-- **Every VM gets a routable IP.** On macOS 26+ each VM joins a vmnet SharedMode network;
-  on Linux it gets a static address on a shared bridge — a real, directly reachable IP
-  either way. No port forwarding, no `-p` flags, no tunnel daemon — call `vm.IP()` and
-  connect.
-- **Nothing of ours runs in the guest.** No agent, no helper binary, no host↔guest
-  protocol. A VM is configured exactly once by cloud-init; after that it's a plain distro
-  you reach over SSH.
+  bootloader; on M3+ you also get nested virtualization, so KVM works inside the guest.
+- **Every VM gets a routable IP.** A vmnet SharedMode network on macOS 26+, a shared
+  bridge with static addresses on Linux. No port forwarding to set up, no tunnel daemon
+  to babysit: call `vm.IP()` and connect.
+- **Nothing of ours runs in the guest.** No agent, no helper binary, no host/guest
+  protocol. cloud-init configures the VM once at first boot; after that it's a plain
+  distro you reach over SSH.
 - **Library-first.** The Go package is the product; the CLI is a thin wrapper over the
-  same calls. Fixtures clean themselves up through `t.Cleanup`.
+  same calls. Test fixtures clean themselves up through `t.Cleanup`.
 
-It's opinionated on purpose: no yaml, no templates, no per-distro code paths — just flags
-and sane defaults.
+No yaml, no templates, no per-distro code paths. Flags and sane defaults.
 
 ## Requirements
 
-One of:
+- **macOS on Apple Silicon.** Clusters (VM↔VM networking) need macOS 26+; below that
+  you get a single VM at a time. Nested virtualization (`/dev/kvm` in the guest) needs
+  M3 or newer. Intel Macs are not supported.
+- **Linux, amd64 or arm64.** Needs `/dev/kvm` (be in the `kvm` group) and
+  `CAP_NET_ADMIN` for the bridge and taps. fleetbox checks both before booting anything
+  and fails with a one-line fix, not a cryptic boot error.
 
-- **macOS, Apple Silicon** — clusters (VM↔VM) need macOS 26+ (vmnet SharedMode); macOS
-  below 26 runs a single VM via VZ NAT. Nested virtualization (`/dev/kvm` in the guest)
-  needs M3 or newer. Intel Macs are not supported. All VM work runs in a small signed
-  `fleetbox-helper` that fleetbox downloads to `~/.fleetbox/bin/` on first use — **your test
-  binary stays pure Go and needs no codesign** (see [First run](#first-run)).
-- **Linux, amd64 or arm64** — needs `/dev/kvm` (be in the `kvm` group) and `CAP_NET_ADMIN`
-  (to create the bridge and taps). fleetbox preflight-checks both and fails with a one-line
-  fix if either is missing, rather than a cryptic boot error. The cloud-hypervisor binary
-  and firmware are downloaded and checksum-pinned to `~/.fleetbox/bin/` on first use.
-
-Plus **Go 1.24+**. The module compiles on `darwin/arm64` and `linux/{amd64,arm64}`; other
-targets build but return a clear "unsupported platform" error.
+Plus Go 1.24+. The module compiles on `darwin/arm64` and `linux/{amd64,arm64}`; other
+targets build but return a clear "unsupported platform" error at runtime.
 
 ## Install
 
@@ -80,26 +71,22 @@ targets build but return a clear "unsupported platform" error.
 go get github.com/pilat/fleetbox
 ```
 
-### First run
+That's the whole install: nothing to build, nothing to codesign. Your test binary stays
+pure Go. On macOS, all the Virtualization.framework work lives in a small signed
+`fleetbox-helper` that fleetbox downloads, checksum-pinned, into `~/.fleetbox/bin/` the
+first time you boot a VM. Linux is the same story with different binaries: the
+cloud-hypervisor VMM and its firmware are fetched and pinned on first use.
 
-Your binary that boots a VM links no hypervisor and needs no codesign — that is the whole
-point. The Virtualization.framework work lives in a small, separately signed
-`fleetbox-helper`, fetched once and cached, the same way the Linux backend already fetches
-cloud-hypervisor.
+The first boot also downloads the cloud image (a few hundred MB, cached in
+`~/.fleetbox/images/`) and prints a progress line so it doesn't look like a hung test.
 
-- **macOS:** the helper is downloaded to `~/.fleetbox/bin/` (checksum-pinned) on first use —
-  nothing to build, nothing to sign. To run against a locally built helper instead
-  (development, or an offline / air-gapped host), point fleetbox at one with `FLEETBOX_HELPER`:
+Hacking on fleetbox itself, or running on an air-gapped host? Build the helper locally
+and point fleetbox at it:
 
-  ```bash
-  make helper                                    # builds + ad-hoc-signs ./bin/fleetbox-helper
-  FLEETBOX_HELPER=$PWD/bin/fleetbox-helper go test ./...
-  ```
-- **Linux:** nothing to sign; cloud-hypervisor downloads to `~/.fleetbox/bin/` on first use.
-
-On both platforms the cloud image downloads once to `~/.fleetbox/images/`. A first run that
-pulls a multi-hundred-MB image (and, on macOS, the helper) prints a progress line so it
-doesn't look like a hung test.
+```bash
+make helper                                    # builds + ad-hoc-signs ./bin/fleetbox-helper
+FLEETBOX_HELPER=$PWD/bin/fleetbox-helper go test ./...
+```
 
 ## Usage
 
@@ -120,8 +107,8 @@ func TestNeedsARealKernel(t *testing.T) {
 		fleetbox.WithMemoryGB(4),
 	)
 
-	// A real machine, not a container: real init (systemd as PID 1), real
-	// kernel, nested KVM available.
+	// What no container can give you: systemd as PID 1, your own kernel,
+	// a working /dev/kvm.
 	out, err := vm.SSH(context.Background(),
 		"cat /proc/1/comm && uname -r && test -e /dev/kvm && echo ok")
 	if err != nil {
@@ -131,11 +118,11 @@ func TestNeedsARealKernel(t *testing.T) {
 }
 ```
 
-`fleetboxtest.Start` registers `t.Cleanup` to destroy the VM, derives a collision-safe name
-from the test name (parallel-test friendly), and skips automatically when the hardware can't
-run it. `SkipIfShort` opts a test out under `go test -short`. `StartN` boots an
-interconnected cluster — several VMs on one shared network that reach each other by IP
-(where clustering is supported; see [Limitations](#limitations)).
+`fleetboxtest.Start` registers `t.Cleanup` to destroy the VM, derives a collision-safe
+name from the test name so parallel tests don't fight, and skips the test automatically
+when the hardware can't run it. `SkipIfShort` opts a test out under `go test -short`.
+`StartN` boots several VMs on one shared network — a real cluster whose members reach
+each other by IP (see [Limitations](#limitations) for where clustering is supported).
 
 ### As a library (no testing.T)
 
@@ -162,16 +149,16 @@ _ = vm.Stop(ctx)                  // graceful shutdown, disk preserved
 ```
 
 `Start` is idempotent: call it again with the same name and it boots the existing VM
-instead of recreating it. State lives under `~/.fleetbox/clusters/<cluster>/<name>/` and survives reboots
-— `Destroy` (or `fleetbox rm`) is the only thing that deletes a disk. Full API on
-[pkg.go.dev](https://pkg.go.dev/github.com/pilat/fleetbox).
+instead of recreating it. State lives under `~/.fleetbox/clusters/<cluster>/<name>/` and
+survives reboots; `Destroy` (or `fleetbox rm`) is the only thing that deletes a disk.
+Full API on [pkg.go.dev](https://pkg.go.dev/github.com/pilat/fleetbox).
 
 ### Handing a VM a directory
 
-`WithFixture` packs a host directory into the guest as a read-only fixture — the natural
-way to hand a VM your test data, config, or build output without a daemon. It works
-identically on macOS and Linux: at boot the directory is snapshotted into an ext4 image,
-attached read-only, and mounted by the guest at the path you give:
+`WithFixture` packs a host directory into the guest as a read-only fixture — the way to
+hand a VM your test data, config, or build output. It works identically on macOS
+and Linux: at boot the directory is snapshotted into an ext4 image, attached read-only,
+and mounted in the guest at the path you give:
 
 ```go
 dir := t.TempDir()
@@ -187,36 +174,35 @@ From the CLI it's a repeatable `--fixture host:guest` flag:
 ./bin/fleetbox up dev --fixture ./src:/work --fixture ./fixtures:/data
 ```
 
-The fixture is **read-only** and **world-readable** (every file `0444`, every dir `0555`,
-owned by root), so any guest user can read it; host permission and exec bits are not
-preserved. The set of fixtures is frozen when the VM is first created (change it with `rm` +
-recreate), but the content is re-snapshotted from the host directory on every boot — so a
-reboot picks up host-side changes, though never live within a single boot. To get data back
-out of the guest, use `fleetbox cp` / scp. The guest path must be absolute, and host paths
-must not contain colons (the value is split on the last colon).
+Fixtures are read-only and world-readable: every file `0444`, every directory `0555`,
+owned by root. Host permission and exec bits are not preserved. The set of fixtures is
+frozen when the VM is first created (`rm` and recreate to change it), but the content is
+re-snapshotted from the host directory on every boot, so a reboot picks up host-side
+changes. To get data back out of the guest, use `fleetbox cp` or scp. The guest path
+must be absolute, and host paths must not contain colons (the value splits on the last
+colon).
 
 ### From the command line
 
 The CLI wraps the same library for manual work:
 
 ```bash
-make build                                   # compiles ./bin/fleetbox (pure Go, nothing to sign)
+make build                                     # compiles ./bin/fleetbox (pure Go, nothing to sign)
 
-./bin/fleetbox up web                        # create & boot a VM
-./bin/fleetbox up node -n 3                  # interconnected cluster: node-1, node-2, node-3
-./bin/fleetbox ssh node-2                     # address a cluster member by name
-./bin/fleetbox ssh node-1 -- ping -c1 node-2 # nodes reach each other by IP
-./bin/fleetbox ssh web -- systemctl status   # …or run a command
+./bin/fleetbox up web                          # create & boot a VM
+./bin/fleetbox up node -n 3                    # boot a cluster: node-1, node-2, node-3
+./bin/fleetbox ssh node-2                      # members are addressed by name
+./bin/fleetbox ssh node-1 -- ping -c1 node-2   # ...and reach each other by IP
 ./bin/fleetbox cp ./mybinary web:/usr/local/bin/
-./bin/fleetbox ls                            # NAME  IP  STATE  CPUS  MEM  DISK  AGE
-./bin/fleetbox ssh-config >> ~/.ssh/config   # then plain `ssh web` works
-./bin/fleetbox down node-1                    # stop one member; the rest keep running
-./bin/fleetbox rm node                        # destroy the whole cluster (prefix match)
+./bin/fleetbox ls                              # NAME  IP  STATE  CPUS  MEM  DISK  AGE
+./bin/fleetbox ssh-config >> ~/.ssh/config     # then plain `ssh web` works
+./bin/fleetbox down node-1                     # stop one member; the rest keep running
+./bin/fleetbox rm node                         # destroy the whole cluster (prefix match)
 ```
 
-A cluster runs in one holder process sharing one network (a vmnet network on macOS, a
-Linux bridge on Linux), so its VMs reach each other by IP; `down`/`ssh`/`rm` still address
-each member by name.
+A cluster's VMs live in one holder process sharing one network (vmnet on macOS, a bridge
+on Linux), which is what lets them reach each other by IP; `ssh`/`down`/`rm` still
+address each member by name.
 
 ## Images
 
@@ -232,62 +218,59 @@ fleetboxtest.Start(t, fleetbox.Debian12)
 fleetboxtest.Start(t, "https://example.com/my-cloud-image.qcow2")
 ```
 
-Images are downloaded and cached once in `~/.fleetbox/images/`, with qcow2 converted to raw
-on the way in. Adding a distro is adding a catalog entry — there are no per-distro code
-paths.
+Images are downloaded and cached once in `~/.fleetbox/images/`, with qcow2 converted to
+raw on the way in. Adding a distro is adding a catalog entry; there are no per-distro
+code paths.
 
 ## How it works
 
-`Start` runs a short, boring pipeline: ensure the SSH key → download and cache the image →
-generate a cloud-init seed ISO → boot the VM (macOS: EFI on a vmnet SharedMode NIC; Linux:
-cloud-hypervisor with a tap on a shared bridge) → get the VM's IP (macOS: from
-`/var/db/dhcpd_leases` by hostname; Linux: the statically assigned address) → wait for SSH.
-On Linux that pipeline runs in-process; on macOS it runs in the downloaded, signed
-`fleetbox-helper` subprocess — the only thing that links Virtualization.framework — which
-the library spawns *bound* to the test process, so the helper and its VMs are reaped when
-the test exits (even on `kill -9`). In CLI mode a detached holder per `up` group (a single
-VM, or a whole cluster sharing one network) outlives the command: on macOS that holder is
-the helper, on Linux the re-exec'd CLI. SSH and `cp` dial the VM's IP directly either way —
-the helper protocol never proxies them.
+`Start` is a short pipeline: make sure the SSH keypair exists, download and cache the
+image, write a cloud-init seed ISO, boot the VM, wait for SSH to answer. The
+platform-specific step is the IP. On macOS the VM's address is read out of
+`/var/db/dhcpd_leases`, looked up by hostname; on Linux fleetbox assigns a static
+address on the bridge and hands it to the guest through cloud-init.
+
+Where that pipeline runs is the part worth knowing. On Linux it runs in your process. On
+macOS it runs inside the downloaded `fleetbox-helper`, the only binary that links
+Virtualization.framework. The library spawns the helper *bound* to the test process, so
+the helper and its VMs are reaped when the test exits, even on `kill -9`. The CLI does
+the opposite: each `up` group (a single VM, or a cluster sharing one network) gets a
+detached holder that outlives the command, which is what keeps VMs running between
+invocations. On macOS that holder is the helper; on Linux it's the CLI re-exec'd. Either
+way, SSH and `cp` dial the VM's IP directly — the helper protocol never proxies them.
 
 For the full picture, read [ARCHITECTURE.md](ARCHITECTURE.md); for *why* it's built this
 way, the decision log lives in [docs/adr/](docs/adr/).
 
 ## Limitations
 
-Both the library (`StartN`) and the CLI (`up -n N`) boot interconnected clusters whose
-VMs reach each other by IP. Mind the sharp edges:
-
-- **Fixtures are read-only and frozen at creation.** `WithFixture` / `--fixture` copies a
-  host directory into the guest read-only (an ext4 image), on both macOS and Linux. There is
-  no live read-write share — edits inside the guest don't flow back to the host; use `cp` /
-  scp for the output direction. The set of fixtures is fixed when the VM is created (`rm` and
-  recreate to change it), though the content re-snapshots on every boot. Files arrive
-  world-readable, owned by root; host permission and exec bits aren't preserved.
-- **A CLI cluster shares one holder process.** All members of a cluster live in one process
-  to share one network, so a holder crash takes the whole cluster down (a single VM is
-  unaffected); on Linux a SIGKILL'd holder also leaves its bridge/taps behind (swept on the
-  next `up`/`down`). On macOS the holder *is* the downloaded `fleetbox-helper`. Members
-  started by separate `up` commands have separate networks and can't be merged into one
-  cluster afterwards — bring a cluster up together.
-- **First run downloads, then caches.** The cloud image (both platforms) and, on macOS, the
-  signed `fleetbox-helper` are fetched once into `~/.fleetbox` and reused. `FLEETBOX_HELPER`
-  overrides the helper download with a locally built one (development / offline). In CI, cache
+- **Fixtures are read-only.** There is no live read-write share: edits inside the guest
+  don't flow back to the host, and host-side edits only show up after a reboot. The
+  exact semantics are under [Handing a VM a directory](#handing-a-vm-a-directory); for
+  the guest→host direction, use `cp` / scp.
+- **A CLI cluster is one process.** Members share one holder so they can share one
+  network, so a holder crash takes the whole cluster down (a lone VM is unaffected). On
+  Linux a SIGKILL'd holder also leaves its bridge and taps behind; the next `up` or
+  `down` sweeps them. Members started by separate `up` commands sit on separate networks
+  and can't be merged afterwards — bring a cluster up together.
+- **First run downloads, then caches.** The cloud image (both platforms) and, on macOS,
+  the signed helper are fetched once into `~/.fleetbox` and reused. `FLEETBOX_HELPER`
+  swaps in a locally built helper (development, offline). In CI, cache
   `~/.fleetbox/{bin,images}` so cold runs don't re-download.
-- **Platform matrix.** macOS Apple Silicon 26+ (clusters), macOS Apple Silicon <26 (single
-  VM only), Linux amd64/arm64 (clusters); Intel macOS unsupported. On Linux, a stopped VM
+- **Platform matrix.** Clusters need macOS Apple Silicon 26+ or Linux amd64/arm64;
+  macOS below 26 runs a single VM; Intel macOS is unsupported. On Linux, a stopped VM
   brought back up needs its `/24` to still be free — on a contended host the auto-picked
-  subnet can shift and the rebooted VM won't be reachable; bring clusters up fresh. arm64
-  Linux boot via rust-hypervisor-firmware is not yet validated on hardware.
+  subnet can shift and the rebooted VM won't be reachable; bring clusters up fresh.
+  arm64 Linux boot via rust-hypervisor-firmware is not yet validated on hardware.
 - **v0 API.** Expect breaking changes until it stabilizes.
 
 ### CI
 
-GitHub-hosted **macOS** runners can't nest-virtualize, so the macOS CI does lint, build, and
-unit tests; VM-boot tests run locally via `make test-vm`. But GitHub-hosted **x86-64 Linux**
-runners *do* expose `/dev/kvm`, so the Linux backend's VM-boot tests can run in CI after a
-one-time udev tweak that lets the runner user open it (and a cache so the image + VMM aren't
-re-downloaded every run):
+GitHub-hosted macOS runners can't nest virtualization, so the macOS workflow does lint,
+build, and unit tests; VM-boot tests run locally via `make test-vm`. GitHub-hosted
+x86-64 Linux runners, on the other hand, expose `/dev/kvm`, so the Linux backend's
+VM-boot tests run in CI after a one-time udev tweak (plus a cache, so the image and VMM
+aren't re-downloaded every run):
 
 ```yaml
 - run: |
@@ -302,21 +285,22 @@ re-downloaded every run):
 ```
 
 arm64 hosted Linux runners do **not** have KVM ("not supported for this sku"); use an
-x86-64 runner for VM-boot CI. This is the "develop on a Mac, run in cheap x86-64 hosted
+x86-64 runner for VM-boot CI. This is the "develop on a Mac, test in cheap x86-64 hosted
 Linux CI" story.
 
 ## Roadmap
 
 Roughly in priority order:
 
-- **Programmatic file copy** — a library-side copy in/out for cases a fixture doesn't fit
-  (the CLI already has `cp` over scp).
-- **Preserve host permissions** in fixtures (they currently arrive world-readable, uid 0).
+- **Programmatic file copy** — a library-side copy in/out for cases a fixture doesn't
+  fit (the CLI already has `cp` over scp).
+- **Preserve host permissions** in fixtures (they currently arrive world-readable,
+  uid 0).
 
-Done recently: read-only host→guest fixtures (`WithFixture` / `--fixture`, an ext4 payload,
-identical on macOS and Linux); VM-to-VM networking over a real network (vmnet SharedMode);
-and CLI clustering (`fleetbox up node -n 3`) — boot an actual cluster (kubeadm, etcd, a Raft
-group) on real interconnected nodes, not mocks or a single-host simulation.
+Recently landed: read-only host→guest fixtures (`WithFixture` / `--fixture`, identical
+on macOS and Linux), VM-to-VM networking over a real network (vmnet SharedMode), and CLI
+clustering (`fleetbox up node -n 3`) — so a kubeadm cluster, an etcd quorum, or a Raft
+group runs on real interconnected nodes, not mocks.
 
 ## License
 
