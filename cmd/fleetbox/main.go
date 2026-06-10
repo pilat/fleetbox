@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -16,6 +17,14 @@ import (
 	"github.com/pilat/fleetbox/internal/control"
 	"github.com/pilat/fleetbox/internal/orchestrator"
 	"github.com/pilat/fleetbox/internal/store"
+)
+
+// Build metadata, set at release time via -ldflags -X main.* (see .goreleaser.yaml).
+// The defaults identify a non-release ("go build" / "go install") build.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
 )
 
 func main() {
@@ -50,6 +59,8 @@ func main() {
 		err = cmdRemove(args)
 	case "help", "-h", "--help":
 		usage()
+	case "version", "--version":
+		fmt.Println(versionString())
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		usage()
@@ -73,6 +84,7 @@ Usage:
   fleetbox cp <src> <dst>
   fleetbox ssh-config
   fleetbox rm <name>... | --all
+  fleetbox version
 
 Commands:
   up         Create and boot VM(s)
@@ -82,6 +94,7 @@ Commands:
   cp         Copy files to/from VM (scp syntax: name:/path)
   ssh-config Print SSH config for all VMs
   rm         Destroy VM(s) completely
+  version    Print version information
 
 Clusters (interconnected, VMs reach each other by IP):
   fleetbox up web -n 3      boots web-1, web-2, web-3 on one shared network
@@ -95,6 +108,34 @@ Fixtures (read-only host dir copied into the guest, set at creation, repeatable)
   paths must not contain colons (the value is split on the last colon).
 
 Defaults: image=debian-12, cpus=2, mem=4, disk=20`)
+}
+
+// versionString reports the build version. Release builds carry it via -ldflags
+// (-X main.version/commit/date, see .goreleaser.yaml). A plain `go install`/`go build`
+// has no ldflags, so fall back to the VCS metadata the Go toolchain stamps into the
+// binary — otherwise `go install`ed CLIs would report "dev".
+func versionString() string {
+	v, c, d := version, commit, date
+	if v == "dev" {
+		if bi, ok := debug.ReadBuildInfo(); ok {
+			if bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+				v = bi.Main.Version
+			}
+			for _, s := range bi.Settings {
+				switch s.Key {
+				case "vcs.revision":
+					if s.Value != "" {
+						c = s.Value
+					}
+				case "vcs.time":
+					if s.Value != "" {
+						d = s.Value
+					}
+				}
+			}
+		}
+	}
+	return fmt.Sprintf("fleetbox %s (commit %s, built %s)", v, c, d)
 }
 
 // stringSlice is a flag.Value that accumulates a repeatable string flag (the

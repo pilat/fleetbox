@@ -77,6 +77,22 @@ pure Go. On macOS, all the Virtualization.framework work lives in a small signed
 first time you boot a VM. Linux is the same story with different binaries: the
 cloud-hypervisor VMM and its firmware are fetched and pinned on first use.
 
+Prefer the CLI to the library? On macOS (Apple Silicon) it ships as a Homebrew cask:
+
+```bash
+brew tap pilat/fleetbox
+brew install --cask fleetbox
+```
+
+On Linux (Homebrew has no casks there), install it straight from source:
+
+```bash
+go install github.com/pilat/fleetbox/cmd/fleetbox@latest
+```
+
+Either way you get the pure-Go `fleetbox` binary; the helper and VMM still auto-download
+on first boot, exactly as they do for the library.
+
 The first boot also downloads the cloud image (a few hundred MB, cached in
 `~/.fleetbox/images/`) and prints a progress line so it doesn't look like a hung test.
 
@@ -198,6 +214,7 @@ make build                                     # compiles ./bin/fleetbox (pure G
 ./bin/fleetbox ssh-config >> ~/.ssh/config     # then plain `ssh web` works
 ./bin/fleetbox down node-1                     # stop one member; the rest keep running
 ./bin/fleetbox rm node                         # destroy the whole cluster (prefix match)
+./bin/fleetbox version                         # print version, commit, build date
 ```
 
 A cluster's VMs live in one holder process sharing one network (vmnet on macOS, a bridge

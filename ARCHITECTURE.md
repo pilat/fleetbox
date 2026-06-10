@@ -32,7 +32,7 @@ Two consumers, one API:
   is a downloaded, signed `fleetbox-helper` subprocess, so the test binary stays pure Go (no
   cgo, no codesign) (ADR-0017); on Linux the test binary self-reexecs into the helper. Either
   way the helper plus its VMs die when the test exits.
-- **CLI mode** — `fleetbox up/down/ls/ssh/cp/ssh-config/rm` for manual work. The CLI runs a
+- **CLI mode** — `fleetbox up/down/ls/ssh/cp/ssh-config/rm/version` for manual work. The CLI runs a
   detached, persistent *holder* per `up` group — a single VM or a whole cluster sharing one
   network (§4.4): on Linux it re-execs itself, on macOS it spawns the same downloaded
   helper. The holder's VMs outlive the command.
@@ -79,7 +79,7 @@ Where the canonical version of each thing lives. When two files disagree, the So
 | Vendored vz provenance & regen | `third_party/vz/NOTICE` + `hack/vendor-vz.sh` | Pinned upstream + vmnet-patch SHAs; `make vendor-vz` regenerates (ADR-0008, ADR-0016). |
 | CI behavior | `.github/workflows/ci.yml` | macOS job: lint + linux/darwin build + unit + fake coordination (no VZ boot). Linux job: build + unit + fake coordination via self-reexec. |
 | Linux VM-boot CI | `.github/workflows/vm-linux.yml` | Boots a real VM on an x86-64 KVM runner. |
-| Release pipelines | `.github/workflows/{release-helper,release}.yml` + `.goreleaser.yaml` | Two channels: helper (`helper-v*`, macOS, codesign) and CLI (`v*`, goreleaser). |
+| Release pipelines | `.github/workflows/{release-helper,release}.yml` + `.goreleaser.yaml` | Two channels: helper (`helper-v*`, macOS, codesign) and CLI (`v*`, goreleaser; also pushes a macOS Homebrew cask to the `pilat/homebrew-fleetbox` tap, ADR-0021). |
 | Working specs (local only) | `ai/tasks/` | Gitignored. Durable decisions must graduate to ADRs. |
 
 ## §4. System Model
@@ -461,7 +461,7 @@ When a PR changes any of these fields for a package, update its section.
 
 ### §5.3 `cmd/fleetbox`
 
-- Purpose: the CLI — `up`, `down`, `ls`, `ssh`, `cp`, `ssh-config`, `rm`.
+- Purpose: the CLI — `up`, `down`, `ls`, `ssh`, `cp`, `ssh-config`, `rm`, `version`.
 - Owns: flag parsing, terminal output, exec of system `ssh`/`scp`. It no longer carries a
   holder seam: on Linux the re-exec into the holder is handled by `internal/holder`'s `init()`
   interceptor (linked via the root package), not a `maybeRunHolder` dispatch here (ADR-0020).

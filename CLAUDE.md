@@ -66,7 +66,7 @@ internal/fixture                host dir → read-only ext4 payload image (via p
 internal/store                  ~/.fleetbox/{clusters,images,bin}/ state, config.json, locking; cluster-rooted layout clusters/<cluster>/<member>/ (ADR-0014)
 internal/dhcp                   /var/db/dhcpd_leases parsing (hostname → IP); darwin-only, helper-side
 internal/sshkey                 keypair + x/crypto/ssh client (client-side)
-cmd/fleetbox                    CLI: up/down/ls/ssh/cp/ssh-config/rm (pure-Go client; drives a DETACHED helper via the client orchestrator on both platforms; on linux self-reexecs into the holder via internal/holder's init())
+cmd/fleetbox                    CLI: up/down/ls/ssh/cp/ssh-config/rm/version (pure-Go client; drives a DETACHED helper via the client orchestrator on both platforms; on linux self-reexecs into the holder via internal/holder's init())
 cmd/fleetbox-helper             darwin VM host: links vz, signed, downloaded; runs internal/holder as a backend-server (ADR-0017/0020)
 contrib/catalog                 build-time tool (not in any runtime binary): refreshes internal/image/catalog.json (ADR-0019)
 ```
