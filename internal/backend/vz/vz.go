@@ -146,6 +146,14 @@ func (n *vzNetwork) Subnet() string {
 	return ""
 }
 
+// Reserve allocates no static IP on the DHCP/vz path — vmnet's bootpd hands out
+// the address and WaitForIP discovers it post-boot (ADR-0007). It returns only
+// the deterministic MAC the NIC will carry, so the helper and the client's seed
+// agree on it (Decision 6).
+func (n *vzNetwork) Reserve(name, _ string) (ip, mac string, err error) {
+	return "", backend.GenerateMAC(name), nil
+}
+
 // detectFreeIPv4Subnet returns a /24 inside 192.168.0.0/16 that overlaps no
 // host interface and has not already been handed out in this process. The
 // chosen subnet is reserved (see reservedSubnets) so a later call picks a
@@ -209,7 +217,7 @@ func occupiedPrivatePrefixes() ([]netip.Prefix, error) {
 
 // Create creates a new VM with the given configuration, attached to nw.
 // nw must be a Network returned by this backend's CreateNetwork.
-func (b *Backend) Create(cfg backend.Config, nw backend.Network) (backend.VM, error) {
+func (b *Backend) Create(cfg backend.Config, nw backend.Network) (_ backend.VM, retErr error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -252,28 +260,19 @@ func (b *Backend) Create(cfg backend.Config, nw backend.Network) (backend.VM, er
 
 	vm := &VM{name: cfg.Name}
 
-	// Serial console
-	if cfg.SerialOut != nil {
-		serialRead, serialWrite, err := os.Pipe()
-		if err != nil {
-			return nil, fmt.Errorf("create serial pipe: %w", err)
+	// Serial console. The helper (this process) opens the log file itself from the
+	// path the client chose — the writer cannot cross the process boundary
+	// (Decision 7). If a later Create step fails, the deferred cleanup closes it so
+	// a failed boot leaks no file or goroutine.
+	if cfg.SerialLogPath != "" {
+		if err := vm.setupSerial(cfg.SerialLogPath, vmConfig); err != nil {
+			return nil, err
 		}
-		vm.serialRead = serialRead
-		vm.serialWrite = serialWrite
-
-		go func() { _, _ = io.Copy(cfg.SerialOut, serialRead) }()
-
-		serialAttachment, err := vz.NewFileHandleSerialPortAttachment(os.Stdin, serialWrite)
-		if err != nil {
-			return nil, fmt.Errorf("create serial attachment: %w", err)
-		}
-		serialConfig, err := vz.NewVirtioConsoleDeviceSerialPortConfiguration(serialAttachment)
-		if err != nil {
-			return nil, fmt.Errorf("create serial config: %w", err)
-		}
-		vmConfig.SetSerialPortsVirtualMachineConfiguration(
-			[]*vz.VirtioConsoleDeviceSerialPortConfiguration{serialConfig},
-		)
+		defer func() {
+			if retErr != nil {
+				vm.closeSerial()
+			}
+		}()
 	}
 
 	// Disk
@@ -423,11 +422,65 @@ type VM struct {
 	// network is not released by GC while the VM (or a cluster sibling) runs
 	// (ADR-0008, R3).
 	network     *vzNetwork
+	serialFile  *os.File
 	serialRead  *os.File
 	serialWrite *os.File
+	serialOnce  sync.Once
 }
 
 var _ backend.VM = (*VM)(nil)
+
+// setupSerial opens the serial log file, wires the guest's serial console to it
+// through a pipe, and registers the serial port on vmConfig. The copy goroutine
+// ends when closeSerial closes the pipe on Stop (or on a failed Create via the
+// caller's deferred cleanup).
+func (v *VM) setupSerial(path string, vmConfig *vz.VirtualMachineConfiguration) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("open serial log: %w", err)
+	}
+	serialRead, serialWrite, err := os.Pipe()
+	if err != nil {
+		_ = f.Close()
+		return fmt.Errorf("create serial pipe: %w", err)
+	}
+	v.serialFile = f
+	v.serialRead = serialRead
+	v.serialWrite = serialWrite
+
+	go func() { _, _ = io.Copy(f, serialRead) }()
+
+	serialAttachment, err := vz.NewFileHandleSerialPortAttachment(os.Stdin, serialWrite)
+	if err != nil {
+		return fmt.Errorf("create serial attachment: %w", err)
+	}
+	serialConfig, err := vz.NewVirtioConsoleDeviceSerialPortConfiguration(serialAttachment)
+	if err != nil {
+		return fmt.Errorf("create serial config: %w", err)
+	}
+	vmConfig.SetSerialPortsVirtualMachineConfiguration(
+		[]*vz.VirtioConsoleDeviceSerialPortConfiguration{serialConfig},
+	)
+	return nil
+}
+
+// closeSerial closes the serial pipe and log file, ending the copy goroutine and
+// flushing buffered console output. It is idempotent (Stop and a failed Create's
+// deferred cleanup may both reach it). os.File methods are safe for concurrent
+// use, so closing while the copy goroutine is mid-write is benign.
+func (v *VM) closeSerial() {
+	v.serialOnce.Do(func() {
+		if v.serialWrite != nil {
+			_ = v.serialWrite.Close()
+		}
+		if v.serialRead != nil {
+			_ = v.serialRead.Close()
+		}
+		if v.serialFile != nil {
+			_ = v.serialFile.Close()
+		}
+	})
+}
 
 // Start boots the VM.
 func (v *VM) Start(ctx context.Context) error {
@@ -460,6 +513,10 @@ func (v *VM) Start(ctx context.Context) error {
 // Stop gracefully shuts down the VM via ACPI.
 // Returns nil if the VM is already stopped.
 func (v *VM) Stop(ctx context.Context) error {
+	// Release the serial log file/pipe on any exit path — the VM is being torn
+	// down whether or not it was already stopped (idempotent via closeSerial).
+	defer v.closeSerial()
+
 	// Already stopped? Not an error.
 	if v.vm.State() == vz.VirtualMachineStateStopped {
 		return nil

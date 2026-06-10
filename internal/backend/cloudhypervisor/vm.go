@@ -50,11 +50,6 @@ type VM struct {
 func newVM(cfg backend.Config, nw *chNetwork, chBin, fwPath, tap string) *VM {
 	vmDir := filepath.Dir(cfg.DiskPath)
 
-	serialPath := ""
-	if f, ok := cfg.SerialOut.(*os.File); ok {
-		serialPath = f.Name()
-	}
-
 	return &VM{
 		name:         cfg.Name,
 		chBin:        chBin,
@@ -62,15 +57,17 @@ func newVM(cfg backend.Config, nw *chNetwork, chBin, fwPath, tap string) *VM {
 		diskPath:     cfg.DiskPath,
 		seedPath:     cfg.SeedPath,
 		fixturePaths: cfg.FixturePaths,
-		serialPath:   serialPath,
-		cpus:         cfg.CPUs,
-		memBytes:     cfg.MemoryBytes,
-		mac:          cfg.MAC,
-		assignedIP:   cfg.AssignedIP,
-		apiSocket:    filepath.Join(vmDir, "ch.sock"),
-		tap:          tap,
-		network:      nw,
-		state:        backend.StateStopped,
+		// cloud-hypervisor opens the serial file itself (--serial file=PATH), so the
+		// path crosses straight through; no Go-side handle to own (Decision 7).
+		serialPath: cfg.SerialLogPath,
+		cpus:       cfg.CPUs,
+		memBytes:   cfg.MemoryBytes,
+		mac:        cfg.MAC,
+		assignedIP: cfg.AssignedIP,
+		apiSocket:  filepath.Join(vmDir, "ch.sock"),
+		tap:        tap,
+		network:    nw,
+		state:      backend.StateStopped,
 	}
 }
 

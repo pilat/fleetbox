@@ -1,26 +1,30 @@
-//go:build darwin && arm64
+//go:build (darwin && arm64) || linux
 
-// coord_test.go exercises the macOS cross-process coordination layer — the real
-// pure-Go client driving a SEPARATELY-BUILT fake helper (cmd/fleetbox-helper
-// -tags fleetbox_fake) over the holder protocol — without booting a real VZ VM.
-// It is the only pre-merge gate for the bound-helper teardown that the whole fake
-// backend exists to protect (ADR-0018).
+// coord_test.go exercises the cross-process coordination layer — the real pure-Go
+// client driving a fake helper over the holder protocol — without booting a real
+// VM. It is the pre-merge gate for the bound-helper teardown that the whole fake
+// backend exists to protect (ADR-0018/0020). It runs on both platforms: on macOS
+// the helper is a SEPARATELY-BUILT fake binary (cmd/fleetbox-helper -tags
+// fleetbox_fake) reached via FLEETBOX_HELPER; on Linux it is the test binary
+// itself, self-reexec'd into the fake holder by internal/holder's init()
+// interceptor (no separate binary, no FLEETBOX_HELPER — helperExe is os.Executable).
 //
 // BANNER: this proves COORDINATION, not that a VM boots. Green here is NOT "VMs
 // work" — real boot/SSH/IP discovery stay covered by `make test-vm` (M3+/26+) and
-// vm-linux.yml. The fake helper's Stop is a no-op; only the spawn/reap/EOF logic
-// around it is tested here.
+// vm-linux.yml. The fake's Stop is a no-op; only the spawn/reap/EOF logic around it
+// is tested here.
 //
-// It is built into the normal (non-fake-tag) fleetboxtest binary and gated at
-// RUNTIME on FLEETBOX_FAKE_HELPER (set by `make test-fake`). Critically it uses
-// the public fleetbox.Start directly, NOT fleetboxtest.Start — the latter skips
-// on a host without nested virt, which on a GitHub macos-26 runner would silently
-// turn this gate into a no-op (the exact failure this plan prevents).
+// It is built into the fleetboxtest binary and gated at RUNTIME on
+// FLEETBOX_FAKE_HELPER (set by `make test-fake`). Critically it uses the public
+// fleetbox.Start directly, NOT fleetboxtest.Start — the latter skips on a host
+// without nested virt, which on a hosted runner would silently turn this gate into
+// a no-op (the exact failure this plan prevents).
 package fleetboxtest_test
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -146,10 +150,142 @@ func TestCoordHelperChild(_ *testing.T) {
 	select {} // hold the VM (and the bound session) until the parent kills us
 }
 
+// fakeRecord mirrors one JSON line the fake backend appends to FLEETBOX_FAKE_RECORD
+// (internal/backend/fake). Declared locally so the test never links the fake
+// package — the contract is the JSON shape, read across the process boundary.
+type fakeRecord struct {
+	Op           string   `json:"op"`
+	Name         string   `json:"name"`
+	DiskPath     string   `json:"disk_path"`
+	SeedPath     string   `json:"seed_path"`
+	EFIPath      string   `json:"efi_path"`
+	FixturePaths []string `json:"fixture_paths"`
+	AssignedIP   string   `json:"assigned_ip"`
+	MAC          string   `json:"mac"`
+	IPHint       string   `json:"ip_hint"`
+}
+
+// TestCoordRecordsBackendSpec proves the client-side artifact glue end to end and
+// cross-process: the client (this process) resolves the image, copies the disk,
+// builds the seed and a fixture, writes config.json, then hands the helper a
+// resolved spec over the protocol. The helper's fake backend appends what it
+// received to FLEETBOX_FAKE_RECORD, which we read back to assert the threading —
+// the in-process global-reads the deleted orchestrator_fake_test relied on are
+// replaced by this record file plus the on-disk artifacts (ADR-0020, T9).
+func TestCoordRecordsBackendSpec(t *testing.T) {
+	requireFakeHelper(t)
+	t.Log(coordBanner)
+
+	home, st := shortHome(t)
+	t.Setenv("HOME", home)
+	recordPath := filepath.Join(home, "fake-record.jsonl")
+	// FLEETBOX_FAKE_RECORD (internal/backend/fake.EnvFakeRecord); the spawned helper
+	// inherits it via the environment and the fake writes the helper's backend args.
+	t.Setenv("FLEETBOX_FAKE_RECORD", recordPath)
+
+	hostDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(hostDir, "data.txt"), []byte("payload"), 0o644); err != nil {
+		t.Fatalf("write fixture source: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	vm, err := fleetbox.Start(ctx, "solo",
+		fleetbox.WithImage(coordImageURL), fleetbox.WithDiskGB(1), fleetbox.WithFixture(hostDir, "/mnt/data"))
+	if err != nil {
+		t.Fatalf("fleetbox.Start: %v", err)
+	}
+
+	// The client built the artifacts on disk (image.CopyDisk, seed.Create,
+	// fixture.BuildImage) and persisted config.json — none of which the helper does.
+	assertFileNonEmpty(t, st.DiskPath("solo"))
+	assertFileNonEmpty(t, st.SeedPath("solo"))
+	assertFileNonEmpty(t, st.FixturePath("solo", 0))
+	assertExists(t, filepath.Join(st.VMDir("solo"), "config.json"))
+
+	// The helper's backend received the resolved spec the client built: assert the
+	// reserve and create records the fake wrote across the process boundary.
+	recs := readRecords(t, recordPath)
+	reserve := findRecord(t, recs, "reserve", "solo")
+	if reserve.MAC == "" {
+		t.Error("reserve record has empty MAC")
+	}
+	create := findRecord(t, recs, "create", "solo")
+	if create.DiskPath != st.DiskPath("solo") {
+		t.Errorf("create.DiskPath = %q, want %q", create.DiskPath, st.DiskPath("solo"))
+	}
+	if create.SeedPath != st.SeedPath("solo") {
+		t.Errorf("create.SeedPath = %q, want %q", create.SeedPath, st.SeedPath("solo"))
+	}
+	if create.EFIPath != st.EFIPath("solo") {
+		t.Errorf("create.EFIPath = %q, want %q", create.EFIPath, st.EFIPath("solo"))
+	}
+	if len(create.FixturePaths) != 1 || create.FixturePaths[0] != st.FixturePath("solo", 0) {
+		t.Errorf("create.FixturePaths = %v, want [%s]", create.FixturePaths, st.FixturePath("solo", 0))
+	}
+	// Fake's Subnet()=="" (DHCP path), so no static IP is threaded — the Linux
+	// static-IP path is covered by real cloud-hypervisor in vm-linux.yml, not here.
+	if create.AssignedIP != "" {
+		t.Errorf("create.AssignedIP = %q, want empty (the fake mimics the DHCP path)", create.AssignedIP)
+	}
+
+	if err := vm.Destroy(ctx); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	// Destroy stopped the member through the helper: a stop record appears.
+	recs = readRecords(t, recordPath)
+	findRecord(t, recs, "stop", "solo")
+}
+
 func requireFakeHelper(t *testing.T) {
 	t.Helper()
 	if os.Getenv("FLEETBOX_FAKE_HELPER") == "" {
 		t.Skip("coordination test requires the fake helper; run via `make test-fake`")
+	}
+}
+
+// readRecords parses the newline-delimited JSON the fake backend appended.
+func readRecords(t *testing.T, path string) []fakeRecord {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read record file %s: %v", path, err)
+	}
+	var recs []fakeRecord
+	for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var r fakeRecord
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("parse record %q: %v", line, err)
+		}
+		recs = append(recs, r)
+	}
+	return recs
+}
+
+// findRecord returns the first record matching op and name, failing if none.
+func findRecord(t *testing.T, recs []fakeRecord, op, name string) fakeRecord {
+	t.Helper()
+	for _, r := range recs {
+		if r.Op == op && r.Name == name {
+			return r
+		}
+	}
+	t.Fatalf("no %q record for %q in %d records", op, name, len(recs))
+	return fakeRecord{}
+}
+
+// assertFileNonEmpty fails unless path exists and is non-empty.
+func assertFileNonEmpty(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if info.Size() == 0 {
+		t.Fatalf("%s exists but is empty", path)
 	}
 }
 

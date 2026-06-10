@@ -1,7 +1,7 @@
 # ADR: vmnet SharedMode Networking (macOS 26+), Replacing VZ NAT
 
 **Date:** 2026-06-04
-**Status:** Accepted
+**Status:** Accepted (amended by [ADR-0020](0020-helper-thin-backend-server.md) — the one-process vmnet SharedMode network now lives in the helper, with IP allocation helper-side)
 
 ## Context
 

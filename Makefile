@@ -1,4 +1,4 @@
-.PHONY: all build helper test test-fake test-vm lint lint-fake catalog vendor-vz clean
+.PHONY: all build helper test test-fake test-fake-linux test-vm lint lint-fake catalog vendor-vz clean
 
 # Default target
 all: build
@@ -30,21 +30,31 @@ helper:
 test:
 	CGO_ENABLED=1 go test -short -race ./...
 
-# Coordination tests against the build-tagged fake backend (ADR-0018): the whole
-# cross-process control<->holder<->orchestrator path runs with no VM boot and no
-# codesign, so it gates teardown + protocol on a stock CI runner. Two pieces, both
-# under -race (-race on the parent test process does NOT instrument the spawned
-# subprocess, so the helper is built -race too; the fake helper links the race
-# runtime via cgo but NOT vz, so it still needs no entitlement):
-#   1. build the pure-Go fake helper binary;
-#   2. run the in-process orchestrator tests (-tags fleetbox_fake) and the darwin
-#      cross-process teardown tests (the normal client binary driving the fake
-#      helper via FLEETBOX_HELPER; FLEETBOX_FAKE_HELPER ungates them).
+# Coordination tests against the build-tagged fake backend (ADR-0018/0020): the
+# whole cross-process client<->helper path — the orchestrator driving a fake helper
+# over the real protocol (createnetwork/reserve/boot-member/status/stop) — runs with
+# no VM boot and no codesign, so it gates teardown + protocol on a stock CI runner.
+# Two pieces, both under -race (-race on the parent test process does NOT instrument
+# the spawned subprocess, so the helper is built -race too; the fake helper links
+# the race runtime via cgo but NOT vz, so it still needs no entitlement):
+#   1. build the fake helper binary (the holder + fake backend, no vz);
+#   2. drive it from the client over FLEETBOX_HELPER (FLEETBOX_FAKE_HELPER ungates
+#      the test). The client is also built -tags fleetbox_fake so skipSSHWait short-
+#      circuits the dial against the fake's unroutable IP — it still links the remote
+#      proxy, not the fake backend (the fake lives only in the helper now, ADR-0020).
 test-fake:
 	CGO_ENABLED=1 go build -tags fleetbox_fake -race -o bin/fleetbox-helper-fake ./cmd/fleetbox-helper
-	CGO_ENABLED=1 go test -race -tags fleetbox_fake ./internal/orchestrator/...
 	FLEETBOX_FAKE_HELPER=1 FLEETBOX_HELPER=$(CURDIR)/bin/fleetbox-helper-fake \
-		CGO_ENABLED=1 go test -race -run TestCoord ./fleetboxtest
+		CGO_ENABLED=1 go test -race -tags fleetbox_fake -run TestCoord ./fleetboxtest
+
+# The Linux equivalent of test-fake. There is no separate fake helper binary on
+# Linux: the test binary self-reexecs into the fake holder via internal/holder's
+# init() interceptor (helperExe is os.Executable), so the same coord tests run with
+# just FLEETBOX_FAKE_HELPER set and NO FLEETBOX_HELPER. The fake boots no VM and
+# touches no host network state, so this needs neither /dev/kvm nor root — it gates
+# the protocol + teardown on a stock Linux runner (ADR-0020).
+test-fake-linux:
+	FLEETBOX_FAKE_HELPER=1 CGO_ENABLED=1 go test -race -tags fleetbox_fake -run TestCoord ./fleetboxtest
 
 # Run VM integration tests (requires darwin/arm64, M3+, macOS 26+).
 # Builds and ad-hoc-signs the helper, then points the library at it via

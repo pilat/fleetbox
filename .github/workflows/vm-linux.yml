@@ -1,10 +1,14 @@
 name: VM boot (Linux)
 
-# Proves the Linux backend end-to-end in CI: x86-64 GitHub-hosted runners expose
+# Proves the Linux backend end-to-end in CI, AND gives the inverted client↔helper
+# protocol real-VM coverage (ADR-0020): x86-64 GitHub-hosted runners expose
 # /dev/kvm, so the cloud-hypervisor backend can boot a real VM after a one-time
-# udev tweak. Bridge/tap creation needs CAP_NET_ADMIN, so the compiled test binary
-# runs as root with the runner's HOME preserved (so ~/.fleetbox caching still
-# applies). arm64 hosted runners have no KVM, so this is amd64 only.
+# udev tweak. The test binary is its own helper — fleetbox.Start re-execs it with
+# --fleetbox-runner and internal/holder's init() interceptor turns that child into
+# the holder (real CH backend) — so this exercises the full client orchestrator →
+# RPC → helper path, not just the backend. Bridge/tap creation needs CAP_NET_ADMIN,
+# so the binary runs as root with the runner's HOME preserved (so ~/.fleetbox
+# caching still applies). arm64 hosted runners have no KVM, so this is amd64 only.
 on:
   push:
     branches: [main]

@@ -1,7 +1,7 @@
 # ADR: Crash-Safe Linux Network Lifecycle, Guest DNS, and Download-Aware Readiness
 
 **Date:** 2026-06-07
-**Status:** Accepted
+**Status:** Accepted (amended by [ADR-0020](0020-helper-thin-backend-server.md) — the network lifecycle and reconcile are now owned by the helper process, keyed on the helper PID)
 
 ## Context
 

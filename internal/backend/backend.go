@@ -3,7 +3,6 @@ package backend
 
 import (
 	"context"
-	"io"
 )
 
 // Config specifies VM configuration.
@@ -15,7 +14,12 @@ type Config struct {
 	MAC         string
 	CPUs        int
 	MemoryBytes uint64
-	SerialOut   io.Writer
+	// SerialLogPath is the host file the backend opens and writes the guest's
+	// serial console to (empty disables serial capture). It crosses the helper
+	// boundary as a path, not an io.Writer, because a writer cannot be serialized;
+	// the helper and client share the host filesystem, so the helper opens it
+	// directly (Decision 7).
+	SerialLogPath string
 	// FixturePaths are host paths of pre-built read-only ext4 fixture images to
 	// attach to the VM as additional read-only block devices (ADR-0015). The
 	// guest mounts each by its volume LABEL, so attachment order is irrelevant.
@@ -45,6 +49,18 @@ type Network interface {
 	// (vz), which is the signal the orchestrator uses to skip static IP
 	// allocation and emit no cloud-init network-config.
 	Subnet() string
+
+	// Reserve allocates one member's address on this live network and returns the
+	// IP and MAC the helper will use, so the client can bake them into the seed
+	// before boot (Decisions 5 and 6). It is the helper-side replacement for the
+	// orchestrator's old client-side IP allocation. On a static-addressing backend
+	// (Linux) it honors ipHint if that address is free in the subnet, else picks
+	// the lowest free one, and returns {ip, mac}. On a DHCP backend (vz, empty
+	// Subnet) it allocates no IP and returns {"", mac}; the runtime IP is
+	// discovered post-boot and surfaced via the holder's status. The MAC is
+	// deterministic in the name (GenerateMAC), returned so the client's seed and
+	// the NIC the helper sets agree without both sides recomputing.
+	Reserve(name, ipHint string) (ip, mac string, err error)
 }
 
 // VM represents a running virtual machine.

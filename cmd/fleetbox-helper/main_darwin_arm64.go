@@ -9,8 +9,11 @@
 // CLI stay pure Go and need no codesign (ADR-0017).
 //
 // It is launched, never invoked by hand: the client passes --fleetbox-runner with
-// the member names, FLEETBOX_OPTS with the encoded options, and (in library mode)
-// FLEETBOX_PARENT_PID so the helper reaps itself when the test process exits.
+// the member names and (in library mode) FLEETBOX_PARENT_PID so the helper reaps
+// itself when the test process exits, or --fleetbox-reconcile for a one-shot prune
+// sweep. Since ADR-0020 the helper is a backend-server: the client drives image
+// resolve, disk/seed/fixture build, and the store, then drives this process over
+// the control protocol — so the helper no longer receives the VM options.
 package main
 
 import (
@@ -21,7 +24,11 @@ import (
 )
 
 func main() {
-	if err := holder.Run(); err != nil {
+	run := holder.Run
+	if holder.IsReconcile() {
+		run = holder.RunReconcile
+	}
+	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "fleetbox-helper: %v\n", err)
 		os.Exit(1)
 	}

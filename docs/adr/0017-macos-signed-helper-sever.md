@@ -1,7 +1,7 @@
 # ADR: macOS Signed-Helper Sever (Pure-Go Client, Downloaded VM Host)
 
 **Date:** 2026-06-09
-**Status:** Accepted (supersedes ADR-0006 and ADR-0009 on macOS; both still stand on Linux)
+**Status:** Accepted (supersedes ADR-0006 and ADR-0009 on macOS; the orchestrator-in-helper half is inverted by [ADR-0020](0020-helper-thin-backend-server.md), which keeps and generalizes this ADR's pure-Go sever)
 
 ## Context
 

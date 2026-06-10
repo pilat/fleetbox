@@ -40,8 +40,9 @@ type chNetwork struct {
 	masquerade bool // whether the egress iptables rules were installed
 	store      *netStore
 
-	mu   sync.Mutex
-	taps []string
+	mu       sync.Mutex
+	taps     []string
+	reserved map[netip.Addr]bool // host IPs handed out by Reserve (gateway pre-marked)
 }
 
 // CreateNetwork creates a bridge on a free /24, assigns it the gateway address,
@@ -104,10 +105,51 @@ func (b *Backend) CreateNetwork() (backend.Network, error) {
 	return n, nil
 }
 
-// Subnet returns the network's IPv4 CIDR; the root package allocates each VM's
-// static address from it.
+// Subnet returns the network's IPv4 CIDR; the client derives each member's
+// gateway and netmask from it to build the seed's static network-config.
 func (n *chNetwork) Subnet() string {
 	return n.subnet.String()
+}
+
+// Reserve allocates a static host address on this live network. It honors ipHint
+// (a member's previously-stored IP) when that address is in-subnet and still free
+// — preserving a stopped member's address across reboots — otherwise it picks the
+// lowest free host address. The gateway, network, and broadcast addresses are
+// reserved, as is every address already handed out in this process. The MAC is
+// deterministic in the name (Decisions 5, 6, 8). It is the helper-side successor
+// to the orchestrator's old allocateIP; allocation lives with the network's owner.
+func (n *chNetwork) Reserve(name, ipHint string) (ip, mac string, err error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.reserved == nil {
+		n.reserved = map[netip.Addr]bool{n.gateway: true}
+	}
+	mac = backend.GenerateMAC(name)
+
+	if ipHint != "" {
+		if a, err := netip.ParseAddr(ipHint); err == nil && n.subnet.Contains(a) && a != n.gateway && !n.reserved[a] {
+			n.reserved[a] = true
+			return a.String(), mac, nil
+		}
+	}
+
+	broadcast := lastAddr(n.subnet)
+	for cand := n.gateway.Next(); n.subnet.Contains(cand) && cand != broadcast; cand = cand.Next() {
+		if !n.reserved[cand] {
+			n.reserved[cand] = true
+			return cand.String(), mac, nil
+		}
+	}
+	return "", "", fmt.Errorf("no free IP in subnet %s", n.subnet)
+}
+
+// lastAddr returns the broadcast (all host bits set) address of an IPv4 prefix.
+func lastAddr(p netip.Prefix) netip.Addr {
+	bytes := p.Addr().As4()
+	for i := p.Bits(); i < 32; i++ {
+		bytes[i/8] |= 1 << (7 - uint(i%8))
+	}
+	return netip.AddrFrom4(bytes)
 }
 
 // Close tears the network down: every remaining tap, then the egress rules, then

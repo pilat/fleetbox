@@ -36,14 +36,20 @@ type catalogEntry struct {
 }
 
 // catalog maps GOOS/GOARCH to the published helper. Only darwin/arm64 needs a
-// helper (linux runs the orchestrator in-process). The url/sha256 are filled in
-// by the release pipeline (Task 7) when the signed artifact is published; until
-// then the empty sha256 forces use of the FLEETBOX_HELPER override.
+// downloaded helper (linux self-reexecs the client binary into the holder —
+// ADR-0020). The version is pinned to the current protocol: the ADR-0020
+// inversion bumped the wire protocol to "2", so the helper is helper-v0.2.0; the
+// published helper-v0.1.0 speaks the old protocol and is deliberately NOT served
+// (a downloaded v0.1.0 would be rejected at the bind handshake). The url/sha256
+// are filled in by the release pipeline when the signed helper-v0.2.0 artifact is
+// published; until then the empty sha256 forces use of the FLEETBOX_HELPER
+// override (the dev/offline path), which is honest about "no published helper yet"
+// rather than handing back a protocol-incompatible binary.
 var catalog = map[string]catalogEntry{
 	"darwin/arm64": {
-		version: "0.1.0",
-		url:     "https://github.com/pilat/fleetbox/releases/download/helper-v0.1.0/fleetbox-helper-darwin-arm64",
-		sha256:  "83abc51a704509f3a1b2d5a73774c8ac0bddd7f498012e4bda39a62b8b3ae0ef",
+		version: "0.2.0",
+		url:     "",
+		sha256:  "",
 	},
 }
 

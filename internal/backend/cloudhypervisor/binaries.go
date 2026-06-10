@@ -15,7 +15,7 @@ import (
 // (ADR-0011) — unlike cloud images, they are never left unpinned.
 const (
 	chVersion = "v52.0" // cloud-hypervisor
-	fwVersion = "0.5.0"  // rust-hypervisor-firmware
+	fwVersion = "0.5.0" // rust-hypervisor-firmware
 )
 
 // chBinaries maps GOARCH to the static cloud-hypervisor binary for it.

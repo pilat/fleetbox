@@ -1,24 +1,31 @@
 // Package holder is the server half of the holder protocol: one process owns one
-// orchestrator.Cluster — its shared network and every VM on it — so a cluster
-// gets the same VM↔VM connectivity the library StartN gives (ADR-0008). It serves
-// one control socket and one pidfile per member name, so the per-name CLI
-// commands (ls/ssh/down/rm/status) address a member by talking to its socket,
-// unaware that several members may live in one process. Members can be stopped
-// individually (the process survives until the last one leaves) and added at
-// runtime (a stopped node re-joins the live cluster's network).
+// cluster — its shared network and every VM on it — so a cluster gets the same
+// VM↔VM connectivity the library StartN gives (ADR-0008). Since ADR-0020 it is a
+// thin backend-server: it links the real backend (vz/cloud-hypervisor) and does
+// nothing else. It does NOT resolve images, build disks/seeds/fixtures, or manage
+// the store — all of that runs client-side in the orchestrator, which drives this
+// process over the control protocol. The helper receives ready paths and boots
+// what the client tells it to.
+//
+// It serves one control socket and one pidfile per member name, so the per-name
+// CLI commands (ls/ssh/down/rm/status) address a member by talking to its socket,
+// unaware that several members may live in one process. The cluster-level RPCs
+// (createnetwork/reserve/boot-member) travel over the primary member's socket and
+// are dispatched by name. Members can be stopped individually (the process
+// survives until the last one leaves) and added at runtime (a stopped node
+// re-joins the live cluster's network with a fresh reserve + boot-member).
 //
 // It runs in two lifetime modes (ADR-0017, R4). DETACHED: a persistent session
 // leader whose VMs outlive the spawning CLI (cattle-with-persistence). BOUND: an
 // attached child of a test process, selected by FLEETBOX_PARENT_PID; it watches
 // that parent (reparent poll) and a long-lived control connection (EOF), and
-// reaps itself and its in-process VMs the moment the test process is gone. On
-// darwin this package is compiled only into cmd/fleetbox-helper (which links vz);
-// on linux the CLI re-execs itself into Run.
+// reaps itself and its VMs the moment the test process is gone. On darwin this
+// package is compiled only into cmd/fleetbox-helper (which links vz); on linux the
+// CLI/test binary re-execs itself into Run.
 package holder
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -32,16 +39,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pilat/fleetbox/internal/backend"
 	"github.com/pilat/fleetbox/internal/control"
-	"github.com/pilat/fleetbox/internal/opts"
-	"github.com/pilat/fleetbox/internal/orchestrator"
 	"github.com/pilat/fleetbox/internal/store"
 )
 
-// failedClusterLinger is how long a holder keeps serving error status after a
-// failed initial boot, so the spawning client can read the error before the
-// process tears down. The client polls every 500ms, so this is generous.
-const failedClusterLinger = 30 * time.Second
+// ipWaitTimeout bounds the helper-side wait for a freshly booted member's IP
+// (vz discovers it from dhcpd_leases; cloud-hypervisor probes its static address).
+// boot-member is synchronous, so this caps how long it blocks before replying.
+const ipWaitTimeout = 2 * time.Minute
 
 // IsRunner returns true if the current process is a holder.
 func IsRunner() bool {
@@ -58,6 +64,30 @@ func GetRunnerVMNames() []string {
 	return nil
 }
 
+// IsReconcile reports whether this process was launched as a one-shot reconcile
+// helper (the Prune path).
+func IsReconcile() bool {
+	return slices.Contains(os.Args, control.ReconcileFlag)
+}
+
+// RunReconcile reclaims orphaned host network state and returns, serving no
+// member. It is the helper's Prune entrypoint: it builds the real backend and runs
+// its Reconcile (Linux bridges/taps/iptables/ip_forward; a no-op on vz/fake).
+func RunReconcile() error {
+	st, err := store.New()
+	if err != nil {
+		return fmt.Errorf("init store: %w", err)
+	}
+	b, err := newRealBackend(st)
+	if err != nil {
+		return fmt.Errorf("init backend: %w", err)
+	}
+	if err := b.Reconcile(); err != nil {
+		return fmt.Errorf("reconcile: %w", err)
+	}
+	return nil
+}
+
 // member is one VM held by the process: its reported state plus the socket that
 // serves it.
 type member struct {
@@ -66,7 +96,7 @@ type member struct {
 	state string
 	ip    string
 	err   string
-	vm    *orchestrator.VM
+	vm    backend.VM
 
 	ln         net.Listener
 	gone       chan struct{}
@@ -87,16 +117,20 @@ func (m *member) status() control.Status {
 	}
 }
 
-// holder owns the cluster and the member registry for one process.
+// holder owns the shared network, the per-member reservations, and the member
+// registry for one process. It links the real backend and translates the
+// control-protocol RPCs into backend calls.
 type holder struct {
-	st *store.Store
+	st      *store.Store
+	backend backend.Backend
 
-	mu       sync.Mutex
-	cluster  *orchestrator.Cluster
-	members  map[string]*member
-	running  int // members currently starting or running
-	done     chan struct{}
-	doneOnce sync.Once
+	mu           sync.Mutex
+	network      backend.Network
+	reservations map[string]control.Reservation
+	members      map[string]*member
+	running      int // members currently starting or running
+	done         chan struct{}
+	doneOnce     sync.Once
 
 	// boundShutdown is closed by the parent-pid poll or the control-socket EOF
 	// when this holder is bound to a test process that has gone away (R4). It is
@@ -108,11 +142,10 @@ type holder struct {
 // Run is the holder's main loop.
 func Run() error {
 	// Pin this goroutine to its OS thread for the holder's lifetime. Every VM is
-	// booted from here (bootMember runs synchronously below), and on Linux each
-	// VM's cloud-hypervisor child carries a PR_SET_PDEATHSIG so it dies if its
-	// parent thread dies. A stable, long-lived parent thread makes that signal
-	// fire only when the holder actually exits, not when Go happens to retire the
-	// launching thread (ADR-0013).
+	// booted from a connection-handling goroutine, and on Linux each VM's
+	// cloud-hypervisor child carries PR_SET_PDEATHSIG so it dies if the holder
+	// dies. A stable, long-lived main thread makes that signal fire only when the
+	// holder actually exits, not when Go retires a transient thread (ADR-0013).
 	runtime.LockOSThread()
 
 	names := GetRunnerVMNames()
@@ -125,36 +158,49 @@ func Run() error {
 		return fmt.Errorf("init store: %w", err)
 	}
 
-	options, err := opts.Decode(os.Getenv(control.EnvOpts))
+	b, err := newRealBackend(st)
 	if err != nil {
-		return fmt.Errorf("decode options: %w", err)
+		return fmt.Errorf("init backend: %w", err)
 	}
 
-	h := &holder{st: st, members: make(map[string]*member), done: make(chan struct{})}
+	// Reclaim any host network state orphaned by a predecessor that crashed before
+	// teardown (no-op on vz/fake; on Linux it removes stale bridges/taps and
+	// restores ip_forward if ours). Owned by the helper now, keyed on its PID
+	// (ADR-0013/0020).
+	_ = b.Reconcile()
 
-	// On any exit — clean shutdown, signal, or panic — release the cluster's
-	// shared network so a Linux bridge and its egress rules don't leak. Runs
-	// after stopAll (deferred LIFO), so members are down first. No-op on macOS.
+	h := &holder{
+		st:           st,
+		backend:      b,
+		reservations: make(map[string]control.Reservation),
+		members:      make(map[string]*member),
+		done:         make(chan struct{}),
+	}
+
+	// On any exit — clean shutdown, signal, or panic — release the shared network
+	// so a Linux bridge and its egress rules don't leak. Runs after stopAll
+	// (deferred LIFO), so members are down first. No-op on macOS.
 	defer func() {
 		h.mu.Lock()
-		c := h.cluster
+		nw := h.network
 		h.mu.Unlock()
-		if c != nil {
-			_ = c.Close()
+		if nw != nil {
+			_ = nw.Close()
 		}
 	}()
 
-	// Register every member as "starting" and start serving its socket BEFORE
-	// booting, so the spawning client sees status the moment it polls.
+	// Register every spawn-name member as "starting" and serve its socket BEFORE
+	// any boot, so the client can address it (and drive its boot) the moment it
+	// connects. Runtime-added members register lazily in bootMember.
 	for _, name := range names {
 		if err := h.register(name); err != nil {
 			return fmt.Errorf("register %s: %w", name, err)
 		}
 	}
 
-	// Bound mode: begin watching the parent process and the control connection
-	// now, before the (potentially slow) boot, so the client's bind dial connects
-	// promptly and a parent death during boot is still caught (R4).
+	// Bound mode: begin watching the parent process and the control connection now,
+	// before any boot, so the client's bind dial connects promptly and a parent
+	// death during boot is still caught (R4).
 	if pidStr := os.Getenv(control.EnvParentPID); pidStr != "" {
 		h.boundShutdown = make(chan struct{})
 		if parentPID, err := strconv.Atoi(pidStr); err == nil {
@@ -169,56 +215,16 @@ func Run() error {
 		}
 	}
 
-	// NewCluster performs the one-time, cluster-wide pull of the image and VMM
-	// binaries before any VM exists. Mark members "downloading" around it so the
-	// client's readiness wait does not charge that (potentially multi-GB) download
-	// against the per-boot budget (ADR-0013); flip back to "starting" once the
-	// pull is done and the per-VM boot begins.
-	for _, name := range names {
-		h.setState(name, control.StateDownloading)
-	}
-	ctx := context.Background()
-	cluster, err := orchestrator.NewCluster(options...)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "create cluster: %v\n", err)
-		for _, name := range names {
-			h.markError(h.memberByName(name), err)
-		}
-	} else {
-		h.mu.Lock()
-		h.cluster = cluster
-		h.mu.Unlock()
-		for _, name := range names {
-			h.setState(name, control.StateStarting)
-		}
-		for _, name := range names {
-			h.bootMember(ctx, name)
-		}
-	}
-
+	// Serve until a signal, until every member has been stopped individually (the
+	// last stop closes done), or until the bound parent goes away. Members boot on
+	// demand via boot-member RPCs, so there is no synchronous boot loop here. In
+	// detached mode boundShutdown is nil, so that select case never fires.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-
-	// In bound mode, a nil channel select case never fires, so the same select
-	// covers both modes: bound adds the parent/EOF teardown trigger.
-	if h.allRunning(names) {
-		// Healthy cluster: serve until a signal, until every member is stopped
-		// individually (the last `stop` closes done), or until the bound parent
-		// goes away.
-		select {
-		case <-sigCh:
-		case <-h.done:
-		case <-h.boundShutdown:
-		}
-	} else {
-		// Initial boot was all-or-nothing and at least one member failed. Keep
-		// serving the error briefly so the client reads it, then tear the whole
-		// cluster down — no half-up clusters from a single `up`.
-		select {
-		case <-sigCh:
-		case <-h.boundShutdown:
-		case <-time.After(failedClusterLinger):
-		}
+	select {
+	case <-sigCh:
+	case <-h.done:
+	case <-h.boundShutdown:
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -314,8 +320,8 @@ func (h *holder) triggerBoundShutdown() {
 // register opens a member's control socket and pidfile and marks it starting.
 // It ensures the member directory exists first, because the pidfile lives inside
 // it but the VM (and thus store.Create) boots later. This is the single
-// chokepoint for both boot paths — the initial loop and addMember's runtime
-// re-join — so the directory is guaranteed for a brand-new member too.
+// chokepoint for both boot paths — the initial spawn-name loop and bootMember's
+// runtime add — so the directory is guaranteed for a brand-new member too.
 func (h *holder) register(name string) error {
 	if err := h.st.EnsureDir(name); err != nil {
 		return fmt.Errorf("ensure member dir: %w", err)
@@ -323,8 +329,8 @@ func (h *holder) register(name string) error {
 	// If the subsequent boot fails, this dir is intentionally left in place: a
 	// re-joining member keeps its persistent disk, and an empty dir from a
 	// never-retried failed boot is benign (List/cmdList skip a configless member
-	// and the next `up` reuses the dir). Deleting it here would risk wiping a
-	// real disk on a transient boot failure — cattle with persistence.
+	// and the next `up` reuses the dir). Deleting it here would risk wiping a real
+	// disk on a transient boot failure — cattle with persistence.
 
 	sockPath := h.st.SocketPath(name)
 	_ = os.Remove(sockPath)
@@ -349,50 +355,142 @@ func (h *holder) register(name string) error {
 	return nil
 }
 
-// bootMember brings a registered member up on the shared network.
-func (h *holder) bootMember(ctx context.Context, name string) {
-	m := h.memberByName(name)
-	if m == nil {
-		return
+// createNetwork creates the cluster's shared network on first request and returns
+// its subnet (empty on the DHCP/vz path). It is idempotent: a repeated call
+// returns the existing network's subnet.
+func (h *holder) createNetwork() (string, error) {
+	h.mu.Lock()
+	if h.network != nil {
+		subnet := h.network.Subnet()
+		h.mu.Unlock()
+		return subnet, nil
 	}
-	vm, err := h.cluster.Add(ctx, name)
+	h.mu.Unlock()
+
+	// backend.CreateNetwork is slow on Linux (ip/iptables system calls + a
+	// reconcile sweep); do NOT hold h.mu across it, or a concurrent status/stop/
+	// reserve RPC would stall for the full duration. Double-check after.
+	nw, err := h.backend.CreateNetwork()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "boot %s: %v\n", name, err)
-		h.markError(m, err)
-		return
+		return "", fmt.Errorf("create network: %w", err)
 	}
-	h.markRunning(m, vm)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.network != nil {
+		_ = nw.Close() // another goroutine raced us to it; drop ours
+		return h.network.Subnet(), nil
+	}
+	h.network = nw
+	return nw.Subnet(), nil
 }
 
-// addMember registers and boots a brand-new member on the existing cluster
-// network. Unlike the initial boot it is independent: its failure does not tear
-// down the rest of the cluster.
-func (h *holder) addMember(ctx context.Context, name string) error {
+// reserve allocates a member's address on the live network (helper-side, the
+// successor to the orchestrator's allocateIP) and remembers it for the member's
+// boot-member, so the NIC and the client's seed agree on the MAC/IP (Decisions
+// 5, 6).
+func (h *holder) reserve(name, ipHint string) (control.Reservation, error) {
+	// Hold h.mu across the whole reservation so it is atomic AND idempotent: a
+	// repeated reserve for the same member returns the first reservation instead of
+	// allocating (and leaking) a second address. nw.Reserve is in-memory and fast,
+	// so holding the lock is cheap (unlike createNetwork's system calls).
 	h.mu.Lock()
-	_, exists := h.members[name]
-	cluster := h.cluster
-	h.mu.Unlock()
-	if exists {
-		return nil // already a member — idempotent
+	defer h.mu.Unlock()
+	if res, ok := h.reservations[name]; ok {
+		return res, nil
 	}
-	if cluster == nil {
-		return errors.New("cluster not ready")
+	if h.network == nil {
+		return control.Reservation{}, errors.New("network not created")
+	}
+	ip, mac, err := h.network.Reserve(name, ipHint)
+	if err != nil {
+		return control.Reservation{}, fmt.Errorf("reserve %s: %w", name, err)
+	}
+	res := control.Reservation{IP: ip, MAC: mac}
+	h.reservations[name] = res
+	return res, nil
+}
+
+// bootMember creates and starts a member's VM on the shared network from a
+// resolved spec plus the address reserved for it, then waits for its IP. It is
+// synchronous: it returns only once the VM is up (IP known) or has failed, so the
+// client's boot-member RPC reply is the authoritative boot result. A runtime-added
+// member (not a spawn name) is registered here first.
+func (h *holder) bootMember(ctx context.Context, spec control.MemberSpec) error {
+	h.mu.Lock()
+	nw := h.network
+	res, reserved := h.reservations[spec.Name]
+	b := h.backend
+	h.mu.Unlock()
+	if nw == nil {
+		return errors.New("network not created")
+	}
+	if !reserved {
+		return fmt.Errorf("member %s was not reserved", spec.Name)
 	}
 
-	// register starts the new member's accept loop, which serves independent
-	// per-connection commands on their own background contexts — not derived
-	// from this request's ctx.
-	if err := h.register(name); err != nil { //nolint:contextcheck // server accept loop owns its context
-		return err
+	if h.memberByName(spec.Name) == nil {
+		// register starts the member's accept loop, whose handlers run on their own
+		// background contexts — not derived from this boot's ctx.
+		if err := h.register(spec.Name); err != nil { //nolint:contextcheck // server accept loop owns its context
+			return fmt.Errorf("register %s: %w", spec.Name, err)
+		}
 	}
-	m := h.memberByName(name)
-	vm, err := cluster.Add(ctx, name)
+	m := h.memberByName(spec.Name)
+	if m == nil {
+		return fmt.Errorf("member %s not registered", spec.Name)
+	}
+	// Refuse a duplicate boot for an already-running member: re-running b.Create
+	// would fail and, via markError, wrongly decrement the running counter — which
+	// for a solo member would close `done` and exit the holder out from under the
+	// live VM. Reject without touching the counter.
+	m.mu.Lock()
+	already := m.vm != nil
+	m.mu.Unlock()
+	if already {
+		return fmt.Errorf("member %s is already running", spec.Name)
+	}
+
+	cfg := backend.Config{
+		Name:          spec.Name,
+		DiskPath:      spec.DiskPath,
+		SeedPath:      spec.SeedPath,
+		EFIPath:       spec.EFIPath,
+		MAC:           res.MAC,
+		CPUs:          spec.CPUs,
+		MemoryBytes:   spec.MemoryBytes,
+		SerialLogPath: spec.SerialLogPath,
+		FixturePaths:  spec.FixturePaths,
+		AssignedIP:    res.IP,
+	}
+
+	vm, err := b.Create(cfg, nw)
 	if err != nil {
 		h.markError(m, err)
-		h.retire(m)
-		return fmt.Errorf("boot member %s: %w", name, err)
+		return fmt.Errorf("create %s: %w", spec.Name, err)
 	}
-	h.markRunning(m, vm)
+	if err := vm.Start(ctx); err != nil {
+		_ = vm.Stop(ctx) // release any tap/process/serial a partial boot left behind
+		h.markError(m, err)
+		return fmt.Errorf("start %s: %w", spec.Name, err)
+	}
+
+	ipCtx, cancel := context.WithTimeout(ctx, ipWaitTimeout)
+	ip, err := vm.WaitForIP(ipCtx)
+	cancel()
+	if err != nil {
+		_ = vm.Stop(ctx)
+		h.markError(m, err)
+		return fmt.Errorf("wait for ip %s: %w", spec.Name, err)
+	}
+
+	if !h.markRunning(m, vm, ip) {
+		// The member was stopped concurrently while we were booting it (a stop RPC,
+		// or teardown). Reap the VM we just started so it does not outlive its
+		// retired member.
+		_ = vm.Stop(ctx)
+		return fmt.Errorf("member %s was stopped during boot", spec.Name)
+	}
 	return nil
 }
 
@@ -434,28 +532,24 @@ func (h *holder) stopAll(ctx context.Context) {
 	}
 }
 
-func (h *holder) markRunning(m *member, vm *orchestrator.VM) {
+// markRunning records a member as running with its VM and IP, unless the member
+// was stopped concurrently during boot — in which case it returns false WITHOUT
+// adopting the VM, so the caller reaps the orphan. (It does not touch the running
+// counter: register counted the member, and a concurrent stop already decremented
+// it via markStopped.)
+func (h *holder) markRunning(m *member, vm backend.VM, ip string) bool {
+	if m == nil {
+		return false
+	}
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state == control.StateStopped {
+		return false
+	}
 	m.state = control.StateRunning
 	m.vm = vm
-	if vm != nil && vm.IP() != nil {
-		m.ip = vm.IP().String()
-	}
-	m.mu.Unlock()
-}
-
-// setState transitions a member between two "active" states (the
-// downloading->starting flip around the cluster-wide pull). Unlike
-// markRunning/markError/markStopped it does not touch the running counter, since
-// both downloading and starting already count as active.
-func (h *holder) setState(name, state string) {
-	m := h.memberByName(name)
-	if m == nil {
-		return
-	}
-	m.mu.Lock()
-	m.state = state
-	m.mu.Unlock()
+	m.ip = ip
+	return true
 }
 
 func (h *holder) markError(m *member, err error) {
@@ -514,23 +608,6 @@ func (h *holder) memberByName(name string) *member {
 	return h.members[name]
 }
 
-// allRunning reports whether every named member reached the running state.
-func (h *holder) allRunning(names []string) bool {
-	for _, name := range names {
-		m := h.memberByName(name)
-		if m == nil {
-			return false
-		}
-		m.mu.Lock()
-		ok := m.state == control.StateRunning
-		m.mu.Unlock()
-		if !ok {
-			return false
-		}
-	}
-	return true
-}
-
 func (h *holder) serve(m *member) {
 	for {
 		conn, err := m.ln.Accept()
@@ -546,39 +623,60 @@ func (h *holder) serve(m *member) {
 	}
 }
 
+// handleConn serves one NDJSON request on a member's socket. status/stop are
+// member-scoped (they act on m); createnetwork/reserve/boot-member are
+// cluster-level (the client routes them through the primary member's socket and
+// they act on the holder by name, ignoring which socket carried them).
 func (h *holder) handleConn(m *member, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
-	buf := make([]byte, 256)
-	n, err := conn.Read(buf)
-	if err != nil {
+	var req control.Request
+	if err := control.ReadMessage(conn, &req); err != nil {
 		return
 	}
 
-	fields := strings.Fields(string(buf[:n]))
-	if len(fields) == 0 {
-		return
-	}
-
-	switch fields[0] {
+	switch req.Cmd {
 	case control.CmdStatus:
-		data, _ := json.Marshal(m.status())
-		_, _ = conn.Write(data)
+		s := m.status()
+		_ = control.WriteMessage(conn, control.Response{Status: &s})
 
 	case control.CmdStop:
-		_, _ = conn.Write([]byte("ok"))
+		_ = control.WriteMessage(conn, control.Response{})
 		h.stopMember(context.Background(), m.name)
 
-	case control.CmdAddMember:
-		if len(fields) < 2 {
-			_, _ = conn.Write([]byte("err: missing member name"))
+	case control.CmdCreateNetwork:
+		subnet, err := h.createNetwork()
+		if err != nil {
+			_ = control.WriteMessage(conn, control.Response{Error: err.Error()})
 			return
 		}
-		if err := h.addMember(context.Background(), fields[1]); err != nil {
-			_, _ = conn.Write([]byte("err: " + err.Error()))
+		_ = control.WriteMessage(conn, control.Response{Subnet: subnet})
+
+	case control.CmdReserve:
+		if req.Name == "" {
+			_ = control.WriteMessage(conn, control.Response{Error: "missing member name"})
 			return
 		}
-		_, _ = conn.Write([]byte("ok"))
+		res, err := h.reserve(req.Name, req.IPHint)
+		if err != nil {
+			_ = control.WriteMessage(conn, control.Response{Error: err.Error()})
+			return
+		}
+		_ = control.WriteMessage(conn, control.Response{Reservation: &res})
+
+	case control.CmdBootMember:
+		if req.Spec == nil || req.Spec.Name == "" {
+			_ = control.WriteMessage(conn, control.Response{Error: "missing or invalid spec"})
+			return
+		}
+		// boot-member runs on a fresh background context (the member outlives this
+		// connection), not the per-request ctx.
+		err := h.bootMember(context.Background(), *req.Spec)
+		if err != nil {
+			_ = control.WriteMessage(conn, control.Response{Error: err.Error()})
+			return
+		}
+		_ = control.WriteMessage(conn, control.Response{})
 	}
 }
 

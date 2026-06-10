@@ -1,8 +1,8 @@
 // Package control is the client half of the holder protocol: it spawns a holder
-// process, waits for its members to come up, and queries or stops them over the
-// per-member unix sockets. It is backend-neutral — it imports only internal/opts
-// and internal/store, never a hypervisor or the orchestrator — so the darwin
-// library client and CLI (which both drive a holder over this protocol) stay
+// process, waits for its members to come up, and drives them (createnetwork/
+// reserve/boot-member/status/stop) over the per-member unix sockets. It is
+// backend-neutral — it imports only internal/store, never a hypervisor or the
+// orchestrator — so the client and CLI that drive a holder over this protocol stay
 // pure Go and need no codesign (ADR-0017, R1).
 //
 // Two spawn modes share one wire protocol. The CLI spawns DETACHED (the holder
@@ -14,7 +14,6 @@
 package control
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -26,18 +25,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pilat/fleetbox/internal/opts"
 	"github.com/pilat/fleetbox/internal/store"
 )
 
 const (
 	// RunnerFlag marks a process as a holder and is followed by the
 	// comma-separated member names it owns. The holder server parses it; Spawn
-	// passes it.
+	// passes it. The helper no longer receives the VM options — it is a
+	// backend-server that the client drives over RPCs (ADR-0020), so the only thing
+	// it needs at launch is the member names it will serve.
 	RunnerFlag = "--fleetbox-runner"
 
-	// EnvOpts carries the JSON-encoded VM options (opts.Encode) to the holder.
-	EnvOpts = "FLEETBOX_OPTS"
+	// ReconcileFlag marks a one-shot reconcile launch of the helper: it reclaims
+	// orphaned host network state (Linux bridges/taps/iptables/ip_forward) and
+	// exits, without serving any member. It backs Prune (ADR-0013/0020).
+	ReconcileFlag = "--fleetbox-reconcile"
 
 	// EnvParentPID is set only in bound mode: it is the client PID the holder
 	// watches so it can reap itself when the test process is gone (R4).
@@ -48,14 +50,21 @@ const (
 	// filename is version-stamped) always matches; a mismatch means a stale
 	// FLEETBOX_HELPER override pointing at a different build, which Spawn rejects
 	// loudly rather than driving with an incompatible protocol (ADR-0017, R5).
-	ProtocolVersion = "1"
+	//
+	// "2" is the NDJSON command protocol with the resolved-member-spec payload and
+	// the create-network/reserve/boot-member exchange; "1" was the fixed-256-byte
+	// text protocol carrying an image alias. The bump forces a stale "1" helper to
+	// be rejected at handshake rather than driven with an incompatible wire format.
+	ProtocolVersion = "2"
 
 	// Wire commands, shared with the holder server half (internal/holder) so the
-	// two ends never drift.
-	CmdStatus    = "status"
-	CmdStop      = "stop"
-	CmdAddMember = "addmember"
-	CmdBind      = "bind"
+	// two ends never drift. The command-socket commands (status/stop and the
+	// createnetwork/reserve/boot-member set in wire.go) travel as NDJSON Request
+	// objects; only bind/ack stay a raw-text handshake on the .ctl socket. Adding a
+	// member to a live cluster is reserve + boot-member (no dedicated command).
+	CmdStatus = "status"
+	CmdStop   = "stop"
+	CmdBind   = "bind"
 	// CmdBindAck confirms the bind handshake. The client sends it only after it
 	// has accepted the helper's version and is committing to hold the connection;
 	// the helper arms its EOF death-watch only after receiving it. This keeps a
@@ -63,10 +72,10 @@ const (
 	// being mistaken for the parent dying and tearing the cluster down (R4).
 	CmdBindAck = "ack"
 
-	// Member states reported over the status socket. StateDownloading is the
-	// one-time pull of the image + VMM binaries that precedes booting; it is
-	// reported separately so the readiness wait does not charge that
-	// (potentially multi-GB) download against the per-boot budget (ADR-0013).
+	// Member states reported over the status socket. Since ADR-0020 the image pull
+	// is client-side (before the helper is spawned), so StateDownloading now covers
+	// only the helper's one-time VMM-binary fetch; it is reported separately so the
+	// readiness wait does not charge that download against the per-boot budget.
 	StateDownloading = "downloading"
 	StateStarting    = "starting"
 	StateRunning     = "running"
@@ -82,6 +91,11 @@ const (
 	// control socket before giving up on the fast EOF-teardown path and relying
 	// on the holder's parent-pid poll alone (R4).
 	bindDialTimeout = 5 * time.Second
+
+	// sockDialWindow bounds how long dialHolder retries connecting to a holder's
+	// member socket — long enough to cover a detached helper's startup before it
+	// opens its sockets, short enough to fail fast on a helper that never came up.
+	sockDialWindow = 10 * time.Second
 )
 
 // errBindUnavailable signals that the holder's control socket never came up
@@ -101,13 +115,14 @@ type Status struct {
 
 // SpawnConfig configures a holder launch. Exe is the binary to run (the
 // downloaded fleetbox-helper on darwin, os.Executable() for the linux
-// re-exec-self CLI). Bound selects the library lifetime mode (attached + parent
-// PID + control connection); false is the CLI's detached/persistent mode.
+// re-exec-self CLI). Names are the members the holder will serve sockets for at
+// launch; the client drives their boot afterwards over RPCs. Bound selects the
+// library lifetime mode (attached + parent PID + control connection); false is
+// the CLI's detached/persistent mode.
 type SpawnConfig struct {
-	Exe     string
-	Names   []string
-	Options []opts.Option
-	Bound   bool
+	Exe   string
+	Names []string
+	Bound bool
 }
 
 // Session is a handle to a spawned holder. In bound mode it owns the control
@@ -155,20 +170,22 @@ func GetStatus(st *store.Store, name string) (*Status, error) {
 		}
 		defer func() { _ = conn.Close() }()
 
-		_, _ = conn.Write([]byte(CmdStatus))
+		if err := WriteMessage(conn, Request{Cmd: CmdStatus}); err != nil {
+			return nil, fmt.Errorf("send status: %w", err)
+		}
 		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
-		buf := make([]byte, 1024)
-		n, err := conn.Read(buf)
-		if err != nil {
+		var resp Response
+		if err := ReadMessage(conn, &resp); err != nil {
 			return nil, fmt.Errorf("read status: %w", err)
 		}
-
-		var status Status
-		if err := json.Unmarshal(buf[:n], &status); err != nil {
-			return nil, fmt.Errorf("parse status: %w", err)
+		if resp.Error != "" {
+			return nil, errors.New(resp.Error)
 		}
-		return &status, nil
+		if resp.Status == nil {
+			return nil, errors.New("status reply missing status")
+		}
+		return resp.Status, nil
 	}
 
 	if !st.Exists(name) {
@@ -182,6 +199,58 @@ func GetStatus(st *store.Store, name string) (*Status, error) {
 		Name:  cfg.Name,
 		State: StateStopped,
 	}, nil
+}
+
+// dialHolder connects to a holder member socket, retrying until the window
+// elapses, so the first RPC to a freshly spawned detached helper does not race
+// the helper's socket setup.
+func dialHolder(sockPath string, window time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(window)
+	for {
+		conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
+		if err == nil {
+			return conn, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("connect to holder: %w", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// SendCommand dials the holder socket serving member `name`, sends one NDJSON
+// request, and returns the reply. It is the client transport the remote-proxy
+// backend uses for the cluster-level RPCs (createnetwork/reserve/boot-member,
+// routed through the primary member's socket) and for stop. A non-empty
+// Response.Error is turned into a Go error. `timeout` bounds the wait for the
+// reply, which a slow boot-member needs to be generous.
+//
+// The dial is retried for a short window: a DETACHED helper (CLI) is not bound,
+// so Spawn returns before the helper has opened its member sockets, and the first
+// RPC (createnetwork) would otherwise race the helper's startup. The BOUND
+// (library) path is already synchronized by Spawn's bind handshake, so the retry
+// is a fast no-op there.
+func SendCommand(st *store.Store, name string, req Request, timeout time.Duration) (*Response, error) {
+	sockPath := st.SocketPath(name)
+	conn, err := dialHolder(sockPath, sockDialWindow)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := WriteMessage(conn, req); err != nil {
+		return nil, fmt.Errorf("send %s: %w", req.Cmd, err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+
+	var resp Response
+	if err := ReadMessage(conn, &resp); err != nil {
+		return nil, fmt.Errorf("read %s reply: %w", req.Cmd, err)
+	}
+	if resp.Error != "" {
+		return nil, errors.New(resp.Error)
+	}
+	return &resp, nil
 }
 
 // Stop gracefully shuts down a single member (the holder keeps running for its
@@ -198,11 +267,13 @@ func Stop(st *store.Store, name string) error {
 	}
 	defer func() { _ = conn.Close() }()
 
-	_, _ = conn.Write([]byte(CmdStop))
+	if err := WriteMessage(conn, Request{Cmd: CmdStop}); err != nil {
+		return fmt.Errorf("send stop: %w", err)
+	}
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 
-	buf := make([]byte, 64)
-	_, _ = conn.Read(buf)
+	var resp Response
+	_ = ReadMessage(conn, &resp) // ack is best-effort; the pidfile poll below is authoritative
 
 	// Wait for the member's pidfile to disappear (the holder retires it once
 	// stopped, even though the process may live on for siblings).
@@ -217,39 +288,6 @@ func Stop(st *store.Store, name string) error {
 	return errors.New("timeout waiting for VM to stop")
 }
 
-// AddMember asks a running holder — reached through a live sibling's socket — to
-// boot name onto its existing shared network, then waits for it to come up. This
-// is how a stopped node re-joins a live cluster instead of getting its own,
-// isolated network.
-func AddMember(st *store.Store, sibling, name string) error {
-	sockPath := st.SocketPath(sibling)
-	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
-	if err != nil {
-		return fmt.Errorf("connect to holder via %s: %w", sibling, err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	if _, err := conn.Write([]byte(CmdAddMember + " " + name)); err != nil {
-		return fmt.Errorf("send addmember: %w", err)
-	}
-	// The holder replies only after the member has booted, which can take a
-	// while, so allow generous time for the reply.
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-
-	buf := make([]byte, 256)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return fmt.Errorf("read reply: %w", err)
-	}
-	reply := strings.TrimSpace(string(buf[:n]))
-	if after, ok := strings.CutPrefix(reply, "err:"); ok {
-		return errors.New(strings.TrimSpace(after))
-	}
-
-	_, err = WaitMembers(st, []string{name}, 5*time.Minute)
-	return err
-}
-
 // Spawn launches a holder for the given member names. In detached mode the
 // holder is a persistent session leader; in bound mode it is an attached child
 // handed the client PID, and Spawn additionally opens the holder's control
@@ -261,11 +299,6 @@ func Spawn(st *store.Store, cfg SpawnConfig) (*Session, error) {
 		return nil, errors.New("no VM names provided")
 	}
 
-	optData, err := opts.Encode(cfg.Options)
-	if err != nil {
-		return nil, fmt.Errorf("encode options: %w", err)
-	}
-
 	logPath := st.BaseDir() + "/runner-" + cfg.Names[0] + ".log"
 	logFile, err := os.Create(logPath)
 	if err != nil {
@@ -274,7 +307,7 @@ func Spawn(st *store.Store, cfg SpawnConfig) (*Session, error) {
 	defer func() { _ = logFile.Close() }()
 
 	cmd := exec.Command(cfg.Exe, RunnerFlag, strings.Join(cfg.Names, ","))
-	cmd.Env = append(os.Environ(), EnvOpts+"="+optData)
+	cmd.Env = os.Environ()
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
