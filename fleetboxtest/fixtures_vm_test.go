@@ -34,7 +34,7 @@ func TestVMFixtureReadOnly(t *testing.T) {
 		t.Fatalf("write host fixture file: %v", err)
 	}
 
-	vm := fleetboxtest.Start(t, fleetbox.Debian12, fleetbox.WithFixture(hostDir, "/work"))
+	vm := fleetboxtest.Start(t, "debian-12", fleetbox.WithFixture(hostDir, "/work"))
 	ctx := context.Background()
 
 	// The fixture content is present at the guest path with matching bytes. The
@@ -80,7 +80,7 @@ func TestVMFixturesPersistAcrossReboot(t *testing.T) {
 	ctx := context.Background()
 
 	vm, err := fleetbox.Start(ctx, name,
-		fleetbox.WithImage(fleetbox.Debian12),
+		fleetbox.WithImage("debian-12"),
 		fleetbox.WithFixture(hostDir, "/work"),
 	)
 	if err != nil {

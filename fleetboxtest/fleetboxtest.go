@@ -5,7 +5,7 @@
 // Example:
 //
 //	func TestMyApp(t *testing.T) {
-//		vm := fleetboxtest.Start(t, fleetbox.Debian12)
+//		vm := fleetboxtest.Start(t, "debian-12")
 //		out, err := vm.SSH(context.Background(), "uname -a")
 //		if err != nil {
 //			t.Fatal(err)

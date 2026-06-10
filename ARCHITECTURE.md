@@ -63,7 +63,7 @@ Where the canonical version of each thing lives. When two files disagree, the So
 | CLI command surface | `cmd/fleetbox/main.go` (`usage()` + dispatch in `main()`) | §5.3 summarizes. |
 | Backend contract | `internal/backend/backend.go` | `Backend`, `VM`, `Network`, `Config`, `State`. |
 | On-disk state layout | `internal/store/store.go` path methods | §4.2 summarizes. |
-| Image catalog | `internal/image/image.go` `Catalog` map | Alias → per-GOARCH URL + sha256. |
+| Image catalog | `internal/image/catalog.json` (embedded) + `internal/image/image.go` | Alias → dated snapshot + per-GOARCH URL + sha256 (pinned, verified); refreshed by `contrib/catalog`. |
 | Pinned VMM binaries | `internal/backend/cloudhypervisor/binaries.go` | cloud-hypervisor + firmware: version + per-arch URL + sha256. |
 | macOS helper catalog | `internal/helperdist/helperdist.go` `catalog` map | fleetbox-helper: version + per-arch URL + sha256; `FLEETBOX_HELPER` override (ADR-0017). |
 | Holder protocol | `internal/control/control.go` (client) + `internal/holder/holder.go` (server) | Wire commands + states + bound-mode bind/version handshake. |
@@ -400,7 +400,9 @@ When a PR changes any of these fields for a package, update its section.
     `WithImage`, `WithCPUs`, `WithMemoryGB`, `WithDiskGB`, `WithFixture(hostDir, guestPath)`
   - `type Fixture{HostPath, GuestPath}` — a read-only host directory packed into the guest
     at boot as an ext4 payload (ADR-0015)
-  - image aliases: `Debian12`, `Ubuntu2404`
+  - image aliases are plain strings resolved against the embedded catalog (e.g.
+    `"debian-12"`); there are no exported alias constants — `catalog.json` is the sole
+    list of which aliases exist (ADR-0019)
 - Invariants:
   - No hypervisor (vz/CH) types in any exported signature — the API is backend-neutral
     (ADR-0002, enforced by depguard for vz). IP discovery is behind `backend.VM.WaitForIP`
@@ -541,15 +543,24 @@ When a PR changes any of these fields for a package, update its section.
 - Purpose: cloud image catalog + qcow2→raw conversion + cache; the download/verify
   itself is delegated to `internal/fetch`.
 - Owns: `~/.fleetbox/images/` contents (via paths given by store).
-- Depends on: `go-qcow2reader`, `internal/fetch`, stdlib.
-- Public API (internal): `Catalog` (alias → `ImageInfo{URLs map[GOARCH]string, SHA256}`),
-  `Ensure(cacheDir, urlOrAlias) (string, error)`, `CopyDisk(src, dst, sizeBytes)`.
+- Depends on: `go-qcow2reader`, `internal/fetch`, stdlib (incl. `embed`).
+- Public API (internal): the `ImageInfo`/`ArchImage` types (also imported by
+  `contrib/catalog`), `Ensure(cacheDir, urlOrAlias) (string, error)`,
+  `CopyDisk(src, dst, sizeBytes)`. The catalog itself is an embedded JSON data file
+  (`catalog.json`, `//go:embed`), parsed once via `loadCatalog()` (sync.Once →
+  wrapped error on malformed JSON); there is no exported `Catalog` var (ADR-0019).
 - Invariants:
-  - One code path for all images — adding a distro is adding a `Catalog` entry, never
-    new code (ADR-0003). The catalog resolves an alias to the URL for the current
-    `runtime.GOARCH`, so the same alias works on macOS arm64 and Linux amd64/arm64.
-  - Cached images are immutable; per-VM disks are copies. Image checksums may be empty
-    ("latest"); `fetch` then skips verification.
+  - One code path for all images — adding a distro is adding a `catalog.json` key,
+    never new code (ADR-0003). The catalog resolves an alias to the per-`runtime.GOARCH`
+    entry, so the same alias works on macOS arm64 and Linux amd64/arm64.
+  - Catalog images are **pinned and verified**: each alias pins a dated upstream
+    snapshot + per-arch SHA256, and the snapshot is stamped into the cache filename
+    for both the downloaded source and the converted raw (`<alias>-<snapshot>-<arch>.raw`)
+    — a snapshot bump is a guaranteed cache miss + re-download, never a stale warm hit
+    (ADR-0019). Only a literal `WithImage(url)` stays unverified (basename-derived
+    cache name). The `contrib/catalog` tool refreshes the snapshot/URL/sha values; the
+    human keys decide which OSes exist.
+  - Cached images are immutable; per-VM disks are copies.
 
 ### §5.7 `internal/seed`
 
@@ -724,8 +735,10 @@ When a PR changes any of these fields for a package, update its section.
 - Invariants:
   - A cached file is always complete: the download goes to a `.download` temp that is
     verified (when a digest is given) and atomically renamed; a mismatch or HTTP error
-    leaves nothing behind. An empty digest skips verification (image "latest" entries);
-    pinned callers (the CH binaries) always pass one.
+    leaves nothing behind. An empty digest skips verification — now only literal
+    `WithImage(url)` images pass one (the CH binaries and catalog images are all pinned;
+    ADR-0019). `fetch` stays sha256-only; the Debian-image sha512 cross-check lives in
+    `contrib/catalog`, not here.
   - A low-level utility imported by two building blocks — the one sanctioned exception to
     "building-block packages don't import each other" (coding-style B.1.2; recorded in
     ADR-0011). It imports nothing of ours.
@@ -864,6 +877,25 @@ When a PR changes any of these fields for a package, update its section.
     tests `Reset` between sub-tests, since every orchestrator entry point builds a fresh
     `fake.New` over the same globals.
 
+### §5.21 `contrib/catalog`
+
+- Purpose: the build-time refresher for the pinned image catalog
+  (`internal/image/catalog.json`) — re-resolves each alias to the newest upstream snapshot
+  and its per-arch URL + SHA256 (ADR-0019). **Not linked into any runtime binary;** run via
+  `make catalog` and the monthly `catalog-refresh.yml`.
+- Owns: nothing of its own; rewrites `catalog.json` in place after resolving every entry.
+- Depends on: `internal/image` (the `ImageInfo`/`ArchImage` types — single source of truth
+  for the JSON shape), stdlib only (`net/http`, `crypto/sha256`+`sha512`, `encoding/json`).
+- Public API: none (package main).
+- Invariants:
+  - The human-authored keys (`distro`/`version`/`codename`) decide which OSes exist; the tool
+    only refreshes the values (snapshot, URLs, sha256, `bumped_at`). Per-distro resolvers live
+    here — allowed because this is `contrib/`, not the runtime library.
+  - Resolves all entries before writing anything (a single failure aborts with no partial
+    write); `bumped_at` advances only on a real change, so a no-op run is byte-identical
+    (idempotent). Debian publishes only SHA512SUMS, so each image is stream-hashed (sha256 +
+    sha512 cross-check) without being persisted; Ubuntu's sha256 is read from SHA256SUMS.
+
 ### Dependency graph
 
 The sever (ADR-0017) splits the import graph into a backend-free **client side** and a
@@ -909,8 +941,11 @@ Edges (verified by `go list -deps`):
   `third_party/vz` (+ `vmnet`) — the only vz import site (depguard `vz-isolation`, ADR-0008)
 - `internal/backend/cloudhypervisor` (linux) → `internal/backend`, `internal/fetch`, stdlib
   only (the only CH import site; no third-party module, no cgo)
-- `internal/image` → `internal/fetch`, `go-qcow2reader`; `internal/fixture` → `go-ext4fs`
-  (its only import site)
+- `internal/image` → `internal/fetch`, `go-qcow2reader`, stdlib `embed` (the catalog);
+  `internal/fixture` → `go-ext4fs` (its only import site)
+- `contrib/catalog` (build-time tool, not in any runtime binary) → `internal/image`
+  (for the `ImageInfo`/`ArchImage` types), stdlib only; run via `make catalog` and the
+  monthly `catalog-refresh.yml` (ADR-0019)
 - The building-block→`fetch` edges (`image`, `fixture`, `helperdist`,
   `backend/cloudhypervisor`) are the sanctioned exception to B.1.2 (ADR-0011); `fetch`
   imports nothing of ours
@@ -946,8 +981,12 @@ CLAUDE.md as checkable rules):
    code outside the holder's control sockets (`internal/holder`, host-only, not
    guest-related); SSH/cp dial the VM IP directly.
 5. **No yaml, no templates, no per-distro code paths.** Check: no yaml parser in
-   go.mod; `internal/image.Catalog` is a dumb map; `internal/seed` has a single code
-   path.
+   go.mod; the image catalog is a dumb alias→data map (`internal/image/catalog.json`,
+   embedded JSON); `internal/seed` has a single code path. *Carve (ADR-0019):* the
+   principle forbids **user-side** config. `catalog.json` is internal data compiled into
+   the binary that the user never edits — the same role the Go map played, in a form a
+   bot (`contrib/catalog`) can rewrite safely. Per-distro logic exists only in
+   `contrib/catalog` (a build-time tool), never in the runtime library.
 6. **Clusters are a naming convention.** Check: no cluster *state file* anywhere. The
    `fleetbox.Cluster` type is an in-process runtime handle only — `StartN`/`StartCluster`
    produce `prefix-i`/named members sharing one network, and the holder keeps that network

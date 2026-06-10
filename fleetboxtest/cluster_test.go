@@ -24,7 +24,7 @@ func TestVMClusterConnectivity(t *testing.T) {
 	fleetboxtest.SkipIfShort(t, "boots real VMs")
 
 	// Cluster A: two nodes on one shared network.
-	clusterA := fleetboxtest.StartN(t, "node", 2, fleetbox.WithImage(fleetbox.Debian12))
+	clusterA := fleetboxtest.StartN(t, "node", 2, fleetbox.WithImage("debian-12"))
 	if len(clusterA) != 2 {
 		t.Fatalf("expected 2 VMs in cluster A, got %d", len(clusterA))
 	}
@@ -34,7 +34,7 @@ func TestVMClusterConnectivity(t *testing.T) {
 
 	// Cluster B: a second cluster started in the same process. R2 requires it
 	// to land on a distinct subnet rather than colliding with cluster A.
-	clusterB := fleetboxtest.StartN(t, "other", 2, fleetbox.WithImage(fleetbox.Debian12))
+	clusterB := fleetboxtest.StartN(t, "other", 2, fleetbox.WithImage("debian-12"))
 	if len(clusterB) != 2 {
 		t.Fatalf("expected 2 VMs in cluster B, got %d", len(clusterB))
 	}

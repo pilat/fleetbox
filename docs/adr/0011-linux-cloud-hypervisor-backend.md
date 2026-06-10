@@ -1,7 +1,10 @@
 # ADR: Linux Backend via cloud-hypervisor, Provisioned by Download-and-Cache
 
 **Date:** 2026-06-07
-**Status:** Accepted
+**Status:** Accepted (superseded in part by [ADR-0019](0019-pin-cloud-images.md) —
+cloud images are now checksum-pinned to dated snapshots exactly like the binaries
+below; the "unlike cloud images, which may stay unpinned for latest" aside in
+Decision 3 no longer holds.)
 
 ## Context
 
@@ -45,9 +48,12 @@ a library that owns a subprocess and talks to it over a socket is still a librar
    holds the shared download → verify → atomic-rename → cache primitive that both
    `internal/image` and the CH backend use. **Every downloaded executable and
    firmware is checksum-pinned** (version + per-arch SHA256, in a Go table next to
-   the backend) — unlike cloud images, which may stay unpinned for "latest". cgo is
-   never introduced; `go:embed` is reserved for a possible future single-binary CLI
-   distribution, never the importable library.
+   the backend). *(This originally added "unlike cloud images, which may stay unpinned
+   for latest" — [ADR-0019](0019-pin-cloud-images.md) closed that gap: cloud images
+   are now pinned to dated snapshots with per-arch SHA256 too, via an embedded
+   catalog.json, and the snapshot is stamped into the image cache filename the same
+   way the version is stamped into the binary's.)* cgo is never introduced for the
+   binaries; `go:embed` is used for the image catalog data (not for any binary).
 
 4. **Linux networking is a shared Linux bridge + per-VM tap + static IP via
    cloud-init.** `CreateNetwork` makes one bridge per cluster on a free `/24`

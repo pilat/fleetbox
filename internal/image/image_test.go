@@ -117,30 +117,38 @@ func TestCopyDiskPassthrough(t *testing.T) {
 	}
 }
 
-// TestEnsureCacheHit pins the cache short-circuit and the URL -> raw-filename
-// derivation, with no network. The derivation appends ".raw" unconditionally
-// after stripping .qcow2/.img: debian's URL already ends in .raw, so its cached
-// name is the double-".raw.raw" below — a quirk this test documents. ubuntu's
-// .img URL derives cleanly to a single .raw. The arch token tracks GOARCH so the
-// alias resolves to the right per-arch image.
-func TestEnsureCacheHit(t *testing.T) {
-	arch := runtime.GOARCH
-	cases := []struct {
-		alias       string
-		wantRawName string
-	}{
-		{"debian-12", "debian-12-generic-" + arch + ".raw.raw"},
-		{"ubuntu-24.04", "ubuntu-24.04-server-cloudimg-" + arch + ".raw"},
+// TestCacheName pins the snapshot-stamped raw cache-filename derivation directly.
+func TestCacheName(t *testing.T) {
+	got := cacheName("debian-12", "20260601-2496", "amd64")
+	want := "debian-12-20260601-2496-amd64.raw"
+	if got != want {
+		t.Errorf("cacheName = %q, want %q", got, want)
 	}
-	for _, tc := range cases {
-		t.Run(tc.alias, func(t *testing.T) {
+}
+
+// TestEnsureCacheHit pins the cache short-circuit for a catalog alias, with no
+// network: a pre-seeded snapshot-stamped raw (the name Ensure now derives from the
+// catalog's pinned snapshot for the current GOARCH) is returned as-is. The old
+// double-".raw.raw" quirk is gone — the name is now <alias>-<snapshot>-<arch>.raw.
+func TestEnsureCacheHit(t *testing.T) {
+	catalog, err := loadCatalog()
+	if err != nil {
+		t.Fatalf("loadCatalog: %v", err)
+	}
+	arch := runtime.GOARCH
+	for _, alias := range []string{"debian-12", "ubuntu-24.04"} {
+		t.Run(alias, func(t *testing.T) {
+			info, ok := catalog[alias]
+			if !ok {
+				t.Fatalf("catalog missing %q", alias)
+			}
 			cacheDir := t.TempDir()
-			rawPath := filepath.Join(cacheDir, tc.wantRawName)
+			rawPath := filepath.Join(cacheDir, cacheName(alias, info.Snapshot, arch))
 			if err := os.WriteFile(rawPath, []byte("cached raw disk"), 0o644); err != nil {
 				t.Fatalf("seed cache: %v", err)
 			}
 
-			got, err := Ensure(cacheDir, tc.alias)
+			got, err := Ensure(cacheDir, alias)
 			if err != nil {
 				t.Fatalf("Ensure: %v", err)
 			}
@@ -148,5 +156,24 @@ func TestEnsureCacheHit(t *testing.T) {
 				t.Errorf("Ensure = %q, want cached %q", got, rawPath)
 			}
 		})
+	}
+}
+
+// TestEnsureCacheHitLiteralURL locks the unchanged literal-URL branch: a non-alias
+// input keeps its basename-derived cache name (here fbtiny -> fbtiny.raw), the same
+// derivation coord_test.go / orchestrator_fake_test.go depend on.
+func TestEnsureCacheHitLiteralURL(t *testing.T) {
+	cacheDir := t.TempDir()
+	rawPath := filepath.Join(cacheDir, "fbtiny.raw")
+	if err := os.WriteFile(rawPath, []byte("cached raw disk"), 0o644); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	got, err := Ensure(cacheDir, "https://invalid.test/fbtiny")
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if got != rawPath {
+		t.Errorf("Ensure = %q, want cached %q", got, rawPath)
 	}
 }
