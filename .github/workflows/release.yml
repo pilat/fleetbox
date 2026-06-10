@@ -34,3 +34,6 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT with write access to pilat/homebrew-fleetbox so GoReleaser can push the
+          # generated formula to the tap. GITHUB_TOKEN can't write to another repo.
+          CICD_HOMEBREW_GITHUB_TOKEN: ${{ secrets.CICD_HOMEBREW_GITHUB_TOKEN }}

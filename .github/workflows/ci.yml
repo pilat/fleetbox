@@ -82,6 +82,15 @@ jobs:
       - name: Build (linux)
         run: go build ./...
 
+      # Validate the release config (.goreleaser.yaml) on every PR, so a broken or
+      # deprecated GoReleaser setting fails here instead of mid-release on a v* tag.
+      - name: Check GoReleaser config
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: check
+
       - name: Unit tests
         run: make test
 
