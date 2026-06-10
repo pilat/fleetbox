@@ -39,17 +39,15 @@ type catalogEntry struct {
 // downloaded helper (linux self-reexecs the client binary into the holder —
 // ADR-0020). The version is pinned to the current protocol: the ADR-0020
 // inversion bumped the wire protocol to "2", so the helper is helper-v0.2.0; the
-// published helper-v0.1.0 speaks the old protocol and is deliberately NOT served
-// (a downloaded v0.1.0 would be rejected at the bind handshake). The url/sha256
-// are filled in by the release pipeline when the signed helper-v0.2.0 artifact is
-// published; until then the empty sha256 forces use of the FLEETBOX_HELPER
-// override (the dev/offline path), which is honest about "no published helper yet"
-// rather than handing back a protocol-incompatible binary.
+// older helper-v0.1.0 speaks the previous protocol and is rejected at the bind
+// handshake. The url/sha256 are the published, ad-hoc-signed darwin/arm64 release
+// asset (release-helper.yml), checksum-pinned so an unverified entitlement-bearing
+// binary is never run (ADR-0017, R5).
 var catalog = map[string]catalogEntry{
 	"darwin/arm64": {
 		version: "0.2.0",
-		url:     "",
-		sha256:  "",
+		url:     "https://github.com/pilat/fleetbox/releases/download/helper-v0.2.0/fleetbox-helper-darwin-arm64",
+		sha256:  "984e5f5ea0fefc3a304ba37fe8d115bb3c487e32ccdaba4a7b787b7352d7f7d6",
 	},
 }
 
