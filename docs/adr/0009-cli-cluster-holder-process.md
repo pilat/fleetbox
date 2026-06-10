@@ -1,7 +1,7 @@
 # ADR: CLI Clusters Run in One Holder Process (Shared In-Process Network)
 
 **Date:** 2026-06-04
-**Status:** Accepted (superseded on macOS by ADR-0017; still in force on Linux)
+**Status:** Accepted (superseded on macOS by ADR-0017; amended by [ADR-0020](0020-helper-thin-backend-server.md) — one holder per up-group is now the model on both platforms, with the orchestrator client-side)
 
 ## Context
 

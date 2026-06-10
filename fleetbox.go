@@ -5,12 +5,13 @@
 // way it configures the guest once with cloud-init and provides SSH access for
 // testing, through the same backend-neutral Go API.
 //
-// On macOS all Virtualization.framework work runs in a separately distributed,
-// ad-hoc-signed fleetbox-helper subprocess that the library downloads at first
-// use and drives over a unix socket, so the importable package — and therefore
-// the user's test binary — is pure Go and needs neither cgo nor codesign
-// (ADR-0017). On Linux the orchestration runs in-process. The public API below is
-// identical on both.
+// The orchestration runs client-side on both platforms and drives a VM helper
+// over a unix socket; the helper holds only the live VMs/network (ADR-0020). On
+// macOS that helper is a separately distributed, ad-hoc-signed fleetbox-helper
+// subprocess the library downloads at first use, so the importable package — and
+// therefore the user's test binary — is pure Go and needs neither cgo nor codesign
+// (ADR-0017). On Linux the single binary self-reexecs into the helper. The public
+// API below is identical on both.
 //
 // Basic usage:
 //

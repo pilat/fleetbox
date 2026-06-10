@@ -1,7 +1,7 @@
 # ADR: CLI Mode Uses a Re-Exec'd Runner Process per VM
 
 **Date:** 2026-06-03
-**Status:** Accepted (superseded on macOS by ADR-0017; still in force on Linux)
+**Status:** Accepted (superseded on macOS by ADR-0017; amended by [ADR-0020](0020-helper-thin-backend-server.md) — the runner is now one backend-server helper per up-group, driven by a client-side orchestrator, on both platforms)
 
 ## Context
 

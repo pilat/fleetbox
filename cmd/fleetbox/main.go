@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,20 +14,16 @@ import (
 
 	"github.com/pilat/fleetbox"
 	"github.com/pilat/fleetbox/internal/control"
+	"github.com/pilat/fleetbox/internal/orchestrator"
 	"github.com/pilat/fleetbox/internal/store"
 )
 
 func main() {
-	// On Linux the CLI re-execs itself as an in-process holder; on macOS the
-	// holder is the separate downloaded fleetbox-helper and this never fires
-	// (ADR-0017, R9).
-	if ran, err := maybeRunHolder(); err != nil {
-		fmt.Fprintf(os.Stderr, "runner error: %v\n", err)
-		os.Exit(1)
-	} else if ran {
-		return
-	}
-
+	// On Linux a re-exec'd holder (--fleetbox-runner/--fleetbox-reconcile) is
+	// intercepted by internal/holder's init() — linked here via the root fleetbox
+	// package — which runs the holder and exits before this main() is reached. On
+	// macOS the holder is the separate downloaded fleetbox-helper, never this binary
+	// (ADR-0020). So by the time we get here, this is a real CLI invocation.
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
@@ -244,44 +241,30 @@ func upMembers(st *store.Store, members []string, options []fleetbox.Option) err
 
 	if len(running) == 0 {
 		fmt.Printf("Starting %s...\n", strings.Join(missing, ", "))
-		if err := spawnHolder(st, missing, options); err != nil {
+		// Client-side orchestration drives a fresh detached helper (ADR-0020): the
+		// CLI resolves the image, builds disks/seeds/fixtures, and drives boot over
+		// the protocol; the helper persists after this command exits.
+		if err := orchestrator.StartClusterDetached(context.Background(), missing, options...); err != nil {
 			return fmt.Errorf("start cluster: %w", err)
 		}
 		printMembers(st, members)
 		return nil
 	}
 
-	// Some members already run. They must share one holder for the added
-	// members to land on the same network.
+	// Some members already run. They must share one holder for the added members
+	// to land on the same network; AddMember drives the live helper through a
+	// running sibling's socket (reserve + boot-member on the existing network).
 	sibling, err := soleHolder(st, running)
 	if err != nil {
 		return err
 	}
 	for _, m := range missing {
 		fmt.Printf("Adding %s to the cluster...\n", m)
-		if err := control.AddMember(st, sibling, m); err != nil {
+		if err := orchestrator.AddMember(context.Background(), sibling, m, options...); err != nil {
 			return fmt.Errorf("add %s: %w", m, err)
 		}
 	}
 	printMembers(st, members)
-	return nil
-}
-
-// spawnHolder launches a fresh detached holder for the given members and waits
-// for them all to come up. The holder is the downloaded fleetbox-helper on macOS
-// and the re-exec'd CLI on Linux (holderExe); either way its VMs are persistent
-// and outlive this command (ADR-0017, R9).
-func spawnHolder(st *store.Store, names []string, options []fleetbox.Option) error {
-	exe, err := holderExe(st)
-	if err != nil {
-		return err
-	}
-	if _, err := control.Spawn(st, control.SpawnConfig{Exe: exe, Names: names, Options: options}); err != nil {
-		return fmt.Errorf("spawn holder: %w", err)
-	}
-	if _, err := control.WaitMembers(st, names, 5*time.Minute); err != nil {
-		return fmt.Errorf("wait for members: %w", err)
-	}
 	return nil
 }
 

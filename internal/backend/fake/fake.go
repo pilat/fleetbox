@@ -1,53 +1,54 @@
 // Package fake is a dumb, instant, pure-Go implementation of the backend
-// interfaces used to exercise the cross-process coordination layer (control ↔
-// holder ↔ orchestrator) on a CI runner that cannot boot a real VM. It is linked
-// only by internal/orchestrator's backend selector under the fleetbox_fake build
-// tag, so it can never enter a normal `go build ./...` artifact (ADR-0018).
+// interfaces used to exercise the cross-process coordination layer (client ↔
+// helper ↔ holder) on a CI runner that cannot boot a real VM. It is linked only
+// by internal/holder's backend selector under the fleetbox_fake build tag, so it
+// can never enter a normal `go build ./...` artifact (ADR-0018/0020).
 //
-// The orchestrator constructs the backend internally (newBackend → fake.New) and
-// never hands it back, so tests observe behavior through package-global state:
-// Reset, Created, Stopped, NetworksClosed, and the FailCreate fault hook. All of
-// it is mutex-guarded — the in-process tests and the fake helper's goroutines run
-// under the race detector — and tests must Reset between sub-tests, because every
-// orchestrator entry point builds a fresh fake.New that writes the same globals.
+// Since ADR-0020 the fake lives BEHIND the helper: a helper built -tags
+// fleetbox_fake uses fake.New(), and the test drives the real client↔helper
+// protocol against it. The fake runs in the helper's address space, so a test in
+// the client process cannot read in-process globals. Instead, when
+// FLEETBOX_FAKE_RECORD names a file, the fake appends one JSON line per backend
+// call (reserve/create/stop/close) to it; the test reads that file afterwards to
+// assert what the helper's backend actually received (the orchestrator's
+// disk/seed/fixture/MAC/IP threading). Everything else a test needs is observable
+// over the protocol (status: state/IP) and on disk (member dirs, config.json).
 //
 // The fake proves coordination, not that a VM boots: Start/Stop are no-ops,
-// WaitForIP returns an unroutable TEST-NET-3 address, and nothing dials the
-// guest. Real boot, SSH, and IP discovery stay covered by the VM-boot suites.
+// WaitForIP returns an unroutable TEST-NET-3 address, and nothing dials the guest.
+// Its Subnet is empty (mimicking macOS DHCP), so the Linux static-IP allocation
+// path is NOT exercised here — that stays covered by real cloud-hypervisor in
+// vm-linux.yml. Real boot, SSH, and IP discovery stay covered by the VM-boot suites.
 package fake
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
-	"slices"
 	"sync"
 
 	"github.com/pilat/fleetbox/internal/backend"
 )
 
-// EnvFailCreate names the member whose Create the fake should fail. It is the
-// cross-process counterpart of FailCreate: the in-process orchestrator test sets
-// the fault with FailCreate, while the spawned fake helper (a separate address
-// space) reads it from this environment variable.
-const EnvFailCreate = "FLEETBOX_FAKE_FAIL_CREATE"
+const (
+	// EnvFailCreate names the member whose Create the fake should fail. The spawned
+	// fake helper (a separate address space from the test) reads it from the
+	// environment to inject a boot failure for the orchestrator's rollback paths.
+	EnvFailCreate = "FLEETBOX_FAKE_FAIL_CREATE"
+
+	// EnvFakeRecord names a file the fake appends one JSON record per backend call
+	// to. It is the cross-process observation channel: the test sets it, drives the
+	// protocol, then reads the file to assert the args the helper's backend saw.
+	EnvFakeRecord = "FLEETBOX_FAKE_RECORD"
+)
 
 var (
-	// mu guards every package-global below. Both the in-process tests (under
-	// -race) and the helper's holder goroutines read and write them.
+	// mu guards ipCounter and serializes record-file appends (the helper's holder
+	// goroutines run under -race).
 	mu sync.Mutex
-	// created records every backend.Config passed to Create, in order. Recording
-	// the config is what gives real glue coverage: the orchestrator's
-	// FixturePaths/MAC/AssignedIP/disk/seed threading shows up here.
-	created []backend.Config
-	// stopped records the name of every VM whose Stop was called, in order.
-	stopped []string
-	// networksClosed counts fakeNetwork.Close calls.
-	networksClosed int
 	// ipCounter assigns each created VM a distinct TEST-NET-3 host octet.
 	ipCounter int
-	// failName is the member whose Create FailCreate has armed to fail.
-	failName string
 )
 
 var (
@@ -56,33 +57,79 @@ var (
 	_ backend.VM      = (*fakeVM)(nil)
 )
 
-// Backend is the fake backend. It holds no state of its own; all observable
-// effects land in the package globals so tests can inspect them.
+// record is one line in the FLEETBOX_FAKE_RECORD file: the op plus whatever fields
+// that op carries. Tests parse it with a matching local struct (no import of this
+// package needed).
+type record struct {
+	Op           string   `json:"op"`
+	Name         string   `json:"name,omitempty"`
+	DiskPath     string   `json:"disk_path,omitempty"`
+	SeedPath     string   `json:"seed_path,omitempty"`
+	EFIPath      string   `json:"efi_path,omitempty"`
+	FixturePaths []string `json:"fixture_paths,omitempty"`
+	AssignedIP   string   `json:"assigned_ip,omitempty"`
+	MAC          string   `json:"mac,omitempty"`
+	IPHint       string   `json:"ip_hint,omitempty"`
+}
+
+// recordOp appends rec to the FLEETBOX_FAKE_RECORD file as one JSON line. It is a
+// no-op when the env var is unset (the VM-boot path never records). Errors are
+// swallowed: recording is a test aid, never load-bearing for a boot.
+func recordOp(rec record) {
+	path := os.Getenv(EnvFakeRecord)
+	if path == "" {
+		return
+	}
+	line, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	_, _ = f.Write(append(line, '\n'))
+}
+
+// Backend is the fake backend. It holds no state of its own; observable effects
+// land in the FLEETBOX_FAKE_RECORD file and over the protocol.
 type Backend struct{}
 
 // New creates a fake backend.
 func New() *Backend { return &Backend{} }
 
 // CreateNetwork returns a fake network. Its Subnet is empty, mirroring the
-// DHCP/vz path so the orchestrator skips static IP allocation (which is unit
-// tested separately in ipalloc_test.go).
+// DHCP/vz path so no static IP is allocated.
 func (b *Backend) CreateNetwork() (backend.Network, error) {
 	return &fakeNetwork{}, nil
 }
 
-// Create records cfg and returns a fake VM, unless this member's Create has been
-// armed to fail (via FailCreate or EnvFailCreate), in which case it records the
-// attempt and returns an error so the orchestrator's create-failure cleanup path
-// runs. The returned VM is assigned a deterministic, unroutable TEST-NET-3 IP.
+// Create records the config it received and returns a fake VM, unless this
+// member's Create has been armed to fail via EnvFailCreate, in which case it
+// records the attempt and returns an error so the orchestrator's create-failure
+// cleanup path runs. The returned VM is assigned a deterministic, unroutable
+// TEST-NET-3 IP.
 func (b *Backend) Create(cfg backend.Config, _ backend.Network) (backend.VM, error) {
+	recordOp(record{
+		Op:           "create",
+		Name:         cfg.Name,
+		DiskPath:     cfg.DiskPath,
+		SeedPath:     cfg.SeedPath,
+		EFIPath:      cfg.EFIPath,
+		FixturePaths: cfg.FixturePaths,
+		AssignedIP:   cfg.AssignedIP,
+		MAC:          cfg.MAC,
+	})
+
 	mu.Lock()
-	created = append(created, cfg)
-	fail := cfg.Name != "" && (cfg.Name == failName || cfg.Name == os.Getenv(EnvFailCreate))
 	ipCounter++
 	ip := fmt.Sprintf("203.0.113.%d", ipCounter)
 	mu.Unlock()
 
-	if fail {
+	if cfg.Name != "" && cfg.Name == os.Getenv(EnvFailCreate) {
 		return nil, fmt.Errorf("fake backend: forced Create failure for %q", cfg.Name)
 	}
 	return &fakeVM{name: cfg.Name, ip: ip, state: backend.StateStopped, stopped: make(chan struct{})}, nil
@@ -99,64 +146,27 @@ func (b *Backend) SupportsClustering() bool { return true }
 // Reconcile is a no-op: the fake owns no host resources.
 func (b *Backend) Reconcile() error { return nil }
 
-// Reset clears all recorded state and the armed fault. Tests must call it between
-// sub-tests, because each orchestrator entry point builds a fresh fake.New that
-// writes these same globals.
-func Reset() {
-	mu.Lock()
-	defer mu.Unlock()
-	created = nil
-	stopped = nil
-	networksClosed = 0
-	ipCounter = 0
-	failName = ""
-}
-
-// Created returns a copy of every backend.Config passed to Create, in order.
-func Created() []backend.Config {
-	mu.Lock()
-	defer mu.Unlock()
-	return slices.Clone(created)
-}
-
-// Stopped returns a copy of the names of every VM whose Stop was called, in order.
-func Stopped() []string {
-	mu.Lock()
-	defer mu.Unlock()
-	return slices.Clone(stopped)
-}
-
-// NetworksClosed returns how many times a fake network was closed.
-func NetworksClosed() int {
-	mu.Lock()
-	defer mu.Unlock()
-	return networksClosed
-}
-
-// FailCreate arms the fake so that Create for the named member returns an error.
-// It latches: every Create for that member keeps failing until it is disarmed
-// (pass the empty string) or cleared by Reset — matching the cross-process
-// EnvFailCreate path, which stays armed for the helper's lifetime.
-func FailCreate(name string) {
-	mu.Lock()
-	defer mu.Unlock()
-	failName = name
-}
-
 // fakeNetwork is the fake's Network handle.
 type fakeNetwork struct{}
 
 // Close records that the network was released.
 func (n *fakeNetwork) Close() error {
-	mu.Lock()
-	networksClosed++
-	mu.Unlock()
+	recordOp(record{Op: "close"})
 	return nil
 }
 
-// Subnet returns the empty string, the signal the orchestrator uses to skip
-// static IP allocation (the DHCP/vz path).
+// Subnet returns the empty string, the signal to skip static IP allocation (the
+// DHCP/vz path).
 func (n *fakeNetwork) Subnet() string { return "" }
+
+// Reserve records the request and mimics the DHCP/vz path: no static IP, just the
+// deterministic MAC. The fake therefore never exercises Linux static-IP
+// allocation — that path is covered by real cloud-hypervisor in vm-linux.yml.
+func (n *fakeNetwork) Reserve(name, ipHint string) (ip, mac string, err error) {
+	mac = backend.GenerateMAC(name)
+	recordOp(record{Op: "reserve", Name: name, IPHint: ipHint, MAC: mac})
+	return "", mac, nil
+}
 
 // fakeVM is the fake's VM handle. It tracks its state and records its Stop.
 type fakeVM struct {
@@ -183,10 +193,7 @@ func (v *fakeVM) Stop(_ context.Context) error {
 	name := v.name
 	v.mu.Unlock()
 
-	mu.Lock()
-	stopped = append(stopped, name)
-	mu.Unlock()
-
+	recordOp(record{Op: "stop", Name: name})
 	v.stopOnce.Do(func() { close(v.stopped) })
 	return nil
 }

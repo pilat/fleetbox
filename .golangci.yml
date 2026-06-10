@@ -94,6 +94,25 @@ linters:
               desc: opts/control must stay backend-free (ADR-0017 sever — keeps the darwin client cgo/codesign-free)
             - pkg: github.com/pilat/fleetbox/internal/orchestrator
               desc: opts/control must not import the orchestrator (ADR-0017 sever)
+        # The client orchestrator and the remote-proxy backend use the
+        # internal/backend INTERFACE (and drive the helper by RPC), but must never
+        # link a CONCRETE backend — that is what keeps the orchestrator package
+        # hypervisor-free on both platforms after the ADR-0020 inversion. The real
+        # vz/cloud-hypervisor backends live only behind the helper (internal/holder
+        # + cmd/fleetbox-helper). This is a package-import rule, distinct from the
+        # macOS binary sever: on Linux the BINARY still links cloud-hypervisor via
+        # the holder entrypoint (self-reexec), which is allowed — only these
+        # client-side PACKAGES are kept clean.
+        orchestration-no-concrete-backend:
+          list-mode: lax
+          files:
+            - "**/internal/orchestrator/**"
+            - "**/internal/backend/remote/**"
+          deny:
+            - pkg: github.com/pilat/fleetbox/internal/backend/vz
+              desc: the client orchestrator/remote proxy must use the backend interface + remote proxy, never a concrete backend (ADR-0020 sever)
+            - pkg: github.com/pilat/fleetbox/internal/backend/cloudhypervisor
+              desc: the client orchestrator/remote proxy must use the backend interface + remote proxy, never a concrete backend (ADR-0020 sever)
     revive:
       rules:
         - name: blank-imports

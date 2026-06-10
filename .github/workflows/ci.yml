@@ -7,10 +7,10 @@ on:
     branches: [main]
 
 jobs:
-  ci:
-    name: Lint & Test
-    # Must stay on macOS: CI builds and lints the darwin (VZ/cgo) code path. It
-    # cannot boot VZ VMs (no nested virtualization on hosted runners), so VM-boot
+  macos:
+    name: macOS — Lint, Build & Test
+    # Must stay on macOS: CI builds and lints the darwin (VZ/cgo) helper code path.
+    # It cannot boot VZ VMs (no nested virtualization on hosted runners), so VM-boot
     # tests are skipped here — they run via `make test-vm` on M3+/macOS 26+ locally.
     runs-on: macos-26
     steps:
@@ -35,8 +35,8 @@ jobs:
           GOOS: linux
 
       # Lint the files behind the fleetbox_fake build tag (the fake backend, the
-      # ssh-wait seam, the tagged tests), invisible to the default lint above —
-      # equivalent to `make lint-fake` (ADR-0018).
+      # ssh-wait seam, the fake preflight, the tagged tests), invisible to the
+      # default lint above — equivalent to `make lint-fake` (ADR-0018).
       - name: Lint (fake backend)
         uses: golangci/golangci-lint-action@v9
         with:
@@ -46,6 +46,9 @@ jobs:
       - name: Build (darwin, incl. signed VM helper)
         run: go build ./...
 
+      # Cross-build the Linux self-reexec path: the same binary links the
+      # cloud-hypervisor backend + holder and becomes the helper after reexec
+      # (ADR-0020). amd64 + arm64.
       - name: Cross-build (linux amd64 + arm64)
         run: |
           GOOS=linux GOARCH=amd64 go build ./...
@@ -54,10 +57,36 @@ jobs:
       - name: Unit tests
         run: make test
 
-      # The pre-merge gate for teardown + the holder protocol: the cross-process
-      # coordination layer runs against the build-tagged fake backend, with no VM
-      # boot and no codesign, so a teardown/protocol regression fails the PR here
-      # rather than slipping through (the VM-boot suites do not run on PRs). See
-      # ADR-0018; note vm-linux.yml is still push:[main]-only (out of scope here).
+      # Pre-merge gate for teardown + the holder protocol: the client drives a fake
+      # helper over the real protocol (createnetwork/reserve/boot-member/status/stop)
+      # with no VM boot and no codesign, so a regression fails the PR here rather than
+      # slipping through (the VM-boot suites do not run on PRs). ADR-0018/0020.
       - name: Coordination tests (fake backend)
         run: make test-fake
+
+  linux:
+    name: Linux — Build & Coordination
+    # Exercises the Linux client path: the self-reexec helper model and the fake
+    # coordination over the real protocol. No KVM is needed here (the fake boots no
+    # VM) — a real VM boot runs in vm-linux.yml on a KVM-enabled runner.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build (linux)
+        run: go build ./...
+
+      - name: Unit tests
+        run: make test
+
+      # The fake coordination via self-reexec: the test binary re-execs itself into
+      # the fake holder (internal/holder init() interceptor), so the same protocol
+      # gate runs on Linux without a separate helper binary, /dev/kvm, or root.
+      - name: Coordination tests (fake backend, self-reexec)
+        run: make test-fake-linux

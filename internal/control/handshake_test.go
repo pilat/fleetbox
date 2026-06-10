@@ -70,7 +70,7 @@ func TestDialBindRejectsVersionMismatch(t *testing.T) {
 		defer func() { _ = conn.Close() }()
 		buf := make([]byte, 64)
 		_, _ = conn.Read(buf)          // bind command
-		_, _ = conn.Write([]byte("2")) // a version the client does not speak
+		_, _ = conn.Write([]byte("1")) // the superseded text protocol — client speaks "2"
 	}()
 
 	conn, err := dialBind(st, primary)

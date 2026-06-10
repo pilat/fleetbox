@@ -1,15 +1,14 @@
-// Package orchestrator owns the VM lifecycle: it resolves the per-call
-// dependencies (store, SSH key, image, backend), creates the backend network,
-// and boots, waits for, and tears down VMs. It is the only place the
-// internal/backend implementations are wired in, so it is the one package whose
-// import graph carries a hypervisor (vz on darwin, cloud-hypervisor on linux).
+// Package orchestrator owns the VM lifecycle CLIENT-SIDE: it resolves the
+// per-call dependencies (store, SSH key, image), spawns the VM helper, creates
+// the network and boots/waits/tears down members by driving that helper over the
+// control protocol. Since ADR-0020 it runs in the client on BOTH platforms and
+// links NO concrete hypervisor — its backend is the pure-Go remote proxy
+// (internal/backend/remote); the real vz/cloud-hypervisor backend lives only
+// behind the helper (internal/holder). The helper binary is the downloaded signed
+// fleetbox-helper on darwin and a self-reexec of the client binary on linux.
 //
-// On linux the root fleetbox package imports the orchestrator and runs it
-// in-process. On darwin the root package does NOT import it — the orchestrator
-// lives only inside the downloaded, signed fleetbox-helper, and the root package
-// is a thin pure-Go client that drives the helper over a socket (ADR-0017). The
-// clustering-capability gate and the public ErrClustersUnsupported sentinel live
-// in the root package, not here: a caller is expected to have checked
+// The clustering-capability gate and the public ErrClustersUnsupported sentinel
+// live in the root package, not here: a caller is expected to have checked
 // SupportsClustering before adding a second member, so Cluster.Add boots
 // unconditionally.
 package orchestrator
@@ -20,12 +19,15 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/pilat/fleetbox/internal/backend"
+	"github.com/pilat/fleetbox/internal/backend/remote"
+	"github.com/pilat/fleetbox/internal/control"
 	"github.com/pilat/fleetbox/internal/fixture"
 	"github.com/pilat/fleetbox/internal/image"
 	"github.com/pilat/fleetbox/internal/opts"
@@ -42,78 +44,117 @@ const (
 	defaultUser   = "fleetbox"
 )
 
-// VM represents a running virtual machine owned by the orchestrator.
+// VM represents a running virtual machine driven by the orchestrator. Since
+// ADR-0020 the orchestrator is a client: it owns the pure-Go prep and drives a
+// helper over the control protocol via a remote-proxy backend, so VM.backend is a
+// remote handle, not a hypervisor.
 type VM struct {
-	name      string
-	ip        net.IP
-	store     *store.Store
-	sshMgr    *sshkey.Manager
-	backend   backend.VM
-	network   backend.Network
-	config    *store.VM
-	serialLog *os.File
-	// ownsNetwork is true only for a VM created by a bare Start (its network has
-	// a single member), so Destroy may release the network. Cluster members share
-	// a network and leave it false — the Cluster owns its teardown (Cluster.Close).
-	ownsNetwork bool
+	name    string
+	ip      net.IP
+	store   *store.Store
+	sshMgr  *sshkey.Manager
+	backend backend.VM
+	config  *store.VM
+	// session is the owning helper's control session. EVERY VM holds it — even a
+	// cluster member whose Cluster handle the caller discarded (StartN) — so the
+	// session, and the bound control connection inside it, stay reachable while any
+	// VM is referenced; GC collecting the last reference is what reaps a bound
+	// helper (ADR-0017 R4).
+	session *control.Session
+	// ownsSession is true only for a solo VM created by Start: its Stop/Destroy
+	// reaps the helper (stopping the sole member makes it exit). A cluster member
+	// leaves it false — the Cluster reaps via Close.
+	ownsSession bool
 }
 
-// startDeps holds the once-per-call handles shared by every VM in a Start or
-// StartN. They are resolved a single time (resolveStartDeps) and reused for
-// each VM, so a StartN cluster does not redo store/key/image setup per node.
+// startDeps holds the once-per-call client prep shared by every VM in a Start or
+// StartN. They are resolved a single time (resolveStartDeps) and reused for each
+// VM, so a StartN cluster does not redo store/key/image setup per node.
 type startDeps struct {
 	options   *opts.Options
 	store     *store.Store
 	sshMgr    *sshkey.Manager
 	pubKey    string
 	imagePath string
-	backend   backend.Backend
 }
 
-// Cluster is a set of VMs sharing one network, so every member reaches the
-// others by IP — a vmnet SharedMode network on macOS, a Linux bridge on Linux
-// (ADR-0008, ADR-0011). The shared network is a runtime object tied to the
-// Cluster's lifetime — never persisted, so a Cluster is a runtime handle, not
-// on-disk state. Members can be added after creation, which is what lets a CLI
-// holder process grow a live cluster without recreating its network.
+// Cluster is a set of VMs sharing one helper-owned network, so every member
+// reaches the others by IP — a vmnet SharedMode network on macOS, a Linux bridge
+// on Linux (ADR-0008, ADR-0011). The shared network is a runtime object in the
+// helper, tied to the Cluster's lifetime — never persisted. The helper is spawned
+// lazily on the first Add (it needs the first member's name); later Adds reserve
+// and boot on the same live helper.
 type Cluster struct {
 	mu      sync.Mutex
 	deps    *startDeps
+	bound   bool // library (bound, reaped with the caller) vs CLI (detached, persistent)
+	backend backend.Backend
 	network backend.Network
+	session *control.Session
+	primary string
 	vms     []*VM
 }
 
-// ipAssignment is a static address allocated from a backend network's subnet:
-// the host IP plus the gateway and netmask the guest needs to configure its NIC.
-type ipAssignment struct {
-	ip      string
-	gateway string
-	netmask string
-}
-
 // Start creates and boots a new VM with the given name on its own one-member
-// network. If the VM already exists, it boots the existing VM.
+// helper. If the VM already exists, the helper boots the existing VM. The helper
+// is bound (reaped when the caller goes away).
 func Start(ctx context.Context, name string, optFns ...opts.Option) (*VM, error) {
 	deps, err := resolveStartDeps(optFns...)
 	if err != nil {
 		return nil, err
 	}
 
-	// One network for this VM. A single Start yields a one-member network; the
-	// macOS-26 requirement surfaces here, propagated from the backend (ADR-0008).
-	nw, err := deps.backend.CreateNetwork()
+	sess, b, err := spawnHelper(deps.store, []string{name}, true)
 	if err != nil {
+		return nil, err
+	}
+
+	nw, err := b.CreateNetwork()
+	if err != nil {
+		_ = sess.Close()
 		return nil, fmt.Errorf("create network: %w", err)
 	}
 
-	vm, err := startOnNetwork(ctx, name, nw, deps)
+	vm, err := startOnNetwork(ctx, name, nw, deps, b)
 	if err != nil {
-		_ = nw.Close() // sole owner failed to boot: release the network it made
+		_ = sess.Close() // sole owner failed to boot: reap the helper it spawned
 		return nil, err
 	}
-	// A bare Start owns its one-member network, so Destroy may release it.
-	vm.ownsNetwork = true
+	// A bare Start owns its helper, so Stop/Destroy reap it.
+	vm.session = sess
+	vm.ownsSession = true
 	return vm, nil
+}
+
+// spawnHelper launches the VM helper for the given members and returns its
+// control session plus a remote-proxy backend that drives it. The helper binary
+// is the downloaded, signed fleetbox-helper on macOS and a self-reexec of this
+// binary on Linux (helperExe); bound is the library lifetime (reaped with the
+// caller), false the CLI's detached/persistent mode.
+func spawnHelper(st *store.Store, names []string, bound bool) (*control.Session, backend.Backend, error) {
+	exe, err := helperExe(st)
+	if err != nil {
+		return nil, nil, err
+	}
+	sess, err := control.Spawn(st, control.SpawnConfig{Exe: exe, Names: names, Bound: bound})
+	if err != nil {
+		return nil, nil, fmt.Errorf("spawn helper: %w", err)
+	}
+	return sess, remote.New(st, names[0]), nil
+}
+
+// deriveNetworkConfig builds the seed's static network-config from the helper's
+// subnet and the member's reserved IP/MAC: the gateway is the subnet's .1 and the
+// netmask comes from its prefix length (Linux static-addressing path).
+func deriveNetworkConfig(subnetCIDR, ip, mac string) (*seed.NetworkConfig, error) {
+	prefix, err := netip.ParsePrefix(subnetCIDR)
+	if err != nil {
+		return nil, fmt.Errorf("parse subnet %q: %w", subnetCIDR, err)
+	}
+	prefix = prefix.Masked()
+	gateway := prefix.Addr().Next()
+	netmask := net.IP(net.CIDRMask(prefix.Bits(), 32)).String()
+	return &seed.NetworkConfig{MAC: mac, IP: ip, Gateway: gateway.String(), Netmask: netmask}, nil
 }
 
 // resolveStartDeps performs the once-per-call setup shared by every VM in a
@@ -153,18 +194,12 @@ func resolveStartDeps(optFns ...opts.Option) (*startDeps, error) {
 		return nil, fmt.Errorf("ensure image: %w", err)
 	}
 
-	b, err := newBackend()
-	if err != nil {
-		return nil, err
-	}
-
 	return &startDeps{
 		options:   options,
 		store:     st,
 		sshMgr:    sshMgr,
 		pubKey:    pubKey,
 		imagePath: imagePath,
-		backend:   b,
 	}, nil
 }
 
@@ -173,32 +208,51 @@ func resolveStartDeps(optFns ...opts.Option) (*startDeps, error) {
 // already-created network nw. Shared setup is done once by resolveStartDeps and
 // passed in via deps. The returned VM retains nw so the network is not released
 // by GC while the VM lives (ADR-0008, R3).
-func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *startDeps) (*VM, error) {
+func startOnNetwork(
+	ctx context.Context, name string, nw backend.Network, deps *startDeps, b backend.Backend,
+) (*VM, error) {
 	st := deps.store
 	options := deps.options
 
+	existing := st.Exists(name)
 	var vmConfig *store.VM
-	if st.Exists(name) {
-		// Load existing VM config
+	if existing {
 		loaded, err := st.Load(name)
 		if err != nil {
 			return nil, fmt.Errorf("load vm config: %w", err)
 		}
 		vmConfig = loaded
-	} else {
+	}
+
+	// Reserve this member's address on the helper-owned network BEFORE building the
+	// seed (Decision 5). A previously-stored IP (existing VM) rides along as a hint
+	// so a stopped member keeps its address while its /24 stays free; a new VM
+	// passes no hint. The helper returns the MAC it will set on the NIC, so the
+	// seed's network-config and the NIC agree without both sides recomputing
+	// (Decision 6). On the DHCP/vz path the IP comes back empty.
+	var ipHint string
+	if vmConfig != nil {
+		ipHint = vmConfig.IP
+	}
+	reservedIP, mac, err := nw.Reserve(name, ipHint)
+	if err != nil {
+		return nil, fmt.Errorf("reserve address: %w", err)
+	}
+
+	if !existing {
 		// Fixtures are frozen at birth: validated, absolutized, and labeled once
 		// here, then persisted and re-applied verbatim on every later boot
-		// (ADR-0015). Validation is a create-time concern only — see the loaded
-		// branch above, which never re-checks the host dirs.
+		// (ADR-0015). Validation is a create-time concern only — the existing
+		// branch above never re-checks the host dirs.
 		fixtures, err := toStoreFixtures(options.Fixtures)
 		if err != nil {
 			return nil, fmt.Errorf("prepare fixtures: %w", err)
 		}
 
-		// Create new VM
 		vmConfig = &store.VM{
 			Name:      name,
-			MAC:       backend.GenerateMAC(name),
+			MAC:       mac,
+			IP:        reservedIP, // empty on the DHCP/vz path
 			CPUs:      options.CPUs,
 			MemoryMB:  options.MemGB * 1024,
 			DiskMB:    options.DiskGB * 1024,
@@ -207,22 +261,15 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 			Fixtures:  fixtures,
 		}
 
-		// On a backend that assigns static addresses (Linux), allocate this VM's
-		// IP from the network's subnet now, before the seed is written, and
-		// persist it so reboots and re-joining cluster members keep it. A
-		// DHCP backend (vz) reports an empty subnet and skips this entirely.
+		// On a static-addressing backend (Linux, non-empty subnet) bake the
+		// reserved IP plus the gateway/netmask derived from the subnet into the
+		// seed's network-config; a DHCP backend (vz) reports an empty subnet and
+		// the guest stays on DHCP with no network-config emitted.
 		var netCfg *seed.NetworkConfig
 		if subnet := nw.Subnet(); subnet != "" {
-			assignment, err := allocateIP(st, subnet)
+			netCfg, err = deriveNetworkConfig(subnet, reservedIP, mac)
 			if err != nil {
-				return nil, fmt.Errorf("allocate ip: %w", err)
-			}
-			vmConfig.IP = assignment.ip
-			netCfg = &seed.NetworkConfig{
-				MAC:     vmConfig.MAC,
-				IP:      assignment.ip,
-				Gateway: assignment.gateway,
-				Netmask: assignment.netmask,
+				return nil, err
 			}
 		}
 
@@ -241,7 +288,7 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 		// first create, and persist via the guest's /etc/fstab — so a reboot
 		// re-mounts them without re-running cloud-init, the same way the labels
 		// stay stable while the images are rebuilt each boot (ADR-0015). On Linux
-		// it also carries the static network-config allocated above; on macOS the
+		// it also carries the static network-config built above; on macOS the
 		// guest stays on DHCP and that config is omitted.
 		seedPath := st.SeedPath(name)
 		seedCfg := seed.Config{
@@ -271,50 +318,45 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 		fixturePaths[i] = imgPath
 	}
 
-	// Create serial log file (owned by VM, closed in Stop/Destroy)
-	serialLog, err := os.OpenFile(st.SerialLogPath(name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("open serial log: %w", err)
-	}
-
-	// Create backend VM on the shared network
+	// Create backend VM on the shared network. The backend opens the serial log
+	// itself from SerialLogPath — the file is VM state owned by the backend (the
+	// helper, once the orchestrator moves client-side), not the orchestrator
+	// (Decision 7); it is released by backend.Stop on every teardown path below.
 	backendCfg := backend.Config{
-		Name:        name,
-		DiskPath:    st.DiskPath(name),
-		SeedPath:    st.SeedPath(name),
-		EFIPath:     st.EFIPath(name),
-		MAC:         vmConfig.MAC,
-		CPUs:        vmConfig.CPUs,
-		MemoryBytes: uint64(vmConfig.MemoryMB) * 1024 * 1024,
-		SerialOut:   serialLog,
+		Name:          name,
+		DiskPath:      st.DiskPath(name),
+		SeedPath:      st.SeedPath(name),
+		EFIPath:       st.EFIPath(name),
+		MAC:           vmConfig.MAC,
+		CPUs:          vmConfig.CPUs,
+		MemoryBytes:   uint64(vmConfig.MemoryMB) * 1024 * 1024,
+		SerialLogPath: st.SerialLogPath(name),
 		// Re-attach the read-only fixture images built above, so both a freshly
 		// created and a rebooted VM get identical fixtures (ADR-0015).
 		FixturePaths: fixturePaths,
 		// The persisted static IP (empty on the DHCP/vz path); the Linux backend
-		// returns it from WaitForIP after a reachability probe.
+		// returns it from WaitForIP after a reachability probe. With the remote
+		// proxy the helper ignores cfg.MAC/AssignedIP (it holds them from the
+		// reservation it made) — they are set here only for the in-helper backend.
 		AssignedIP: vmConfig.IP,
 	}
-	backendVM, err := deps.backend.Create(backendCfg, nw)
+	backendVM, err := b.Create(backendCfg, nw)
 	if err != nil {
-		_ = serialLog.Close()
 		return nil, fmt.Errorf("create backend vm: %w", err)
 	}
 
 	// Boot the VM
 	if err := backendVM.Start(ctx); err != nil {
-		_ = backendVM.Stop(ctx) // release any tap/process a partial boot left behind
-		_ = serialLog.Close()
+		_ = backendVM.Stop(ctx) // release any tap/process/serial a partial boot left behind
 		return nil, fmt.Errorf("start vm: %w", err)
 	}
 
 	vm := &VM{
-		name:      name,
-		store:     st,
-		sshMgr:    deps.sshMgr,
-		backend:   backendVM,
-		network:   nw,
-		config:    vmConfig,
-		serialLog: serialLog,
+		name:    name,
+		store:   st,
+		sshMgr:  deps.sshMgr,
+		backend: backendVM,
+		config:  vmConfig,
 	}
 
 	// Wait for IP. Discovery is the backend's job (vz parses dhcpd_leases by
@@ -326,13 +368,11 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 	cancel()
 	if err != nil {
 		_ = backendVM.Stop(ctx)
-		_ = serialLog.Close()
 		return nil, fmt.Errorf("wait for ip: %w", err)
 	}
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		_ = backendVM.Stop(ctx)
-		_ = serialLog.Close()
 		return nil, fmt.Errorf("backend returned invalid IP %q", ipStr)
 	}
 	vm.ip = ip
@@ -343,7 +383,6 @@ func startOnNetwork(ctx context.Context, name string, nw backend.Network, deps *
 	if !skipSSHWait() {
 		if err := vm.waitForSSH(ctx, 2*time.Minute); err != nil {
 			_ = backendVM.Stop(ctx)
-			_ = serialLog.Close()
 			return nil, fmt.Errorf("wait for ssh: %w", err)
 		}
 	}
@@ -406,55 +445,6 @@ func toSeedFixtures(fixtures []store.Fixture) []seed.Fixture {
 	return out
 }
 
-// allocateIP picks the lowest free host address in subnet for a new VM. The
-// gateway (.1), network, and broadcast addresses are reserved, as are the IPs
-// already persisted to other VMs' configs in the same subnet — so members of a
-// cluster get distinct, stable addresses without any cluster-level state. It is
-// only called on backends that assign static IPs (Linux); vz reports no subnet.
-func allocateIP(st *store.Store, subnetCIDR string) (ipAssignment, error) {
-	prefix, err := netip.ParsePrefix(subnetCIDR)
-	if err != nil {
-		return ipAssignment{}, fmt.Errorf("parse subnet %q: %w", subnetCIDR, err)
-	}
-	prefix = prefix.Masked()
-
-	gateway := prefix.Addr().Next() // .1
-	broadcast := lastAddr(prefix)
-
-	taken := map[netip.Addr]bool{gateway: true}
-	names, err := st.List()
-	if err != nil {
-		return ipAssignment{}, fmt.Errorf("list vms: %w", err)
-	}
-	for _, n := range names {
-		cfg, err := st.Load(n)
-		if err != nil || cfg.IP == "" {
-			continue
-		}
-		if a, err := netip.ParseAddr(cfg.IP); err == nil && prefix.Contains(a) {
-			taken[a] = true
-		}
-	}
-
-	netmask := net.IP(net.CIDRMask(prefix.Bits(), 32)).String()
-	for candidate := gateway.Next(); prefix.Contains(candidate) && candidate != broadcast; candidate = candidate.Next() {
-		if !taken[candidate] {
-			return ipAssignment{ip: candidate.String(), gateway: gateway.String(), netmask: netmask}, nil
-		}
-	}
-
-	return ipAssignment{}, fmt.Errorf("no free IP in subnet %s", subnetCIDR)
-}
-
-// lastAddr returns the broadcast (all host bits set) address of an IPv4 prefix.
-func lastAddr(p netip.Prefix) netip.Addr {
-	bytes := p.Addr().As4()
-	for i := p.Bits(); i < 32; i++ {
-		bytes[i/8] |= 1 << (7 - uint(i%8))
-	}
-	return netip.AddrFrom4(bytes)
-}
-
 // Name returns the VM name.
 func (v *VM) Name() string {
 	return v.name
@@ -481,34 +471,27 @@ func (v *VM) SSH(_ context.Context, cmd string) (string, error) {
 	return out, nil
 }
 
-// Stop gracefully shuts down the VM. The disk is preserved.
+// Stop gracefully shuts down the VM via the helper. The disk is preserved; the
+// helper closes its own serial log file as part of Stop (Decision 7). For a solo
+// VM this stops the helper's only member, so the helper exits, and ownsSession
+// reaps it.
 func (v *VM) Stop(ctx context.Context) error {
-	err := v.backend.Stop(ctx)
-	if v.serialLog != nil {
-		_ = v.serialLog.Close()
-		v.serialLog = nil
-	}
-	if err != nil {
+	if err := v.backend.Stop(ctx); err != nil {
 		return fmt.Errorf("stop vm: %w", err)
 	}
-
+	if v.ownsSession && v.session != nil {
+		_ = v.session.Close()
+	}
 	return nil
 }
 
-// Destroy stops the VM and removes all its files.
+// Destroy stops the VM and removes all its files. The backend's Stop polls the
+// member's pidfile, so the VM is confirmed down before its store files are
+// deleted (R6).
 func (v *VM) Destroy(ctx context.Context) error {
 	_ = v.backend.Stop(ctx)
-
-	if v.serialLog != nil {
-		_ = v.serialLog.Close()
-		v.serialLog = nil
-	}
-
-	// Release the network only for a sole-owner VM; a cluster member's network is
-	// shared and torn down by Cluster.Close (R3). No-op on macOS.
-	if v.ownsNetwork && v.network != nil {
-		_ = v.network.Close()
-		v.network = nil
+	if v.ownsSession && v.session != nil {
+		_ = v.session.Close()
 	}
 
 	// Idempotent: a second Destroy finds the files already gone and returns nil
@@ -537,55 +520,74 @@ func (v *VM) waitForSSH(_ context.Context, timeout time.Duration) error {
 	return nil
 }
 
-// NewCluster creates a cluster's shared network but boots no VMs. Use Add to
-// bring members up on it. Shared setup (store, SSH key, image, backend) runs once
-// here and is reused for every Add.
+// NewCluster prepares a cluster client; no helper is spawned until the first Add
+// (the helper is launched on the first member's name). Shared client prep (store,
+// SSH key, image) runs once here and is reused for every Add. The helper is bound
+// — reaped when the caller goes away — matching the library lifetime.
 func NewCluster(optFns ...opts.Option) (*Cluster, error) {
+	return newCluster(true, optFns...)
+}
+
+// NewClusterDetached is NewCluster for the CLI: the helper is spawned detached so
+// it persists after the command exits, and reconnect-by-name addresses members
+// later (ls/ssh/down). Cluster.Close releases the persistent helper rather than
+// reaping it.
+func NewClusterDetached(optFns ...opts.Option) (*Cluster, error) {
+	return newCluster(false, optFns...)
+}
+
+func newCluster(bound bool, optFns ...opts.Option) (*Cluster, error) {
 	deps, err := resolveStartDeps(optFns...)
 	if err != nil {
 		return nil, err
 	}
-
-	nw, err := deps.backend.CreateNetwork()
-	if err != nil {
-		return nil, fmt.Errorf("create network: %w", err)
-	}
-
-	return &Cluster{deps: deps, network: nw}, nil
+	return &Cluster{deps: deps, bound: bound}, nil
 }
 
-// Close releases the cluster's shared network. Call it once every member has been
-// stopped or destroyed — on Linux it tears down the bridge and egress rules; on
-// macOS it is a no-op (the vmnet network is released by GC). It is idempotent.
-func (c *Cluster) Close() error {
-	c.mu.Lock()
-	nw := c.network
-	c.network = nil
-	c.mu.Unlock()
-
-	if nw == nil {
+// ensureHelper spawns the cluster's single helper on the first member and creates
+// its shared network, memoized so every later Add reuses the same live helper and
+// network. The caller holds c.mu.
+func (c *Cluster) ensureHelper(name string) error {
+	if c.session != nil {
 		return nil
 	}
-	if err := nw.Close(); err != nil {
-		return fmt.Errorf("close cluster network: %w", err)
+	sess, b, err := spawnHelper(c.deps.store, []string{name}, c.bound)
+	if err != nil {
+		return err
 	}
+	nw, err := b.CreateNetwork()
+	if err != nil {
+		_ = sess.Close()
+		return fmt.Errorf("create network: %w", err)
+	}
+	c.session = sess
+	c.backend = b
+	c.network = nw
+	c.primary = name
 	return nil
 }
 
-// Add boots an additional VM on the cluster's shared network and registers it as
-// a member. The new VM reaches every existing member by IP. The
+// Add boots an additional VM on the cluster's shared helper and registers it as a
+// member. The first Add spawns the helper; later Adds reserve and boot on the same
+// live network, so the new VM reaches every existing member by IP. The
 // clustering-capability gate lives in the root package's Cluster.Add, which is
-// expected to have rejected a second member on a non-clustering backend before
+// expected to have rejected a second member on a non-clustering host before
 // reaching here, so Add boots unconditionally.
 func (c *Cluster) Add(ctx context.Context, name string) (*VM, error) {
-	vm, err := startOnNetwork(ctx, name, c.network, c.deps)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.ensureHelper(name); err != nil {
+		return nil, err
+	}
+	vm, err := startOnNetwork(ctx, name, c.network, c.deps, c.backend)
 	if err != nil {
 		return nil, err
 	}
-
-	c.mu.Lock()
+	// Members share, but do not own, the cluster's session — the Cluster reaps it
+	// via Close (or GC, once the last member is unreferenced).
+	vm.session = c.session
 	c.vms = append(c.vms, vm)
-	c.mu.Unlock()
 	return vm, nil
 }
 
@@ -597,32 +599,91 @@ func (c *Cluster) VMs() []*VM {
 	return slices.Clone(c.vms)
 }
 
-// SupportsClustering reports whether this cluster's backend can interconnect VMs
-// on its shared network. It is false only on macOS older than 26, where VZ NAT
-// isolates VMs from one another (ADR-0008, ADR-0012); the root package's gate
-// consults it before booting a second member.
-func (c *Cluster) SupportsClustering() bool {
-	return c.deps.backend.SupportsClustering()
-}
-
-// Prune reclaims the inert host resources a fleetbox holder leaves behind if it
-// dies without running its teardown — on Linux, orphaned bridges, taps, and
-// firewall rules. On macOS it is a no-op (vmnet owns its state).
-func Prune() error {
-	b, err := newBackend()
+// StartClusterDetached boots the named VMs as one interconnected cluster on a
+// single detached helper that persists after this process exits (the CLI's `up`).
+// It is all-or-nothing: on any member's failure it destroys the members already
+// started and releases the helper. On success the helper is left running and the
+// members are addressed later by name (ls/ssh/down).
+func StartClusterDetached(ctx context.Context, names []string, optFns ...opts.Option) error {
+	c, err := NewClusterDetached(optFns...)
 	if err != nil {
 		return err
 	}
-	if err := b.Reconcile(); err != nil {
-		return fmt.Errorf("prune: %w", err)
+	for _, name := range names {
+		if _, err := c.Add(ctx, name); err != nil {
+			for _, vm := range c.VMs() {
+				_ = vm.Destroy(ctx)
+			}
+			_ = c.Close()
+			return fmt.Errorf("start %s: %w", name, err)
+		}
+	}
+	// Detached: leave the helper running and do not reap it — the members outlive
+	// this command (cattle-with-persistence).
+	return nil
+}
+
+// AddMember boots a new member onto the LIVE helper already serving `sibling`,
+// without spawning a new one — how a stopped node re-joins a running cluster's
+// network instead of getting an isolated one of its own. It drives the live helper
+// through the sibling's socket: createnetwork is idempotent (returns the existing
+// subnet), then the member is reserved and booted on that network.
+func AddMember(ctx context.Context, sibling, name string, optFns ...opts.Option) error {
+	deps, err := resolveStartDeps(optFns...)
+	if err != nil {
+		return err
+	}
+	b := remote.New(deps.store, sibling)
+	nw, err := b.CreateNetwork()
+	if err != nil {
+		return fmt.Errorf("reach cluster network via %s: %w", sibling, err)
+	}
+	if _, err := startOnNetwork(ctx, name, nw, deps, b); err != nil {
+		return fmt.Errorf("add member %s: %w", name, err)
 	}
 	return nil
 }
 
-// NestedVirtSupported reports whether nested virtualization is available on this
-// host, asking the backend directly. On darwin it is the authoritative VZ check
-// (the root client uses a pure-Go heuristic to avoid downloading the helper just
-// to skip a test); on linux it probes /dev/kvm and the KVM nested parameter.
-func NestedVirtSupported() bool {
-	return nestedVirtSupported()
+// Close releases the cluster's helper. For a bound (library) cluster it closes the
+// control connection and reaps the helper, which tears down the shared network
+// helper-side; for a detached (CLI) cluster it releases the persistent helper. It
+// is idempotent.
+func (c *Cluster) Close() error {
+	c.mu.Lock()
+	sess := c.session
+	c.session = nil
+	c.backend = nil
+	c.network = nil
+	c.primary = ""
+	c.vms = nil
+	c.mu.Unlock()
+
+	if sess != nil {
+		_ = sess.Close()
+	}
+	return nil
+}
+
+// Prune reclaims the inert host network state a helper leaves behind if it dies
+// without running its teardown — on Linux, orphaned bridges, taps, firewall rules,
+// and a left-on ip_forward. It spawns a short-lived helper that reconciles and
+// exits, because reconcile needs CAP_NET_ADMIN (it runs ip/iptables), which the
+// Linux helper carries. On macOS the root's prune is a no-op and never calls this
+// (vmnet owns its own state) — ADR-0013/0020.
+func Prune() error {
+	st, err := store.New()
+	if err != nil {
+		return fmt.Errorf("init store: %w", err)
+	}
+	exe, err := helperExe(st)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(exe, control.ReconcileFlag)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("prune: %w", err)
+	}
+	return nil
 }

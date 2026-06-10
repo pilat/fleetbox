@@ -4,7 +4,9 @@
 **Status:** Accepted (superseded in part by [ADR-0019](0019-pin-cloud-images.md) —
 cloud images are now checksum-pinned to dated snapshots exactly like the binaries
 below; the "unlike cloud images, which may stay unpinned for latest" aside in
-Decision 3 no longer holds.)
+Decision 3 no longer holds. Amended by [ADR-0020](0020-helper-thin-backend-server.md):
+the cloud-hypervisor backend now runs inside a helper process (reached by self-reexec)
+rather than in-process, driven by a client-side orchestrator.)
 
 ## Context
 

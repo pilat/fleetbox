@@ -1,27 +1,22 @@
-//go:build darwin && arm64 && !fleetbox_fake
+//go:build darwin && arm64
 
 package orchestrator
 
 import (
-	"github.com/pilat/fleetbox/internal/backend"
-	"github.com/pilat/fleetbox/internal/backend/vz"
+	"fmt"
+
+	"github.com/pilat/fleetbox/internal/helperdist"
+	"github.com/pilat/fleetbox/internal/store"
 )
 
-func newBackend() (backend.Backend, error) {
-	return vz.New(), nil
-}
-
-// preflight is a no-op on macOS: the helper holds the virtualization entitlement
-// and vmnet needs no special host capability. The authoritative VZ capability
-// check happens when the VM boots.
-func preflight() error {
-	return nil
-}
-
-// nestedVirtSupported asks Virtualization.framework directly. It is the
-// authoritative check, run inside the helper; the root darwin client uses a
-// pure-Go heuristic instead so it can decide to skip a test without downloading
-// the helper (ADR-0017, R7).
-func nestedVirtSupported() bool {
-	return vz.New().NestedVirtSupported()
+// helperExe returns the downloaded, signed fleetbox-helper the client spawns as
+// the VM holder, fetching it on first use (or honoring FLEETBOX_HELPER). This is
+// the macOS sever: the client links no vz — only the path to the signed helper,
+// which carries the entitlement (ADR-0017/0020).
+func helperExe(st *store.Store) (string, error) {
+	path, err := helperdist.Ensure(st)
+	if err != nil {
+		return "", fmt.Errorf("resolve helper: %w", err)
+	}
+	return path, nil
 }
