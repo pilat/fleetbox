@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +38,11 @@ func (m *Manager) EnsureKey() (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("read public key: %w", err)
 		}
+		// Repair ownership on EVERY run, not just fresh creation: a key written
+		// root-owned by an earlier run (or a pre-fix /root/.fleetbox) must still
+		// be handed back to the invoking user, or a non-root `ssh -i` can't read
+		// it (ADR-0023). Idempotent and cheap.
+		m.chownToInvoker()
 		return strings.TrimSpace(string(pubKeyBytes)), nil
 	}
 
@@ -73,6 +79,7 @@ func (m *Manager) EnsureKey() (string, error) {
 		return "", fmt.Errorf("write public key: %w", err)
 	}
 
+	m.chownToInvoker()
 	return pubKeyStr, nil
 }
 
@@ -180,4 +187,28 @@ func (m *Manager) WaitForSSH(addr, user string, timeout time.Duration) error {
 func (m *Manager) DialIP(ip net.IP, user string, timeout time.Duration) (*Client, error) {
 	addr := net.JoinHostPort(ip.String(), "22")
 	return m.Dial(addr, user, timeout)
+}
+
+// chownToInvoker hands the freshly created (or repaired) key pair back to the user
+// who invoked the CLI via sudo, so a non-root `ssh -i` can read the 0600 private
+// key (ADR-0023). It is a no-op unless the process is root with SUDO_UID/SUDO_GID
+// set — i.e. a normal user, or macOS, does nothing — and best-effort: a chown
+// failure must not break key setup. It changes ONLY ownership (mode stays 0600),
+// because ssh refuses a world-readable key, so loosening the mode is not an option;
+// and only the two key files, never the base dir (decision 6 — 0755 already lets
+// the user traverse to them).
+func (m *Manager) chownToInvoker() {
+	if os.Geteuid() != 0 {
+		return
+	}
+	uid, err := strconv.Atoi(os.Getenv("SUDO_UID"))
+	if err != nil {
+		return
+	}
+	gid, err := strconv.Atoi(os.Getenv("SUDO_GID"))
+	if err != nil {
+		return
+	}
+	_ = os.Chown(m.keyPath, uid, gid)
+	_ = os.Chown(m.keyPath+".pub", uid, gid)
 }

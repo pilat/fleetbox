@@ -259,7 +259,20 @@ func (h *holder) listenControl(primary string) net.Listener {
 		fmt.Fprintf(os.Stderr, "listen control socket: %v\n", err)
 		return nil
 	}
+	chmodClientSocket(sockPath)
 	return ln
+}
+
+// chmodClientSocket loosens a holder-created unix socket to 0666 when the holder
+// runs as root, so a non-root client (`ls`/`ssh`/`cp` and the library's bound
+// control connection) can connect — a unix-socket connect needs WRITE permission,
+// and a root umask leaves the socket 0755 → EACCES for the user (ADR-0023).
+// Best-effort and a no-op off-root; 0666 on a local-only dev socket is an accepted
+// tradeoff (noted in ADR-0023).
+func chmodClientSocket(path string) {
+	if os.Geteuid() == 0 {
+		_ = os.Chmod(path, 0o666)
+	}
 }
 
 // serveControl accepts connections on the holder-wide control socket and hands
@@ -338,6 +351,7 @@ func (h *holder) register(name string) error {
 	if err != nil {
 		return fmt.Errorf("listen socket: %w", err)
 	}
+	chmodClientSocket(sockPath)
 
 	if err := WritePidfile(h.st, name); err != nil {
 		_ = ln.Close()

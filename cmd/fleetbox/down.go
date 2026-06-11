@@ -34,6 +34,11 @@ preserving their disks. Bring them back with up. Use --all to stop every VM.`,
 }
 
 func runDown(positional []string, all bool) error {
+	// down drives teardown of root-owned bridges/taps, so it needs root (ADR-0023).
+	if err := ensurePrivileged(); err != nil {
+		return err
+	}
+
 	// --all means "every VM"; combining it with explicit names is contradictory and
 	// silently widening scope to all is a footgun, so reject it.
 	if all && len(positional) > 0 {

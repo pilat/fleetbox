@@ -39,6 +39,14 @@ anything. Use --all to remove every VM and -f/--force to skip the prompt.`,
 }
 
 func runRm(positional []string, all, force bool) error {
+	// rm deletes root-owned files (disk.raw) and drives holder teardown, so it needs
+	// root. Elevation re-execs the whole command, so the user sees the sudo prompt
+	// first and the [y/N] confirmation afterward (authenticate, then confirm) — an
+	// accepted ordering (ADR-0023).
+	if err := ensurePrivileged(); err != nil {
+		return err
+	}
+
 	// --all means "every VM"; combining it with explicit names is contradictory and
 	// silently widening scope to all is a footgun, so reject it.
 	if all && len(positional) > 0 {

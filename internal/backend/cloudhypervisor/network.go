@@ -80,7 +80,7 @@ func (b *Backend) CreateNetwork() (backend.Network, error) {
 	if out, err := runIP("link", "add", bridge, "type", "bridge"); err != nil {
 		_ = n.store.delete(bridge)
 		if isPermissionDenied(out) {
-			return nil, fmt.Errorf("create bridge (need CAP_NET_ADMIN; run as root or grant the capability): %w", err)
+			return nil, fmt.Errorf("create bridge (needs root): %w", err)
 		}
 		return nil, fmt.Errorf("create bridge %s: %w", bridge, err)
 	}

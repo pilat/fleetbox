@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -48,9 +49,24 @@ type Store struct {
 	baseDir string
 }
 
-// New creates a Store at the default location (~/.fleetbox).
+// New creates a Store at the default location (<home>/.fleetbox). When the process
+// is root via sudo it resolves the INVOKING user's home, not /root, so state never
+// splits between /root/.fleetbox and ~/.fleetbox across an auto-elevated `up` and a
+// non-root `ls`/`ssh` (ADR-0023). This is the single place the base-dir rule lives,
+// so every process — CLI, orchestrator, holder — agrees.
 func New() (*Store, error) {
-	home, err := os.UserHomeDir()
+	home, err := resolveBaseHome(
+		os.Geteuid(),
+		os.Getenv("SUDO_USER"),
+		func(name string) (string, error) {
+			u, err := user.Lookup(name)
+			if err != nil {
+				return "", fmt.Errorf("lookup user %q: %w", name, err)
+			}
+			return u.HomeDir, nil
+		},
+		os.UserHomeDir,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("get home dir: %w", err)
 	}
@@ -292,6 +308,30 @@ func (s *Store) SocketPath(name string) string {
 // under the sun_path limit.
 func (s *Store) ControlSocketPath(primary string) string {
 	return filepath.Join(s.baseDir, "run", sockHash(primary)+".ctl")
+}
+
+// resolveBaseHome decides which home directory roots the store. When the process
+// is root AND was invoked via sudo (euid==0 and SUDO_USER set), it resolves the
+// invoking user's home via lookupHome (a passwd lookup), so root-created state
+// lands in ~alice/.fleetbox, not /root/.fleetbox — the one source of truth a later
+// non-root `ls`/`ssh` reads (ADR-0023). It deliberately does NOT trust $HOME in the
+// root case: a manual `sudo fleetbox` leaves HOME=/root while SUDO_USER=alice, so
+// $HOME would land state in the wrong place. Everything else — non-root, or root
+// without SUDO_USER, or a failed/empty passwd lookup — falls back to fallbackHome
+// (os.UserHomeDir, i.e. $HOME) and never errors on the lookup. The two home sources
+// are injected so this is unit-testable off-root on any platform.
+func resolveBaseHome(
+	euid int,
+	sudoUser string,
+	lookupHome func(string) (string, error),
+	fallbackHome func() (string, error),
+) (string, error) {
+	if euid == 0 && sudoUser != "" {
+		if home, err := lookupHome(sudoUser); err == nil && home != "" {
+			return home, nil
+		}
+	}
+	return fallbackHome()
 }
 
 // sockHash maps a VM name to a short, filesystem-safe token (the first 16 hex of

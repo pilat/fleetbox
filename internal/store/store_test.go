@@ -1,12 +1,107 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestResolveBaseHome pins the one place the SUDO_USER base-dir rule lives
+// (ADR-0023): root-via-sudo resolves the invoking user's passwd home; every other
+// case falls back to $HOME without erroring on a lookup miss. Runs off-root on
+// darwin/arm64 — the only automated coverage of this rule.
+func TestResolveBaseHome(t *testing.T) {
+	const aliceHome = "/home/alice"
+	const fallback = "/fallback/home"
+
+	lookupOK := func(string) (string, error) { return aliceHome, nil }
+	lookupErr := func(string) (string, error) { return "", errors.New("no such user") }
+	lookupEmpty := func(string) (string, error) { return "", nil }
+	fallbackOK := func() (string, error) { return fallback, nil }
+	fallbackErr := func() (string, error) { return "", errors.New("$HOME unset") }
+
+	cases := []struct {
+		name     string
+		euid     int
+		sudoUser string
+		lookup   func(string) (string, error)
+		fallback func() (string, error)
+		want     string
+		wantErr  bool
+	}{
+		{
+			name:     "root via sudo → invoking user's home",
+			euid:     0,
+			sudoUser: "alice",
+			lookup:   lookupOK,
+			fallback: fallbackOK,
+			want:     aliceHome,
+		},
+		{
+			name:     "non-root → fallback",
+			euid:     1000,
+			sudoUser: "alice",
+			lookup:   lookupOK,
+			fallback: fallbackOK,
+			want:     fallback,
+		},
+		{
+			name:     "root without SUDO_USER → fallback",
+			euid:     0,
+			sudoUser: "",
+			lookup:   lookupOK,
+			fallback: fallbackOK,
+			want:     fallback,
+		},
+		{
+			name:     "lookup error → fallback",
+			euid:     0,
+			sudoUser: "alice",
+			lookup:   lookupErr,
+			fallback: fallbackOK,
+			want:     fallback,
+		},
+		{
+			name:     "empty home → fallback",
+			euid:     0,
+			sudoUser: "alice",
+			lookup:   lookupEmpty,
+			fallback: fallbackOK,
+			want:     fallback,
+		},
+		// The one branch that returns a non-nil error: the fallback itself fails
+		// (e.g. $HOME unset). The error must propagate, not get swallowed.
+		{
+			name:     "fallback error propagates",
+			euid:     1000,
+			sudoUser: "",
+			lookup:   lookupOK,
+			fallback: fallbackErr,
+			wantErr:  true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveBaseHome(tc.euid, tc.sudoUser, tc.lookup, tc.fallback)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("resolveBaseHome(%d, %q) = %q, want error", tc.euid, tc.sudoUser, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveBaseHome: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("resolveBaseHome(%d, %q) = %q, want %q", tc.euid, tc.sudoUser, got, tc.want)
+			}
+		})
+	}
+}
 
 func TestStoreBasic(t *testing.T) {
 	tmpDir := t.TempDir()

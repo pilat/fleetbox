@@ -70,6 +70,13 @@ change them by rm + up.`,
 }
 
 func runUp(cmd *cobra.Command, names []string, f *upFlags) error {
+	// up creates the bridge/taps via the root holder, so it needs root: re-exec
+	// under sudo (interactive) or print the command (non-interactive). No-op on
+	// macOS and when already root (ADR-0023).
+	if err := ensurePrivileged(); err != nil {
+		return err
+	}
+
 	members, err := clusterMembers(names, f.count)
 	if err != nil {
 		return err
