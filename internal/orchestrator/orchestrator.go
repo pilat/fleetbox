@@ -15,6 +15,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -65,6 +66,11 @@ type VM struct {
 	// reaps the helper (stopping the sole member makes it exit). A cluster member
 	// leaves it false — the Cluster reaps via Close.
 	ownsSession bool
+	// createdThisCall is true when this VM's files were created by the current
+	// call (it did not exist in the store beforehand). The detached-cluster
+	// rollback consults it so a failed `up` only Destroys members it freshly made
+	// and merely Stops pre-existing ones, never deleting a persisted disk.
+	createdThisCall bool
 }
 
 // startDeps holds the once-per-call client prep shared by every VM in a Start or
@@ -210,7 +216,7 @@ func resolveStartDeps(optFns ...opts.Option) (*startDeps, error) {
 // by GC while the VM lives (ADR-0008, R3).
 func startOnNetwork(
 	ctx context.Context, name string, nw backend.Network, deps *startDeps, b backend.Backend,
-) (*VM, error) {
+) (vm *VM, err error) {
 	st := deps.store
 	options := deps.options
 
@@ -276,6 +282,17 @@ func startOnNetwork(
 		if err := st.Create(vmConfig); err != nil {
 			return nil, fmt.Errorf("create vm store: %w", err)
 		}
+
+		// From here this call owns freshly created on-disk state (member dir, disk,
+		// seed, fixtures). If any later step fails, startOnNetwork returns no *VM, so
+		// Add never records it in c.vms and the cluster rollback can't reach it —
+		// delete it on the way out so a partial member never leaks. Only fires for a
+		// just-created member: an existing one being re-upped keeps its disk.
+		defer func() {
+			if err != nil {
+				_ = st.Delete(name)
+			}
+		}()
 
 		// Copy disk image
 		diskPath := st.DiskPath(name)
@@ -351,12 +368,15 @@ func startOnNetwork(
 		return nil, fmt.Errorf("start vm: %w", err)
 	}
 
-	vm := &VM{
+	vm = &VM{
 		name:    name,
 		store:   st,
 		sshMgr:  deps.sshMgr,
 		backend: backendVM,
 		config:  vmConfig,
+		// existing was read before any file was created, so it cleanly marks
+		// whether this call made the VM — the bit the rollback branches on.
+		createdThisCall: !existing,
 	}
 
 	// Wait for IP. Discovery is the backend's job (vz parses dhcpd_leases by
@@ -601,9 +621,13 @@ func (c *Cluster) VMs() []*VM {
 
 // StartClusterDetached boots the named VMs as one interconnected cluster on a
 // single detached helper that persists after this process exits (the CLI's `up`).
-// It is all-or-nothing: on any member's failure it destroys the members already
+// It is all-or-nothing: on any member's failure it rolls back the members already
 // started and releases the helper. On success the helper is left running and the
 // members are addressed later by name (ls/ssh/down).
+//
+// Rollback is disk-safe: a re-up of stopped members (which already have persisted
+// disks) only stops them, while members this call created fresh are destroyed —
+// never delete a disk that existed before this `up` (see Cluster.rollback).
 func StartClusterDetached(ctx context.Context, names []string, optFns ...opts.Option) error {
 	c, err := NewClusterDetached(optFns...)
 	if err != nil {
@@ -611,16 +635,39 @@ func StartClusterDetached(ctx context.Context, names []string, optFns ...opts.Op
 	}
 	for _, name := range names {
 		if _, err := c.Add(ctx, name); err != nil {
-			for _, vm := range c.VMs() {
-				_ = vm.Destroy(ctx)
-			}
+			rbErr := c.rollback(ctx)
 			_ = c.Close()
+			if rbErr != nil {
+				return fmt.Errorf("start %s: %w (rollback also failed: %w)", name, err, rbErr)
+			}
 			return fmt.Errorf("start %s: %w", name, err)
 		}
 	}
 	// Detached: leave the helper running and do not reap it — the members outlive
 	// this command (cattle-with-persistence).
 	return nil
+}
+
+// rollback undoes a partial detached cluster up. For each member already added it
+// branches on createdThisCall: a member this call created fresh is Destroyed (its
+// files are this call's mess to clean up), while a pre-existing member — a stopped
+// node being re-upped — is only Stopped, so its persisted disk survives. This is
+// the data-loss fix: the old rollback Destroyed every added member, deleting disks
+// that existed before the up.
+func (c *Cluster) rollback(ctx context.Context) error {
+	var errs error
+	for _, vm := range c.VMs() {
+		if vm.createdThisCall {
+			if err := vm.Destroy(ctx); err != nil {
+				errs = errors.Join(errs, fmt.Errorf("rollback destroy %s: %w", vm.name, err))
+			}
+		} else {
+			if err := vm.Stop(ctx); err != nil {
+				errs = errors.Join(errs, fmt.Errorf("rollback stop %s: %w", vm.name, err))
+			}
+		}
+	}
+	return errs
 }
 
 // AddMember boots a new member onto the LIVE helper already serving `sibling`,

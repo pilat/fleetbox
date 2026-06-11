@@ -46,6 +46,9 @@ test-fake:
 	CGO_ENABLED=1 go build -tags fleetbox_fake -race -o bin/fleetbox-helper-fake ./cmd/fleetbox-helper
 	FLEETBOX_FAKE_HELPER=1 FLEETBOX_HELPER=$(CURDIR)/bin/fleetbox-helper-fake \
 		CGO_ENABLED=1 go test -race -tags fleetbox_fake -run TestCoord ./fleetboxtest
+	# The orchestrator's createdThisCall test needs the fake tag too (skipSSHWait);
+	# it uses local stubs, not the fake helper, so no FLEETBOX_HELPER is required.
+	CGO_ENABLED=1 go test -race -tags fleetbox_fake ./internal/orchestrator/
 
 # The Linux equivalent of test-fake. There is no separate fake helper binary on
 # Linux: the test binary self-reexecs into the fake holder via internal/holder's
@@ -55,6 +58,8 @@ test-fake:
 # the protocol + teardown on a stock Linux runner (ADR-0020).
 test-fake-linux:
 	FLEETBOX_FAKE_HELPER=1 CGO_ENABLED=1 go test -race -tags fleetbox_fake -run TestCoord ./fleetboxtest
+	# Same fake-tagged orchestrator test as test-fake (local stubs, no helper).
+	CGO_ENABLED=1 go test -race -tags fleetbox_fake ./internal/orchestrator/
 
 # Run VM integration tests (requires darwin/arm64, M3+, macOS 26+).
 # Builds and ad-hoc-signs the helper, then points the library at it via

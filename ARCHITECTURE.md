@@ -61,7 +61,7 @@ Where the canonical version of each thing lives. When two files disagree, the So
 |---------|----------------|-------|
 | Public library API | `fleetbox.go` | Exported symbols + doc comments. §5.1 summarizes. |
 | Test-fixture API | `fleetboxtest/fleetboxtest.go` | §5.2 summarizes. |
-| CLI command surface | `cmd/fleetbox/main.go` (`usage()` + dispatch in `main()`) | §5.3 summarizes. |
+| CLI command surface | `cmd/fleetbox/` cobra tree (`newRootCmd` in `root.go` + one `newXxxCmd` per command file) | §5.3 summarizes (ADR-0022). |
 | Backend contract | `internal/backend/backend.go` | `Backend`, `VM`, `Network`, `Config`, `State`. |
 | On-disk state layout | `internal/store/store.go` path methods | §4.2 summarizes. |
 | Image catalog | `internal/image/catalog.json` (embedded) + `internal/image/image.go` | Alias → dated snapshot + per-GOARCH URL + sha256 (pinned, verified); refreshed by `contrib/catalog`. |
@@ -461,14 +461,24 @@ When a PR changes any of these fields for a package, update its section.
 
 ### §5.3 `cmd/fleetbox`
 
-- Purpose: the CLI — `up`, `down`, `ls`, `ssh`, `cp`, `ssh-config`, `rm`, `version`.
-- Owns: flag parsing, terminal output, exec of system `ssh`/`scp`. It no longer carries a
-  holder seam: on Linux the re-exec into the holder is handled by `internal/holder`'s `init()`
-  interceptor (linked via the root package), not a `maybeRunHolder` dispatch here (ADR-0020).
+- Purpose: the CLI — `up`, `down`, `ls`, `ssh`, `cp`, `ssh-config`, `rm`, `version`, plus
+  cobra's auto-generated `completion` and `help`. Aliases: `start`→`up`, `stop`/`halt`→`down`,
+  `list`→`ls`, `shell`→`ssh`, `remove`/`destroy`/`delete`→`rm`.
+- Owns: a cobra command tree, terminal output, exec of system `ssh`/`scp`. It is built on
+  **cobra** (ADR-0022): `newRootCmd` in `root.go` assembles one `newXxxCmd` per command file
+  (`up.go`, `down.go`, …); there is no `init()` and no package-level command globals (only the
+  ldflags-set build-metadata `version/commit/date`). Each command's `RunE` calls a `runX`
+  helper that opens its own `store.New()`, so store-free commands (`version`, `completion`,
+  `--help`) never fail on a store error. A single `cliExit{code, silent}` error type drives the
+  process exit code from `main` (used by ssh/cp exit-code propagation and the best-effort bulk
+  loops). It no longer carries a holder seam: on Linux the re-exec into the holder is handled by
+  `internal/holder`'s `init()` interceptor (linked via the root package), not a `maybeRunHolder`
+  dispatch here (ADR-0020).
 - Depends on: `fleetbox` (public API), `internal/orchestrator` (to drive a detached helper
-  for `up`), `internal/control` (status/stop for the per-name commands), `internal/store`. It
-  links no hypervisor on darwin (ADR-0017); on Linux it links the holder + cloud-hypervisor
-  via the root's blank import (the accepted non-sever).
+  for `up`), `internal/control` (status/stop for the per-name commands), `internal/store`
+  (incl. `ClusterName` for `down`/`rm` target resolution), and `github.com/spf13/cobra`
+  (+ `pflag`). It links no hypervisor on darwin (ADR-0017); on Linux it links the holder +
+  cloud-hypervisor via the root's blank import (the accepted non-sever).
 - Public API: none (package main).
 - Invariants:
   - The CLI adds no capability of its own — every VM operation goes through the public API
@@ -482,12 +492,26 @@ When a PR changes any of these fields for a package, update its section.
     `up` partitions members into running/missing: none running → fresh detached helper; some
     running in one helper → `orchestrator.AddMember` (reserve + boot-member on a live
     sibling's holder) so a re-upped node re-joins the live network; running members split
-    across processes → rejected (their networks can't merge). Flags and positional names may
-    be interspersed (`up test1 -n 2` works).
-  - `up` accepts a repeatable `--fixture host:guest` flag (a custom `flag.Value`); host
-    paths are resolved to absolute against the CLI cwd before they cross into the holder
-    (split on the last colon), and flow to the library as `WithFixture` (ADR-0015). In a
-    cluster every member gets the same fixtures.
+    across processes → rejected (their networks can't merge). cobra parses flags and positional
+    names interspersed (`up test1 -n 2` works). `up` warns (stderr) when a create-only flag is
+    set on an already-existing member (options are frozen at create — ADR-0015).
+  - `down` and `rm` resolve targets through one shared resolver: an exact VM name, else a
+    cluster prefix expanded via `store.ClusterName` (the `-<digits>` rule — so `web` hits
+    `web-1`/`web-2` but never an unrelated solo `web-prod`). Both are best-effort across
+    multiple targets (per-target result lines, non-zero exit if any failed/unknown). `rm` is
+    the only destructive command and confirms any non-empty removal unless `-f`/`--force`.
+  - `ssh` requires `--` before a remote command (`ssh web -- uname -a`); trailing args without
+    it are rejected, not silently dropped. `ssh`/`cp` propagate the child `ssh`/`scp` exit code
+    verbatim. `cp` rejects VM↔VM copies (exactly one side is `name:/path`).
+  - `ls` renders a human table (default), bare names (`-q`), or a JSON array (`-o json`, the
+    pinned snake_case machine contract — `internal/store`-consistent keys, no `age` field).
+    `ssh`/`cp`/`down` dynamically complete running VM names, `rm` all VM names
+    (`ValidArgsFunction`); the `completion` subcommand's per-shell scripts ship via the
+    Homebrew cask (ADR-0021/0022).
+  - `up` accepts a repeatable `--fixture host:guest` flag (`StringArrayVar`); host paths are
+    resolved to absolute against the CLI cwd before they cross into the holder (split on the
+    last colon; the guest path must be absolute), and flow to the library as `WithFixture`
+    (ADR-0015). In a cluster every member gets the same fixtures.
   - Cleanup is automatic, never a user command: `down` (like `up`) runs the backend
     reconcile via `fleetbox.Prune()` to reclaim resources a crashed holder left, so on
     Linux it too needs root for the `ip`/`iptables` calls (ADR-0013).
@@ -611,8 +635,10 @@ When a PR changes any of these fields for a package, update its section.
 - Depends on: stdlib only.
 - Public API (internal): `Store` (`New`, `NewAt`, path methods incl. `BinDir`,
   `NetworkStateDir`, `FixturePath`, `PidfilePath`, `SocketPath`, `ControlSocketPath`,
-  `EnsureDir`, `Exists/Create/Save/Load/Delete/List`, `TryLock`), `VM` config struct
-  (incl. `Fixtures`, `IP`), `Fixture{HostPath, GuestPath, Label}`, `Lock.Unlock`.
+  `EnsureDir`, `Exists/Create/Save/Load/Delete/List`, `TryLock`), `ClusterName` (the
+  documented `-<digits>` member→cluster rule, exported so the CLI's `down`/`rm` resolution
+  reuses it), `VM` config struct (incl. `Fixtures`, `IP`),
+  `Fixture{HostPath, GuestPath, Label}`, `Lock.Unlock`.
 - Invariants:
   - Every path under `~/.fleetbox/` is produced by a `Store` method — no other package
     builds those paths by hand. `BinDir` (`~/.fleetbox/bin`) and `NetworkStateDir`
@@ -817,6 +843,12 @@ When a PR changes any of these fields for a package, update its section.
   - The clustering gate and `ErrClustersUnsupported` live in the root package, not here:
     `Cluster.Add` boots unconditionally (the caller is expected to have gated). `Destroy`
     is idempotent (skips delete when the store entry is already gone).
+  - `StartClusterDetached`'s rollback is disk-safe: each VM carries `createdThisCall`
+    (`= !st.Exists(name)` at build time), and on a partial-up failure `Cluster.rollback`
+    Destroys only members this call created while merely Stopping pre-existing ones — so a
+    re-up of stopped members never deletes a persisted disk. The library's bound
+    `StartCluster` (root) keeps its destroy-all rollback on purpose: its fixtures are
+    ephemeral within a test.
   - Reserve precedes the seed build: `Network.Reserve(name, ipHint)` (helper-side) returns the
     IP/MAC the client bakes into the seed; the previously-stored IP rides along as the hint so
     a stopped member keeps its address (ADR-0020).
@@ -973,9 +1005,9 @@ HOLDER SIDE (links a backend):                                                  
 
 Edges (verified by `go list -deps`):
 
-- `cmd/fleetbox` → `fleetbox`, `internal/orchestrator`, `internal/control`, `internal/store`;
-  on linux it transitively links `internal/holder` + cloud-hypervisor (via the root's blank
-  import); on darwin it links NO hypervisor (the sever)
+- `cmd/fleetbox` → `fleetbox`, `internal/orchestrator`, `internal/control`, `internal/store`,
+  `github.com/spf13/cobra` (+ `pflag`); on linux it transitively links `internal/holder` +
+  cloud-hypervisor (via the root's blank import); on darwin it links NO hypervisor (the sever)
 - `fleetboxtest` → `fleetbox` (public API only)
 - `fleetbox` (root): neutral → `internal/opts`; supported (`darwin||linux`) →
   `internal/orchestrator`; linux probes → blank `internal/holder`; darwin probes →
@@ -1122,18 +1154,20 @@ After implementation changes, verify:
   requires a §5 section update.
 - **Public API**: exported symbols in `fleetbox.go` and `fleetboxtest/` match §5.1 /
   §5.2. Quick check: `go doc github.com/pilat/fleetbox | grep '^func\|^type\|^const'`.
-- **CLI surface**: commands in `cmd/fleetbox/main.go`'s dispatch switch match §5.3 and
-  the `usage()` text.
+- **CLI surface**: the cobra commands (`newXxxCmd` constructors wired in `root.go`'s
+  `newRootCmd`) — their `Use`/`Aliases`/flags — match §5.3.
 - **Backend contract**: `internal/backend/backend.go` interfaces match §5.4.
 - **State layout**: path methods in `internal/store/store.go` match the §4.2 tree.
 - **Sever gate (macOS)**: `GOOS=darwin GOARCH=arm64 go list -deps` of `fleetbox`,
   `fleetboxtest`, and `cmd/fleetbox` excludes `internal/backend/vz` and `third_party/vz`,
   and the three build with `CGO_ENABLED=0` (§6.9, ADR-0017).
 - **Dependencies**: direct requires in `go.mod` match the deps named in §5 module
-  sections (currently: pilat/cloudiso, pilat/go-ext4fs, go-qcow2reader, x/crypto, and
-  x/sys — now a direct dep, used by `internal/helperdist` (quarantine xattr) and the darwin
-  capability probes, as well as by the in-module vendored vz; plus go-infinity-channel +
-  x/mod pulled in by vz). The vz fork itself is not a require — it is vendored in-module (see below).
+  sections (currently: pilat/cloudiso, pilat/go-ext4fs, go-qcow2reader, x/crypto,
+  spf13/cobra — the CLI framework, §5.3, ADR-0022, pulling spf13/pflag + inconshreveable/
+  mousetrap as indirects — and x/sys — now a direct dep, used by `internal/helperdist`
+  (quarantine xattr) and the darwin capability probes, as well as by the in-module vendored
+  vz; plus go-infinity-channel + x/mod pulled in by vz). The vz fork itself is not a require —
+  it is vendored in-module (see below).
   The vz fork is the import-path-renamed Code-Hex/vz + norio-nomura's unreleased
   vmnet patch (PR #205), regenerated from pinned sources by `make vendor-vz`. It is
   vendored in-module under `third_party/vz` — no separate go.mod, so a downstream

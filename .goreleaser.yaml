@@ -47,6 +47,14 @@ homebrew_casks:
   - name: fleetbox
     binaries:
       - fleetbox
+    # Generate and install shell completions by running the freshly built binary
+    # at release time (GoReleaser v2.15+). cobra emits OS-independent scripts, so
+    # the linux release host can produce the macOS cask's completions; pwsh comes
+    # along for free with shell_parameter_format: cobra (ADR-0022).
+    generate_completions_from_executable:
+      args: [completion]
+      shell_parameter_format: cobra
+      shells: [bash, zsh, fish]
     homepage: "https://github.com/pilat/fleetbox"
     description: "Linux VMs as Go test fixtures, on macOS and Linux behind one backend-neutral API"
     license: MIT

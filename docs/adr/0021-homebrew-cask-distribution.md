@@ -36,9 +36,17 @@ the `CICD_HOMEBREW_GITHUB_TOKEN` PAT secret).
 - Add a `version` subcommand with `-ldflags -X main.{version,commit,date}` so
   brew-installed users can report what they have.
 
-The cask carries only the CLI. The signed helper and the cloud-hypervisor VMM/firmware
+The cask carries the CLI binary. The signed helper and the cloud-hypervisor VMM/firmware
 still auto-download (checksum-pinned) on first boot, so nothing in this channel needs
 codesigning.
+
+**Amendment (2026-06-11, ADR-0022):** the cask now *also* installs shell completions, not
+only the binary. Once the CLI moved onto cobra, the `homebrew_casks` block gained
+`generate_completions_from_executable` (`args: [completion]`, `shell_parameter_format: cobra`,
+`shells: [bash, zsh, fish]`); on `brew install` the cask runs `fleetbox completion <shell>`
+and installs the output. The quarantine-strip postflight and caveats are unchanged. So the
+earlier "the cask carries only the binary" framing is superseded — it carries the binary plus
+generated completions. See ADR-0022.
 
 ## Alternatives Considered
 
