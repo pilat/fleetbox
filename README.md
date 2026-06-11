@@ -58,9 +58,11 @@ No yaml, no templates, no per-distro code paths. Flags and sane defaults.
 - **macOS on Apple Silicon.** Clusters (VM↔VM networking) need macOS 26+; below that
   you get a single VM at a time. Nested virtualization (`/dev/kvm` in the guest) needs
   M3 or newer. Intel Macs are not supported.
-- **Linux, amd64 or arm64.** Needs `/dev/kvm` (be in the `kvm` group) and
-  `CAP_NET_ADMIN` for the bridge and taps. fleetbox checks both before booting anything
-  and fails with a one-line fix, not a cryptic boot error.
+- **Linux, amd64 or arm64.** Needs `/dev/kvm` (be in the `kvm` group) and **root** for the
+  network — the shared bridge and per-VM taps. The CLI elevates itself: run `fleetbox up`
+  and approve the one sudo password prompt. For the library and `go test`, run under sudo
+  (see Install). fleetbox checks both before booting anything and fails with a clear error,
+  not a cryptic boot one.
 
 Plus Go 1.24+. The module compiles on `darwin/arm64` and `linux/{amd64,arm64}`; other
 targets build but return a clear "unsupported platform" error at runtime.
@@ -92,6 +94,23 @@ go install github.com/pilat/fleetbox/cmd/fleetbox@latest
 
 Either way you get the pure-Go `fleetbox` binary; the helper and VMM still auto-download
 on first boot, exactly as they do for the library.
+
+On Linux the network work needs root, but you don't run `sudo fleetbox` yourself — the CLI
+re-execs its own absolute path under sudo for `up`/`down`/`rm`, so you just run `fleetbox up`
+and approve the password prompt (no need to put the binary on root's `PATH`). Read-only
+commands — `ls`, `ssh`, `cp`, `ssh-config` — never ask for sudo. In a non-interactive shell
+(CI, a pipe, no terminal) it doesn't hang: it prints the exact `sudo …` command to run and
+exits.
+
+For the **library** on Linux there's no auto-elevation (a test must never spawn a password
+prompt), so run the test binary under sudo. The invocation our own CI uses:
+
+```bash
+sudo -E env "HOME=$HOME" "PATH=$PATH" go test ./...
+```
+
+`HOME` keeps fleetbox's state under your `~/.fleetbox` (not `/root`), and `PATH` lets the
+root process find the Go toolchain and the `ip`/`iptables` it shells out to.
 
 The first boot also downloads the cloud image (a few hundred MB, cached in
 `~/.fleetbox/images/`) and prints a progress line so it doesn't look like a hung test.

@@ -95,7 +95,10 @@ path. The sequence:
 
 0. **Preflight** — `preflight()` (per-platform) fails fast with an actionable message if
    the host can't run a VM, before the (possibly multi-GB) image download. No-op on macOS;
-   on Linux it checks `/dev/kvm` is openable and `CAP_NET_ADMIN` is held.
+   on Linux it checks `/dev/kvm` is openable and the process is root (`euid==0`). Root, not
+   `CAP_NET_ADMIN`, is the honest gate — the backend shells out to `ip`/`iptables` (file
+   caps don't survive `exec`) and writes DAC-gated `ip_forward`, so only root works; the
+   CLI auto-elevates before this runs (ADR-0023).
 1. **Options** — apply functional options over defaults (image=debian-12, cpus=2,
    mem=4GB, disk=20GB).
 2. **Store** — `store.New()` ensures `~/.fleetbox/{clusters,images}/` exist.
@@ -309,7 +312,7 @@ The support matrix and how it is realized in build tags:
   NOT select a backend; its `internal/orchestrator` build-tagged files provide only
   `helperExe` (helper acquisition: `helperdist` on darwin, `os.Executable` self-reexec on
   linux, error otherwise) and `preflight` (`preflight_linux.go` checks /dev/kvm +
-  CAP_NET_ADMIN; `preflight_default.go`/`preflight_fake.go` are no-ops). The root package is
+  `euid==0`/root, ADR-0023; `preflight_default.go`/`preflight_fake.go` are no-ops). The root package is
   build-tagged too (ADR-0020): `fleetbox_supported.go` (`darwin||linux`) holds the one
   client impl that delegates to the orchestrator; `fleetbox_{darwin_arm64,linux,unsupported}.go`
   hold only per-platform host probes (`fleetbox_linux.go` also blank-imports `internal/holder`
@@ -337,9 +340,12 @@ The support matrix and how it is realized in build tags:
   auto-downloaded and checksum-pinned via the `internal/helperdist` catalog;
   `FLEETBOX_HELPER` overrides it for dev/offline.
 - **Linux host prerequisites** (not provisionable; probed with clear errors): `/dev/kvm`
-  present and accessible (user in the `kvm` group) and `CAP_NET_ADMIN` (to make the
-  bridge and taps). The cloud-hypervisor binary and firmware are downloaded and
-  checksum-pinned to `~/.fleetbox/bin/` (ADR-0011); the Linux path is pure Go, no cgo.
+  present and accessible (user in the `kvm` group) and **root** — the bridge/taps still
+  need `CAP_NET_ADMIN` (root has it), plus `CAP_DAC_OVERRIDE` to write `ip_forward`, so
+  the preflight gates on `euid==0`, not on the capability. The CLI auto-elevates via sudo;
+  library/tests run under sudo (ADR-0023). The cloud-hypervisor binary and firmware are
+  downloaded and checksum-pinned to `~/.fleetbox/bin/` (ADR-0011); the Linux path is pure
+  Go, no cgo.
 - **Nested virtualization** (consumers running KVM inside guests) needs M3+ on macOS,
   or the host KVM `nested` parameter on Linux. `fleetbox.NestedVirtSupported()` reports
   availability; `fleetboxtest` skips when unsupported.
@@ -515,6 +521,17 @@ When a PR changes any of these fields for a package, update its section.
   - Cleanup is automatic, never a user command: `down` (like `up`) runs the backend
     reconcile via `fleetbox.Prune()` to reclaim resources a crashed holder left, so on
     Linux it too needs root for the `ip`/`iptables` calls (ADR-0013).
+  - **Linux auto-elevation (CLI-only — ADR-0023).** The privileged commands `up`/`down`/`rm`
+    call `ensurePrivileged()` first (an allowlist in each `RunE`, never a root
+    `PersistentPreRunE` — that would fire on `__complete`/`help`). Interactive (a `/dev/tty`
+    opens) → re-exec `sudo env FLEETBOX_ELEVATED=1 PATH=… <abs self> <args>` via
+    `syscall.Exec` (absolute self-path fixes `sudo: command not found`; the `env` prefix sets
+    the loop-guard flag and PATH without relying on `sudo -E`). Non-interactive → print the
+    exact command and exit non-zero (silent `cliExit`), never hang. The user-level commands
+    (`ls`/`ssh`/`cp`/`ssh-config`/`version`/`completion`) never elevate. The pure decision is
+    `decideElevation` in `elevate.go` (table-tested); the shell is `elevate_linux.go`, a
+    `!linux` no-op stub is `elevate_other.go` (macOS uses the signed helper, never sudo). The
+    **library never elevates** — this lives only here.
   - No yaml, no config files — flags and defaults only.
 
 ### §5.4 `internal/backend`
@@ -640,6 +657,13 @@ When a PR changes any of these fields for a package, update its section.
   reuses it), `VM` config struct (incl. `Fixtures`, `IP`),
   `Fixture{HostPath, GuestPath, Label}`, `Lock.Unlock`.
 - Invariants:
+  - **One base dir, the invoking user's home (ADR-0023).** `New` resolves the base via the
+    pure `resolveBaseHome`: when root-via-sudo (`euid==0 && SUDO_USER != ""`) it uses
+    `SUDO_USER`'s passwd home (`os/user.Lookup`), NOT `$HOME` — a manual `sudo fleetbox`
+    leaves `HOME=/root` while `SUDO_USER=alice`, so trusting `$HOME` would split state into
+    `/root/.fleetbox`. Every other case (non-root, no `SUDO_USER`, or a failed/empty lookup)
+    falls back to `os.UserHomeDir()` and never errors. This is the single place the rule
+    lives, so CLI, orchestrator, and holder all agree on `~alice/.fleetbox`.
   - Every path under `~/.fleetbox/` is produced by a `Store` method — no other package
     builds those paths by hand. `BinDir` (`~/.fleetbox/bin`) and `NetworkStateDir`
     (`~/.fleetbox/networks`, the Linux backend's write-ahead records — ADR-0013) are
@@ -693,6 +717,11 @@ When a PR changes any of these fields for a package, update its section.
   - One keypair per installation, generated lazily, injected into guests via cloud-init
     only.
   - Host key checking is intentionally disabled (ephemeral test VMs).
+  - **Ownership fixup (ADR-0023).** `EnsureKey` chowns the key pair to `SUDO_UID:SUDO_GID`
+    on every run (idempotent — `chownToInvoker`) when root-via-sudo, so a non-root `ssh -i`
+    can read the `0600` private key a root `up` created. Mode stays `0600` (`ssh` refuses a
+    world-readable key, so ownership is the only fix); only the two key files are touched,
+    never the base dir. No-op off-root and on macOS.
 
 ### §5.11 `internal/control`
 
@@ -746,7 +775,8 @@ When a PR changes any of these fields for a package, update its section.
     `/dev/kvm`. Fixture images (`cfg.FixturePaths`) are appended as extra
     `path=…,readonly=on` values on the single `--disk` flag, after the seed — the guest
     mounts each by `LABEL`, so order is irrelevant (ADR-0015). `CreateNetwork`'s first `ip`
-    call doubles as the `CAP_NET_ADMIN` probe.
+    call is the backstop permission check (it errors `create bridge (needs root)` if a
+    non-root holder ever reaches it; the preflight already gated on root — ADR-0023).
   - `CreateNetwork` makes one bridge per cluster on a free `/24` (gateway `.1`) and
     installs `iptables` MASQUERADE/FORWARD egress rules; `Network.Reserve(name, ipHint)`
     allocates a member's static IP on that `/24` (lowest free, or the hint if free) — the
@@ -852,7 +882,7 @@ When a PR changes any of these fields for a package, update its section.
   - Reserve precedes the seed build: `Network.Reserve(name, ipHint)` (helper-side) returns the
     IP/MAC the client bakes into the seed; the previously-stored IP rides along as the hint so
     a stopped member keeps its address (ADR-0020).
-  - Under `-tags fleetbox_fake`, `preflight_fake.go` skips the /dev/kvm+CAP_NET_ADMIN check
+  - Under `-tags fleetbox_fake`, `preflight_fake.go` skips the /dev/kvm+root check
     and `skipSSHWait` → true (the fake's IP is unroutable). The concrete backend selection is
     the helper's job (`internal/holder`), not here, so the orchestrator has no `newBackend`.
 
@@ -883,6 +913,12 @@ When a PR changes any of these fields for a package, update its section.
     control-connection EOF (fast) + reparent poll (backstop). Detached mode persists. On
     darwin it is `cmd/fleetbox-helper`; on linux the client/test binary self-reexecs into it
     via the `init()` interceptor.
+  - **Socket fixup (ADR-0023).** Each unix socket the holder creates (per-member and the
+    bound control socket) is `chmod 0666`ed when running as root, so a non-root client can
+    `connect()` (a unix-socket connect needs *write* permission; a root umask leaves it
+    `0755` → EACCES). `0666` on a local-only dev socket is an accepted tradeoff. The holder
+    inherits `SUDO_*` because `control.Spawn` passes `os.Environ()`, so the store resolves
+    the same `~user/.fleetbox` the elevated client did.
 
 ### §5.18 `internal/helperdist`
 
