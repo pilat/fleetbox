@@ -47,3 +47,11 @@ func TestParseFixtureErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestParseFixtureRelativeGuest(t *testing.T) {
+	// The guest path must be absolute; reject it early (before any image
+	// download) rather than letting the orchestrator catch it at boot.
+	if _, _, err := parseFixture("/abs/src:work"); err == nil {
+		t.Error("parseFixture with relative guest = nil error, want error")
+	}
+}

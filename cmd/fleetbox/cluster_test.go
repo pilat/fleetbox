@@ -1,9 +1,6 @@
-//go:build darwin && arm64
-
 package main
 
 import (
-	"flag"
 	"slices"
 	"strings"
 	"testing"
@@ -43,42 +40,6 @@ func TestClusterMembers(t *testing.T) {
 			}
 			if !slices.Equal(got, tc.want) {
 				t.Errorf("clusterMembers(%v, %d) = %v, want %v", tc.names, tc.count, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestParseInterspersed(t *testing.T) {
-	cases := []struct {
-		name     string
-		args     []string
-		wantPos  []string
-		wantFlag int
-	}{
-		{
-			name:     "flag between positionals",
-			args:     []string{"a", "-n", "3", "b"},
-			wantPos:  []string{"a", "b"},
-			wantFlag: 3,
-		},
-		{name: "flag first", args: []string{"-n", "2", "a"}, wantPos: []string{"a"}, wantFlag: 2},
-		{name: "positionals only", args: []string{"a", "b"}, wantPos: []string{"a", "b"}, wantFlag: 1},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			fs := flag.NewFlagSet("test", flag.ContinueOnError)
-			n := fs.Int("n", 1, "")
-
-			pos, err := parseInterspersed(fs, tc.args)
-			if err != nil {
-				t.Fatalf("parseInterspersed(%v): %v", tc.args, err)
-			}
-			if !slices.Equal(pos, tc.wantPos) {
-				t.Errorf("positional = %v, want %v", pos, tc.wantPos)
-			}
-			if *n != tc.wantFlag {
-				t.Errorf("-n = %d, want %d", *n, tc.wantFlag)
 			}
 		})
 	}

@@ -342,6 +342,15 @@ func (l *Lock) Unlock() error {
 	return nil
 }
 
+// ClusterName derives a member's cluster name by stripping a single trailing
+// "-<digits>" group, e.g. "web-3" → "web", "dev" → "dev". It is the exported,
+// documented entry point to the membership rule (see clusterName for the exact
+// cases) so callers outside the package — the CLI's down/rm target resolution —
+// reuse the one canonical rule instead of re-deriving the digits-suffix logic.
+func ClusterName(name string) string {
+	return clusterName(name)
+}
+
 // clusterName derives a member's cluster name by stripping a single trailing
 // "-<digits>" group. It is the inverse-free mapping that lets a member's
 // directory be located from its name alone, with no persisted cluster field:
