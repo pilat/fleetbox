@@ -1,11 +1,5 @@
 package main
 
-// elevateAction is the outcome of the privilege-elevation decision (ADR-0023). The
-// decision is computed by the pure, un-tagged decideElevation below so it is
-// table-testable on any platform; the Linux shell (elevate_linux.go) maps each action
-// to a real syscall.Exec/print, and non-Linux uses a no-op stub (elevate_other.go).
-type elevateAction int
-
 const (
 	// elevateProceed: already root (or nothing to do) — run the command in-process.
 	elevateProceed elevateAction = iota
@@ -20,6 +14,12 @@ const (
 	// still not root — sudo is misconfigured; fail instead of re-exec'ing forever.
 	elevateLoopError
 )
+
+// elevateAction is the outcome of the privilege-elevation decision (ADR-0023). The
+// decision is computed by the pure, un-tagged decideElevation below so it is
+// table-testable on any platform; the Linux shell (elevate_linux.go) maps each action
+// to a real syscall.Exec/print, and non-Linux uses a no-op stub (elevate_other.go).
+type elevateAction int
 
 // decideElevation chooses what a privileged CLI command does given the current
 // state. It is the loop-guard and the interactivity gate in one pure place:
