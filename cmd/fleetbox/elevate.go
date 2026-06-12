@@ -1,5 +1,7 @@
 package main
 
+import "strings"
+
 const (
 	// elevateProceed: already root (or nothing to do) — run the command in-process.
 	elevateProceed elevateAction = iota
@@ -39,4 +41,30 @@ func decideElevation(euid int, alreadyElevated, ttyOpenable, sudoFound bool) ele
 		return elevateExecSudo
 	}
 	return elevatePrint
+}
+
+// ensureSbinInPath returns path with the standard sbin directories appended if
+// missing. The elevated holder shells out to `ip`/`iptables`, which live in
+// /sbin and /usr/sbin — directories a regular user's PATH often omits (a stock
+// Debian cloud image's login PATH has no sbin). Auto-elevation forwards the user's
+// PATH through an `env` wrapper that overrides sudo's secure_path, so without this
+// the holder's `iptables` lookup fails and network setup dies (ADR-0023). Empty
+// path entries are dropped so a leading/trailing ":" never injects the cwd. Pure
+// and un-tagged so it is table-testable on any platform.
+func ensureSbinInPath(path string) string {
+	var dirs []string
+	seen := map[string]bool{}
+	add := func(d string) {
+		if d != "" && !seen[d] {
+			seen[d] = true
+			dirs = append(dirs, d)
+		}
+	}
+	for d := range strings.SplitSeq(path, ":") {
+		add(d)
+	}
+	for _, d := range []string{"/usr/local/sbin", "/usr/sbin", "/sbin"} {
+		add(d)
+	}
+	return strings.Join(dirs, ":")
 }

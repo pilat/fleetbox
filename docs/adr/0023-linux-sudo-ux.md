@@ -58,6 +58,12 @@ itself booby-trapped:
   key, so ownership is the only fix. The root holder `chmod 0666`s each unix socket it
   creates so a non-root client can connect. Disks/logs stay root-owned; only the holder
   touches them.
+- **Cross-uid liveness probe.** `control.IsRunning` probes the holder with
+  `kill(pid, 0)` and treats `EPERM` as alive, not dead: the holder an elevated `up`
+  spawned is root-owned, so a non-root `ls`/`ssh` is not permitted to signal it and gets
+  `EPERM` although the process exists. Only `ESRCH` means gone. Without this the status
+  path short-circuited to "stopped" before ever reaching the `0666` socket — the two
+  fixups above are necessary but were not sufficient on their own.
 
 Privilege classes: **privileged (auto-elevate)** = `up`, `down`, `rm`; **user-level
 (never elevate)** = `ls`, `ssh`, `cp`, `ssh-config`, `version`, `completion`.
@@ -101,8 +107,11 @@ and the socket block read-only commands; disks/logs are root-only by design.
 - Behavioral coverage is mostly manual on a Linux host: the macOS CI runs the
   `fleetbox_fake` path (preflight is a no-op), and the Linux VM CI runs as root via
   sudo, so `euid==0` short-circuits the elevation and ownership paths. The automated
-  coverage is the pure functions (`requireRoot`, `resolveBaseHome`, `decideElevation`),
-  unit-tested off-root on darwin/arm64.
+  coverage is the pure functions (`requireRoot`, `resolveBaseHome`, `decideElevation`,
+  `signalMeansAlive`), unit-tested off-root on darwin/arm64. The cross-uid liveness bug
+  is exactly what slipped past that gap — it surfaced only on the first real non-root run
+  on a Linux box, which is why that manual run is the true acceptance gate, not the
+  off-root unit tests.
 - References ADR-0011 (Linux backend's privileged shell-outs), ADR-0014 (store layout),
   ADR-0020 (self-reexec holder that inherits `SUDO_*`), ADR-0022 (the cobra CLI this
   wires into). Amends none of them; it adds the privilege model they assumed but left

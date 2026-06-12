@@ -120,7 +120,7 @@ func elevatedArgv() ([]string, error) {
 		return nil, fmt.Errorf("resolve own path: %w", err)
 	}
 	argv := make([]string, 0, 5+len(os.Args)-1)
-	argv = append(argv, "sudo", "env", envElevated+"=1", "PATH="+os.Getenv("PATH"), self)
+	argv = append(argv, "sudo", "env", envElevated+"=1", "PATH="+ensureSbinInPath(os.Getenv("PATH")), self)
 	argv = append(argv, os.Args[1:]...)
 	return argv, nil
 }
