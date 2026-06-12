@@ -761,6 +761,12 @@ When a PR changes any of these fields for a package, update its section.
   - `GetStatus` reads the live holder socket *before* on-disk `config.json`, so a
     still-starting member reports correctly. The image/VMM pull is the client's job before
     spawn now; `StateDownloading` covers only the helper's VMM-binary fetch (ADR-0020).
+  - **Cross-uid liveness (ADR-0023).** `IsRunning` probes the holder with `kill(pid, 0)`
+    and treats `EPERM` as ALIVE, not dead (`signalMeansAlive`): on Linux the holder an
+    elevated `up` spawned is root-owned, so a non-root `ls`/`ssh` cannot signal it and gets
+    `EPERM` though the process exists. Only `ESRCH` (absent) is "not running". Without this,
+    `GetStatus` short-circuited to `StateStopped` before ever dialing the (0666) socket, so
+    non-root read-only commands reported a running VM as stopped.
 
 ### §5.12 `internal/backend/cloudhypervisor`
 

@@ -153,7 +153,20 @@ func IsRunning(st *store.Store, name string) bool {
 	if err != nil {
 		return false
 	}
-	return proc.Signal(syscall.Signal(0)) == nil
+	return signalMeansAlive(proc.Signal(syscall.Signal(0)))
+}
+
+// signalMeansAlive classifies a kill(pid, 0) liveness probe. The process is alive
+// if the probe succeeded (nil) OR failed with EPERM — EPERM means the process
+// EXISTS but is owned by another user, so we are not permitted to signal it. That
+// is exactly a non-root `ls`/`ssh` probing the root-owned holder an elevated `up`
+// spawned (ADR-0023): the holder is alive, we just can't signal across the uid
+// boundary. Only a genuinely absent process (ESRCH, or any other error) is "not
+// running". Treating EPERM as dead was why non-root read-only commands reported a
+// running VM as stopped. Split out as a pure function so the cross-uid case is
+// unit-testable without spawning a foreign-owned process.
+func signalMeansAlive(err error) bool {
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // GetStatus returns the status of a member. A live holder is authoritative — even

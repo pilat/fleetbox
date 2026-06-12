@@ -49,3 +49,43 @@ func TestDecideElevation(t *testing.T) {
 		})
 	}
 }
+
+// TestEnsureSbinInPath pins the PATH fix (ADR-0023): the elevated holder needs
+// /sbin and /usr/sbin (where ip/iptables live) even when the invoking user's PATH
+// omits them — as a stock Debian cloud image's does. Surfaced by dogfooding the
+// Linux path inside a fleetbox-booted VM.
+func TestEnsureSbinInPath(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "sbin-less user PATH gets sbin appended",
+			in:   "/usr/local/bin:/usr/bin:/bin",
+			want: "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+		},
+		{
+			name: "already-present sbin dirs are not duplicated",
+			in:   "/usr/sbin:/usr/bin:/sbin:/bin",
+			want: "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin",
+		},
+		{
+			name: "empty PATH yields just the sbin dirs (no cwd-injecting empty entry)",
+			in:   "",
+			want: "/usr/local/sbin:/usr/sbin:/sbin",
+		},
+		{
+			name: "empty entries are dropped",
+			in:   "/usr/bin::/bin:",
+			want: "/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ensureSbinInPath(tc.in); got != tc.want {
+				t.Errorf("ensureSbinInPath(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
