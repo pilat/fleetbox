@@ -1,4 +1,9 @@
-//go:build linux
+//go:build linux && amd64
+
+// The --disk assembly under test is arch-independent; this runs on amd64, where
+// bootArgs is the firmware no-op and needs no real disk. The arm64 direct-kernel
+// boot (which extracts a kernel from a real image) is exercised by the nested
+// integration test instead (ADR-0024).
 
 package cloudhypervisor
 
@@ -23,7 +28,10 @@ func TestBuildArgsFixtures(t *testing.T) {
 		tap:          "fbtap0",
 	}
 
-	args := v.buildArgs()
+	args, err := v.buildArgs()
+	if err != nil {
+		t.Fatalf("buildArgs: %v", err)
+	}
 
 	diskFlags := 0
 	for _, a := range args {
@@ -57,7 +65,11 @@ func TestBuildArgsNoFixtures(t *testing.T) {
 		tap:       "fbtap0",
 	}
 
-	joined := strings.Join(v.buildArgs(), " ")
+	args, err := v.buildArgs()
+	if err != nil {
+		t.Fatalf("buildArgs: %v", err)
+	}
+	joined := strings.Join(args, " ")
 	want := "--disk path=/vm/disk.raw path=/vm/seed.iso,readonly=on --cpus"
 	if !strings.Contains(joined, want) {
 		t.Errorf("disk args = %q\nwant to contain %q", joined, want)

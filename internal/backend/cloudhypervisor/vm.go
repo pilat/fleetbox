@@ -77,7 +77,11 @@ func newVM(cfg backend.Config, nw *chNetwork, chBin, fwPath, tap string) *VM {
 func (v *VM) Start(ctx context.Context) error {
 	_ = os.Remove(v.apiSocket) // a stale socket from a prior boot would block the bind
 
-	cmd := exec.Command(v.chBin, v.buildArgs()...)
+	args, err := v.buildArgs()
+	if err != nil {
+		return fmt.Errorf("build cloud-hypervisor args: %w", err)
+	}
+	cmd := exec.Command(v.chBin, args...)
 	// Tie the VM's life to the holder's: if the holder dies — even via SIGKILL,
 	// OOM, or a panic that no Close can catch — the kernel SIGKILLs this child too,
 	// so a crashed holder never leaves a VM running with a vanished NIC (ADR-0013).
@@ -186,24 +190,31 @@ func (v *VM) WaitForIP(ctx context.Context) (string, error) {
 	}
 }
 
-// buildArgs renders the full cloud-hypervisor command line: firmware as the
-// kernel (PVH), the raw disk, the read-only seed ISO and any read-only fixture
-// images, cpu/memory, the tap NIC with the VM's MAC, and serial to the log file.
-// All block devices share one --disk flag (cloud-hypervisor takes multiple
-// space-separated values); the guest mounts fixtures by LABEL, so their order
-// after the seed does not matter (ADR-0015).
-func (v *VM) buildArgs() []string {
+// buildArgs renders the full cloud-hypervisor command line: the boot config
+// (arch-specific — firmware on x86_64, direct kernel on arm64, via bootArgs), the
+// raw disk, the read-only seed ISO and any read-only fixture images, cpu/memory,
+// the tap NIC with the VM's MAC, and serial to the log file. All block devices
+// share one --disk flag (cloud-hypervisor takes multiple space-separated values);
+// the guest mounts fixtures by LABEL, so their order after the seed does not
+// matter (ADR-0015).
+func (v *VM) buildArgs() ([]string, error) {
 	disks := make([]string, 0, 2+len(v.fixturePaths))
 	disks = append(disks, "path="+v.diskPath, "path="+v.seedPath+",readonly=on")
 	for _, p := range v.fixturePaths {
 		disks = append(disks, "path="+p+",readonly=on")
 	}
 
-	args := []string{
-		"--api-socket", v.apiSocket,
-		"--kernel", v.fwPath,
-		"--disk",
+	// How the guest kernel is booted differs by arch (bootArgs lives in
+	// boot_{amd64,arm64}.go): x86_64 chain-loads via rust-hypervisor-firmware,
+	// arm64 boots the extracted kernel directly (ADR-0024).
+	boot, err := v.bootArgs()
+	if err != nil {
+		return nil, err
 	}
+
+	args := []string{"--api-socket", v.apiSocket}
+	args = append(args, boot...)
+	args = append(args, "--disk")
 	args = append(args, disks...)
 	args = append(args,
 		"--cpus", "boot="+strconv.Itoa(v.cpus),
@@ -216,7 +227,7 @@ func (v *VM) buildArgs() []string {
 	} else {
 		args = append(args, "--serial", "off")
 	}
-	return args
+	return args, nil
 }
 
 // waitAPIReady polls vm.info until cloud-hypervisor answers, the process exits,

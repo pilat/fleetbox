@@ -44,10 +44,15 @@ import (
 	"github.com/pilat/fleetbox/internal/store"
 )
 
-// ipWaitTimeout bounds the helper-side wait for a freshly booted member's IP
-// (vz discovers it from dhcpd_leases; cloud-hypervisor probes its static address).
-// boot-member is synchronous, so this caps how long it blocks before replying.
-const ipWaitTimeout = 2 * time.Minute
+// defaultIPWaitTimeout bounds the helper-side wait for a freshly booted member's
+// IP (vz discovers it from dhcpd_leases; cloud-hypervisor probes its static
+// address). boot-member is synchronous, so this caps how long it blocks before
+// replying. It is generous on purpose: a warm boot is seconds, but a first boot
+// runs cloud-init and grows the root filesystem, which can exceed two minutes on a
+// modest host — too tight a cap turns a slow-but-fine boot into a false failure.
+// FLEETBOX_IP_WAIT_TIMEOUT overrides it (a Go duration) for the extremes, notably a
+// doubly-nested boot where bring-up is many minutes (ADR-0024).
+const defaultIPWaitTimeout = 5 * time.Minute
 
 // IsRunner returns true if the current process is a holder.
 func IsRunner() bool {
@@ -425,6 +430,17 @@ func (h *holder) reserve(name, ipHint string) (control.Reservation, error) {
 	return res, nil
 }
 
+// ipWaitTimeout is defaultIPWaitTimeout unless FLEETBOX_IP_WAIT_TIMEOUT overrides
+// it with a positive Go duration (e.g. "10m") — the knob slow/nested hosts need.
+func ipWaitTimeout() time.Duration {
+	if v := os.Getenv("FLEETBOX_IP_WAIT_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultIPWaitTimeout
+}
+
 // bootMember creates and starts a member's VM on the shared network from a
 // resolved spec plus the address reserved for it, then waits for its IP. It is
 // synchronous: it returns only once the VM is up (IP known) or has failed, so the
@@ -489,7 +505,7 @@ func (h *holder) bootMember(ctx context.Context, spec control.MemberSpec) error 
 		return fmt.Errorf("start %s: %w", spec.Name, err)
 	}
 
-	ipCtx, cancel := context.WithTimeout(ctx, ipWaitTimeout)
+	ipCtx, cancel := context.WithTimeout(ctx, ipWaitTimeout())
 	ip, err := vm.WaitForIP(ipCtx)
 	cancel()
 	if err != nil {
