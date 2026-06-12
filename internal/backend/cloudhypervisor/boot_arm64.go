@@ -225,19 +225,7 @@ func copyKernel(src, dst string) error {
 		defer func() { _ = gz.Close() }()
 		reader = gz
 	}
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", dst, err)
-	}
-	defer func() { _ = out.Close() }()
-	if _, err := io.Copy(out, reader); err != nil {
-		return fmt.Errorf("write kernel: %w", err)
-	}
-	if err := out.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", dst, err)
-	}
-	return nil
+	return atomicWrite(dst, reader)
 }
 
 func copyFile(src, dst string) error {
@@ -246,16 +234,32 @@ func copyFile(src, dst string) error {
 		return fmt.Errorf("open %s: %w", src, err)
 	}
 	defer func() { _ = in.Close() }()
-	out, err := os.Create(dst)
+	return atomicWrite(dst, in)
+}
+
+// atomicWrite streams r into dst via a sibling temp file renamed on success, so an
+// interrupted copy (I/O error, ENOSPC, a SIGKILL from the holder's Pdeathsig)
+// never leaves a truncated file behind. A later boot would treat that file as a
+// valid cache (fileExists short-circuits re-extraction) and boot a corrupt kernel;
+// the rename makes the cache all-or-nothing.
+func atomicWrite(dst string, r io.Reader) error {
+	tmp := dst + ".tmp"
+	out, err := os.Create(tmp)
 	if err != nil {
-		return fmt.Errorf("create %s: %w", dst, err)
+		return fmt.Errorf("create %s: %w", tmp, err)
 	}
-	defer func() { _ = out.Close() }()
-	if _, err := io.Copy(out, in); err != nil {
-		return fmt.Errorf("copy %s: %w", src, err)
+	defer func() {
+		_ = out.Close()
+		_ = os.Remove(tmp) // best-effort: a no-op once renamed, cleanup on failure
+	}()
+	if _, err := io.Copy(out, r); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
 	}
 	if err := out.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", dst, err)
+		return fmt.Errorf("close %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", tmp, dst, err)
 	}
 	return nil
 }
