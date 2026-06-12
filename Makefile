@@ -1,4 +1,4 @@
-.PHONY: all build helper test test-fake test-fake-linux test-vm lint lint-fake catalog vendor-vz clean
+.PHONY: all build helper test test-fake test-fake-linux test-vm test-nested lint lint-fake catalog vendor-vz clean
 
 # Default target
 all: build
@@ -69,6 +69,15 @@ test-fake-linux:
 test-vm: helper
 	FLEETBOX_HELPER=$(CURDIR)/bin/fleetbox-helper \
 		go test -count=1 -v -timeout 30m -run TestVM ./fleetboxtest
+
+# Nested dogfood gate: fleetbox-on-mac boots a Linux guest with nested /dev/kvm,
+# then a linux/arm64 fleetbox boots a NESTED VM inside it via the arm64
+# direct-kernel path (ADR-0024). LOCAL-ONLY (no CI lane — the runner needs an M3+
+# macOS host); gated behind the fleetbox_nested build tag. Slow: a nested boot is
+# minutes, so the timeout is generous.
+test-nested: helper
+	FLEETBOX_HELPER=$(CURDIR)/bin/fleetbox-helper \
+		go test -count=1 -v -timeout 40m -tags fleetbox_nested -run TestNestedLinuxBoot ./fleetboxtest
 
 # Refresh the pinned cloud-image catalog (internal/image/catalog.json). The
 # human-authored keys decide which OSes exist; the tool only refreshes the values

@@ -464,6 +464,13 @@ When a PR changes any of these fields for a package, update its section.
   - Every VM it creates is destroyed via `t.Cleanup` — test VMs never outlive tests.
   - Skips (not fails) on unsupported platforms (`skipIfUnsupported`).
   - VM names are derived from test names (`safeName`) so parallel tests don't collide.
+  - **Nested dogfood gate (`nested_test.go`, build tag `fleetbox_nested`).** The first
+    fleetbox-tests-fleetbox loop: on M3+ macOS it boots a Linux guest with nested
+    `/dev/kvm`, pushes a freshly built linux/arm64 fleetbox in, and boots a NESTED VM
+    there via the arm64 direct-kernel path (ADR-0024). LOCAL-ONLY for now — there is no
+    CI lane (the runner needs an M3+ macOS host); the vector is laid for a future job. Run
+    it with `FLEETBOX_HELPER=… go test -tags fleetbox_nested -run TestNestedLinuxBoot
+    -timeout 30m ./fleetboxtest`.
 
 ### §5.3 `cmd/fleetbox`
 
@@ -758,8 +765,9 @@ When a PR changes any of these fields for a package, update its section.
 ### §5.12 `internal/backend/cloudhypervisor`
 
 - Purpose: the cloud-hypervisor implementation of `backend.Backend` on Linux. Boots a
-  stock cloud image with the pinned `rust-hypervisor-firmware`, controlled over CH's
-  REST API on a per-VM unix socket — pure Go, no cgo (ADR-0011).
+  stock cloud image — via the pinned `rust-hypervisor-firmware` on x86_64, or a direct
+  kernel boot on arm64 (ADR-0024) — controlled over CH's REST API on a per-VM unix socket
+  — pure Go, no cgo (ADR-0011).
 - Owns: the CH child process per VM and its `exited` channel; the `chNetwork` (Linux
   bridge, subnet, taps, egress rules); the per-bridge write-ahead records and
   `ip_forward` marker under `~/.fleetbox/networks/` (`netstate.go`); the pinned
@@ -777,6 +785,14 @@ When a PR changes any of these fields for a package, update its section.
     mounts each by `LABEL`, so order is irrelevant (ADR-0015). `CreateNetwork`'s first `ip`
     call is the backstop permission check (it errors `create bridge (needs root)` if a
     non-root holder ever reaches it; the preflight already gated on root — ADR-0023).
+  - **Arch-specific boot (ADR-0024, `boot_{amd64,arm64}.go`).** x86_64 boots via the PVH
+    `rust-hypervisor-firmware` (`--kernel <fw>`), which chain-loads the guest kernel from
+    the disk. arm64 boots the kernel **directly** — the aarch64 firmware does not execute
+    the guest under Apple-Silicon nested virt and is untested on bare metal — extracting
+    the image's own `vmlinuz`/`initrd` from `disk.raw` once (loopback mount, gunzip if
+    needed; cached next to the disk) and passing `--kernel`/`--initramfs`/`--cmdline
+    "console=ttyAMA0 root=/dev/vda1 rw"`. The extracted kernel is the image's at first
+    boot (a later in-guest kernel update needs `rm`+`up`).
   - `CreateNetwork` makes one bridge per cluster on a free `/24` (gateway `.1`) and
     installs `iptables` MASQUERADE/FORWARD egress rules; `Network.Reserve(name, ipHint)`
     allocates a member's static IP on that `/24` (lowest free, or the hint if free) — the
