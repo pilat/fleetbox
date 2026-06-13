@@ -386,7 +386,7 @@ func (h *holder) createNetwork() (string, error) {
 	}
 	h.mu.Unlock()
 
-	// backend.CreateNetwork is slow on Linux (ip/iptables system calls + a
+	// backend.CreateNetwork is slow on Linux (netlink/nftables system calls + a
 	// reconcile sweep); do NOT hold h.mu across it, or a concurrent status/stop/
 	// reserve RPC would stall for the full duration. Double-check after.
 	nw, err := h.backend.CreateNetwork()

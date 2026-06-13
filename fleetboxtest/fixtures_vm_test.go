@@ -1,5 +1,3 @@
-//go:build darwin && arm64
-
 package fleetboxtest_test
 
 import (
@@ -22,8 +20,9 @@ import (
 // charset-restricted names could not carry, proving the ext4 advantage — and
 // that the mount is read-only (a write fails).
 //
-// Named with the TestVM prefix so `make test-vm` (-test.run TestVM) runs it.
-// Boots a real VM: skipped on unsupported platforms (via the fixture) and -short.
+// Cross-platform (no build tag): fixtures attach read-only on both backends
+// (ADR-0015). Boots a real VM, so it skips on hosts that cannot boot one (via the
+// fixture → SkipIfCannotBootVM) and in -short.
 func TestVMFixtureReadOnly(t *testing.T) {
 	fleetboxtest.SkipIfShort(t, "boots real VMs")
 

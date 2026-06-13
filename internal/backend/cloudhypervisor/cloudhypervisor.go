@@ -55,11 +55,11 @@ func (b *Backend) SupportsClustering() bool {
 	return true
 }
 
-// Reconcile removes the host resources (bridges, taps, iptables rules) of every
-// network whose owning holder is no longer alive, and restores ip_forward once
-// nothing of ours remains. It is the engine behind `fleetbox prune`; the same
-// sweep runs automatically at the start of each CreateNetwork so orphans from a
-// crashed holder self-heal on the next up (ADR-0013).
+// Reconcile removes the host resources (bridges, taps, nft firewall tables) of
+// every network whose owning holder is no longer alive, and restores the uplink's
+// forwarding flag once nothing of ours remains. It is the engine behind `fleetbox
+// prune`; the same sweep runs automatically at the start of each CreateNetwork so
+// orphans from a crashed holder self-heal on the next up (ADR-0013, ADR-0025).
 func (b *Backend) Reconcile() error {
 	return b.reconcile(true)
 }
@@ -135,11 +135,16 @@ func checkKVM() error {
 	return nil
 }
 
-// kvmNestedEnabled reports whether the kvm_intel/kvm_amd nested parameter is on.
+// kvmNestedEnabled reports whether KVM's nested parameter is on. It checks the x86
+// submodules (kvm_intel/kvm_amd) and the base kvm module — the latter is where
+// arm64 (and the generic case) expose the flag, since arm64 has no kvm_intel/
+// kvm_amd. Without it the probe was x86-only and reported false on every arm64
+// host, even one with ARMv8.3+ nested virt enabled.
 func kvmNestedEnabled() bool {
 	for _, p := range []string{
-		"/sys/module/kvm_intel/parameters/nested",
-		"/sys/module/kvm_amd/parameters/nested",
+		"/sys/module/kvm_intel/parameters/nested", // x86 Intel
+		"/sys/module/kvm_amd/parameters/nested",   // x86 AMD
+		"/sys/module/kvm/parameters/nested",       // arm64 / generic
 	} {
 		data, err := os.ReadFile(p)
 		if err != nil {

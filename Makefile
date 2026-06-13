@@ -1,4 +1,4 @@
-.PHONY: all build helper test test-fake test-fake-linux test-vm test-nested lint lint-fake catalog vendor-vz clean
+.PHONY: all build helper test test-fake test-fake-linux test-vm lint lint-fake catalog vendor-vz clean
 
 # Default target
 all: build
@@ -61,23 +61,22 @@ test-fake-linux:
 	# Same fake-tagged orchestrator test as test-fake (local stubs, no helper).
 	CGO_ENABLED=1 go test -race -tags fleetbox_fake ./internal/orchestrator/
 
-# Run VM integration tests (requires darwin/arm64, M3+, macOS 26+).
+# Run the full, capability-driven VM suite (requires darwin/arm64, M3+, macOS 26+).
 # Builds and ad-hoc-signs the helper, then points the library at it via
-# FLEETBOX_HELPER. The test binary itself links no hypervisor and needs neither
-# cgo nor codesign — that is the whole point of the sever (ADR-0017).
-# Timeout is well above Go's 10m default: a cluster test boots several VMs.
+# FLEETBOX_HELPER. There is NO -run selector: each test self-skips on capability and
+# speed, so this runs everything the host supports — conformance + cluster, PLUS the
+# nested dogfood (TestNestedLinuxBoot, folded in from the old `make test-nested`),
+# which boots an outer guest and runs this same suite inside it on cloud-hypervisor.
+# The test binary itself links no hypervisor and needs neither cgo nor codesign — the
+# whole point of the sever (ADR-0017). The -timeout is a generous backstop, not a per-test
+# budget: each VM boot is capped by FLEETBOX_IP_WAIT_TIMEOUT / BootTimeout and the nested
+# orchestrator self-caps at 40m, so a true hang is caught long before this fires. It must
+# clear the SUM of the direct boots (conformance + cluster + fixtures) AND the nested
+# orchestrator's 40m, because a Go -timeout kills the binary without running t.Cleanup —
+# leaking VMs. Hence 90m.
 test-vm: helper
 	FLEETBOX_HELPER=$(CURDIR)/bin/fleetbox-helper \
-		go test -count=1 -v -timeout 30m -run TestVM ./fleetboxtest
-
-# Nested dogfood gate: fleetbox-on-mac boots a Linux guest with nested /dev/kvm,
-# then a linux/arm64 fleetbox boots a NESTED VM inside it via the arm64
-# direct-kernel path (ADR-0024). LOCAL-ONLY (no CI lane — the runner needs an M3+
-# macOS host); gated behind the fleetbox_nested build tag. Slow: a nested boot is
-# minutes, so the timeout is generous.
-test-nested: helper
-	FLEETBOX_HELPER=$(CURDIR)/bin/fleetbox-helper \
-		go test -count=1 -v -timeout 40m -tags fleetbox_nested -run TestNestedLinuxBoot ./fleetboxtest
+		go test -count=1 -v -timeout 90m ./fleetboxtest
 
 # Refresh the pinned cloud-image catalog (internal/image/catalog.json). The
 # human-authored keys decide which OSes exist; the tool only refreshes the values

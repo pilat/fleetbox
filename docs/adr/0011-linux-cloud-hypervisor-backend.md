@@ -6,7 +6,10 @@ cloud images are now checksum-pinned to dated snapshots exactly like the binarie
 below; the "unlike cloud images, which may stay unpinned for latest" aside in
 Decision 3 no longer holds. Amended by [ADR-0020](0020-helper-thin-backend-server.md):
 the cloud-hypervisor backend now runs inside a helper process (reached by self-reexec)
-rather than in-process, driven by a client-side orchestrator.)
+rather than in-process, driven by a client-side orchestrator. Amended by
+[ADR-0025](0025-linux-netlink-nftables.md): the bridge/tap/egress plumbing is now
+programmed directly via netlink + nftables — no `ip`/`iptables` shell-outs — with
+per-interface forwarding instead of the global `ip_forward` switch.)
 
 ## Context
 

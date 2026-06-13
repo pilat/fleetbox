@@ -1,25 +1,34 @@
-//go:build fleetbox_nested
-
 // This is the dogfood gate: use fleetbox to test fleetbox. On an Apple-Silicon mac
-// (M3+, macOS 26+) fleetbox boots a Linux guest with a working nested /dev/kvm,
-// then a freshly built linux/arm64 fleetbox boots a NESTED VM inside it via the
-// arm64 direct-kernel path (ADR-0024) — the path that does NOT run under the
-// rust-hypervisor-firmware the firmware boot used.
+// (M3+, macOS 26+) fleetbox boots a Linux guest with a working nested /dev/kvm, then
+// the SAME unified fleetboxtest suite — cross-built for linux/arm64 — runs INSIDE that
+// guest on the cloud-hypervisor backend via the arm64 direct-kernel path (ADR-0024).
+// Inside, the conformance test (single-VM lifecycle + egress through the nft
+// masquerade, ADR-0025) and the cluster test (VM↔VM over the shared bridge + subnet
+// isolation, ADR-0011) run against a live kernel; the orchestrator below self-skips
+// there (it is darwin-only), so there is no recursion. fleetbox testing fleetbox,
+// exercising the real netlink/nftables code end to end.
 //
-// It is gated behind the `fleetbox_nested` build tag and is LOCAL-ONLY for now:
-// there is no CI lane because the runner must be an M3+ macOS host. The vector is
-// left for a future CI job. Run it locally with the signed helper:
+// There is no separate in-guest test: the dogfood is the real suite. The inner run's
+// PASS/FAIL is the inner process's exit code (which VM.SSH surfaces as a non-nil error
+// on non-zero exit) — the output is logged for diagnosis, not string-matched.
 //
-//	FLEETBOX_HELPER=$PWD/bin/fleetbox-helper \
-//	  go test -tags fleetbox_nested -run TestNestedLinuxBoot -timeout 30m -v ./fleetboxtest
+// No build tag: TestNestedLinuxBoot is gated at runtime instead (darwin/arm64 +
+// NestedVirtSupported + !-short + FLEETBOX_HELPER set). It folds into the full
+// `make test-vm` run; it is NOT auto-downloaded — nested is deliberate, heavy setup,
+// so it skips unless FLEETBOX_HELPER points at a signed helper (`make helper` does this
+// for `make test-vm`).
 //
-// Note: a nested boot is slow; if the inner `up` trips the holder's IP-wait, the
-// serial log under the inner ~/.fleetbox shows the boot progressing — nested timing,
-// not the direct-kernel path, is the cause.
+// LOCAL-ONLY: no CI lane, because the runner must be an M3+ macOS host.
+//
+// Note: a nested boot is slow; FLEETBOX_IP_WAIT_TIMEOUT (honored by both the holder's
+// IP-wait and the fixtures' BootTimeout) is widened to 20m inside the guest. If the
+// inner cluster still trips it, the serial log under the inner ~/.fleetbox shows the
+// boot progressing — nested timing, not the direct-kernel path, is the cause.
 package fleetboxtest
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,66 +40,72 @@ import (
 	"github.com/pilat/fleetbox"
 )
 
-// elevateInGuest runs a privileged fleetbox command inside the guest as root. The
-// cloud-init user has passwordless sudo; FLEETBOX_ELEVATED short-circuits the CLI's
-// own auto-elevation, the PATH carries sbin so the holder finds ip/iptables, and
-// FLEETBOX_IP_WAIT_TIMEOUT widens the IP-wait because a doubly-nested boot is slow.
-const elevateInGuest = "sudo -n env FLEETBOX_ELEVATED=1 FLEETBOX_IP_WAIT_TIMEOUT=15m " +
-	"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /tmp/fleetbox"
+// elevateInGuest runs a privileged fleetbox binary inside the guest as root. The
+// cloud-init user has passwordless sudo; the PATH keeps /sbin reachable for the
+// elevated environment (the backend itself no longer shells out — host networking
+// is netlink/nftables, ADR-0025), and FLEETBOX_IP_WAIT_TIMEOUT widens both the
+// holder's IP-wait and the fixtures' BootTimeout because a doubly-nested boot is slow.
+const elevateInGuest = "sudo -n env FLEETBOX_IP_WAIT_TIMEOUT=20m " +
+	"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+// TestNestedLinuxBoot is the Mac-side orchestrator (see the file comment).
 func TestNestedLinuxBoot(t *testing.T) {
+	SkipIfShort(t, "nested dogfood boots an outer guest and runs the full suite inside it")
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
 		t.Skip("nested boot needs an Apple-Silicon mac (M3+, macOS 26+)")
+	}
+	if !fleetbox.NestedVirtSupported() {
+		t.Skip("host lacks nested virtualization (Apple Silicon M3+, macOS 26+)")
 	}
 	if os.Getenv("FLEETBOX_HELPER") == "" {
 		t.Skip("set FLEETBOX_HELPER to the signed helper (see `make helper` / make test-vm)")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Minute)
 	defer cancel()
 
-	// 1. Build the linux/arm64 fleetbox that will run inside the guest.
-	bin := filepath.Join(t.TempDir(), "fleetbox-linux-arm64")
-	build := exec.CommandContext(ctx, "go", "build", "-o", bin, "../cmd/fleetbox")
+	// 1. Cross-build the linux/arm64 fleetboxtest *test binary* that will run inside
+	//    the guest. It is the SAME unified suite (no special tag) and is its own helper
+	//    there (self-reexec on --fleetbox-runner), exactly like vm-linux.yml's binary.
+	bin := filepath.Join(t.TempDir(), "fleetboxtest-linux-arm64")
+	build := exec.CommandContext(ctx, "go", "test", "-c", "-o", bin, ".")
 	build.Env = append(os.Environ(), "GOOS=linux", "GOARCH=arm64", "CGO_ENABLED=0")
 	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build linux/arm64 fleetbox: %v\n%s", err, out)
+		t.Fatalf("cross-build linux/arm64 fleetboxtest binary: %v\n%s", err, out)
 	}
 
 	// 2. Boot the outer Linux guest; on M3+ it gets a working /dev/kvm (nested virt).
+	//    Sized with headroom for the inner cluster (peak 8 GB across 4 small members).
 	outer := Start(t, "debian-12",
-		fleetbox.WithCPUs(4), fleetbox.WithMemoryGB(8), fleetbox.WithDiskGB(40))
+		fleetbox.WithCPUs(8), fleetbox.WithMemoryGB(16), fleetbox.WithDiskGB(60))
 
 	if out, err := outer.SSH(ctx, "test -e /dev/kvm && echo kvm-ok"); err != nil ||
 		!strings.Contains(out, "kvm-ok") {
 		t.Fatalf("guest has no /dev/kvm (nested virt unavailable?): %v\n%s", err, out)
 	}
 
-	// 3. Push the linux fleetbox in (the public VM API exposes SSH but not copy, so
-	//    scp directly against the VM IP with fleetbox's per-installation key).
+	// 3. Push the test binary in (the public VM API exposes SSH but not copy, so scp
+	//    directly against the VM IP with fleetbox's per-installation key).
 	scp := exec.CommandContext(ctx, "scp",
 		"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-		"-i", sshKeyPath(t), bin, "fleetbox@"+outer.IP().String()+":/tmp/fleetbox")
+		"-i", sshKeyPath(t), bin, "fleetbox@"+outer.IP().String()+":/tmp/fleetboxtest")
 	if out, err := scp.CombinedOutput(); err != nil {
-		t.Fatalf("scp fleetbox into guest: %v\n%s", err, out)
+		t.Fatalf("scp test binary into guest: %v\n%s", err, out)
 	}
 
-	// 4. Boot a NESTED VM inside the guest with the new arm64 direct-kernel path.
-	if out, err := outer.SSH(ctx, "chmod +x /tmp/fleetbox && "+elevateInGuest+" up innervm"); err != nil {
-		t.Fatalf("nested `fleetbox up` failed: %v\n%s", err, out)
-	} else {
-		t.Logf("nested up:\n%s", out)
-	}
-
-	// 5. The nested VM must be running with an IP (root `ls` — the holder is root).
-	out, err := outer.SSH(ctx, elevateInGuest+" ls")
+	// 4. Run the FULL suite inside the guest: no -run selector, no -short, so capability
+	//    skip runs everything the guest supports — conformance + cluster on the
+	//    cloud-hypervisor backend; the orchestrator self-skips (not darwin). A nested
+	//    boot is slow, hence the generous inner -test.timeout and the widened
+	//    FLEETBOX_IP_WAIT_TIMEOUT in elevateInGuest. Pass/fail is the binary's exit code
+	//    (surfaced as the SSH error), NOT a string match on the output.
+	cmd := fmt.Sprintf("chmod +x /tmp/fleetboxtest && %s /tmp/fleetboxtest "+
+		"-test.v -test.timeout 30m", elevateInGuest)
+	out, err := outer.SSH(ctx, cmd)
+	t.Logf("in-guest unified suite output:\n%s", out)
 	if err != nil {
-		t.Fatalf("nested `ls`: %v\n%s", err, out)
+		t.Fatalf("in-guest unified suite failed (inner exit non-zero): %v", err)
 	}
-	if !strings.Contains(out, "innervm") || !strings.Contains(out, "running") {
-		t.Fatalf("nested VM is not running:\n%s", out)
-	}
-	t.Logf("nested VM running:\n%s", out)
 }
 
 // sshKeyPath returns fleetbox's per-installation SSH private key, used to scp into

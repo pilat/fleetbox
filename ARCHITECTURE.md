@@ -69,7 +69,7 @@ Where the canonical version of each thing lives. When two files disagree, the So
 | macOS helper catalog | `internal/helperdist/helperdist.go` `catalog` map | fleetbox-helper: version + per-arch URL + sha256; `FLEETBOX_HELPER` override (ADR-0017). |
 | Holder protocol | `internal/control/control.go` (client) + `internal/holder/holder.go` (server) | Wire commands + states + bound-mode bind/version handshake. |
 | Coordination test seam | `internal/backend/fake` + the `fleetbox_fake` build tag | Fake backend so CI gates teardown + the holder protocol with no VM boot; `make test-fake`/`make lint-fake` (ADR-0018). |
-| Network teardown records & reconcile | `internal/backend/cloudhypervisor/netstate.go` | Write-ahead bridge/tap records + `ip_forward` marker under `~/.fleetbox/networks/`; crash recovery (ADR-0013). |
+| Network teardown records & reconcile | `internal/backend/cloudhypervisor/netstate.go` | Write-ahead bridge/tap/uplink records + per-uplink forwarding marker under `~/.fleetbox/networks/`; crash recovery (ADR-0013, ADR-0025). |
 | Guest provisioning contract | `internal/seed/seed.go` (user-data / meta-data) | One user, one SSH key, hostname, fixture mount lines. Nothing else. |
 | Fixture payload format | `internal/fixture/fixture.go` | Host dir → read-only ext4 image (go-ext4fs), attached read-only, mounted by LABEL (ADR-0015). |
 | Code style rules | `docs/coding-style.md` + `.golangci.yml` | Prescriptive. Lint enforces the machine-checkable subset. |
@@ -78,7 +78,7 @@ Where the canonical version of each thing lives. When two files disagree, the So
 | Build & signing recipe | `Makefile` + `entitlements.plist` | `com.apple.security.virtualization` entitlement. |
 | Vendored vz provenance & regen | `third_party/vz/NOTICE` + `hack/vendor-vz.sh` | Pinned upstream + vmnet-patch SHAs; `make vendor-vz` regenerates (ADR-0008, ADR-0016). |
 | CI behavior | `.github/workflows/ci.yml` | macOS job: lint + linux/darwin build + unit + fake coordination (no VZ boot). Linux job: build + unit + fake coordination via self-reexec. |
-| Linux VM-boot CI | `.github/workflows/vm-linux.yml` | Boots a real VM on an x86-64 KVM runner. |
+| Linux VM-boot CI | `.github/workflows/vm-linux.yml` | Runs the full capability-driven suite (conformance + cluster) on an x86-64 KVM runner. |
 | Release pipelines | `.github/workflows/{release-helper,release}.yml` + `.goreleaser.yaml` | Two channels: helper (`helper-v*`, macOS, codesign) and CLI (`v*`, goreleaser; also pushes a macOS Homebrew cask to the `pilat/homebrew-fleetbox` tap, ADR-0021). |
 | Working specs (local only) | `ai/tasks/` | Gitignored. Durable decisions must graduate to ADRs. |
 
@@ -96,9 +96,9 @@ path. The sequence:
 0. **Preflight** — `preflight()` (per-platform) fails fast with an actionable message if
    the host can't run a VM, before the (possibly multi-GB) image download. No-op on macOS;
    on Linux it checks `/dev/kvm` is openable and the process is root (`euid==0`). Root, not
-   `CAP_NET_ADMIN`, is the honest gate — the backend shells out to `ip`/`iptables` (file
-   caps don't survive `exec`) and writes DAC-gated `ip_forward`, so only root works; the
-   CLI auto-elevates before this runs (ADR-0023).
+   `CAP_NET_ADMIN`, is the honest gate — the backend programs netlink + nf_tables (which
+   need `CAP_NET_ADMIN`) and writes DAC-gated per-interface forwarding under `/proc`, so
+   only root reliably works; the CLI auto-elevates before this runs (ADR-0023, ADR-0025).
 1. **Options** — apply functional options over defaults (image=debian-12, cpus=2,
    mem=4GB, disk=20GB).
 2. **Store** — `store.New()` ensures `~/.fleetbox/{clusters,images}/` exist.
@@ -159,7 +159,7 @@ All persistent state lives under `~/.fleetbox/` and is owned by `internal/store`
 │   └── <hash>.ctl         #   bound-mode holder-wide socket (bind handshake + EOF teardown)
 ├── images/                # downloaded + converted raw cloud images (cache)
 ├── bin/                   # downloaded checksum-pinned binaries: cloud-hypervisor + firmware (Linux), fleetbox-helper-<ver> (macOS)
-├── networks/              # Linux: per-bridge write-ahead records (<bridge>.json) + ipforward.orig marker (ADR-0013)
+├── networks/              # Linux: per-bridge write-ahead records (<bridge>.json) + per-uplink forwarding markers (fwd-<iface>.orig) (ADR-0013, ADR-0025)
 ├── id_ed25519, id_ed25519.pub   # per-installation SSH keypair
 └── runner-<name>.log      # holder process output, named after the first member
 ```
@@ -212,10 +212,12 @@ single NIC. How that is realized differs by backend.
   network: the backend falls back to a per-VM `VZNATNetworkDeviceAttachment` (a single,
   isolated VM, no clusters — ADR-0012).
 - **Linux (cloud-hypervisor).** `CreateNetwork` makes one **Linux bridge per cluster**
-  on a free `/24` (gateway `.1`), enables IPv4 forwarding (only if it was off, restoring
-  it once nothing of ours remains — ADR-0013), and installs `iptables`
-  MASQUERADE/FORWARD rules for egress. Each VM gets a **tap** enslaved to the bridge
-  (`--net tap=…`); its static IP is allocated **helper-side** by `Network.Reserve` (which
+  on a free `/24` (gateway `.1`) via netlink, enables **per-interface** IPv4 forwarding on
+  the bridge and the discovered uplink (never the global switch; restoring the uplink's
+  flag once nothing of ours remains — ADR-0025), and installs an `nf_tables` table with a
+  masquerade rule plus a self-protecting forward-filter drop for egress. Each VM gets a
+  **tap** enslaved to the bridge (`--net tap=…`); its static IP is allocated **helper-side**
+  by `Network.Reserve` (which
   honors a stopped member's stored IP as a hint) and the client injects the returned IP +
   derived gateway/netmask via the seed's NoCloud `network-config` (ADR-0020). Members on one
   bridge reach the host, each other, and the internet — the SharedMode property reproduced on
@@ -322,7 +324,8 @@ The support matrix and how it is realized in build tags:
   `linux`; `internal/dhcp` is tagged `darwin`. `cmd/fleetbox-helper` is darwin/arm64 (a stub
   elsewhere). `cmd/fleetbox` links the orchestrator (client) and, on linux, the holder (via
   the root's blank import) — but never a hypervisor on darwin. `fleetboxtest` compiles
-  everywhere but its fixtures skip on non-darwin/arm64 (Linux fixtures are a follow-up).
+  everywhere; its VM-boot tests run wherever the host can boot a VM (Linux via `/dev/kvm`,
+  darwin/arm64 via vz — `SkipIfCannotBootVM`) and skip otherwise.
 - **macOS networking floor is 26.0 for clusters.** vmnet SharedMode
   (`VZVmnetNetworkDeviceAttachment`) exists only on macOS 26+ (ADR-0008). The vz backend
   detects the major version (`syscall.Sysctl("kern.osproductversion")`) once and, below
@@ -340,15 +343,18 @@ The support matrix and how it is realized in build tags:
   auto-downloaded and checksum-pinned via the `internal/helperdist` catalog;
   `FLEETBOX_HELPER` overrides it for dev/offline.
 - **Linux host prerequisites** (not provisionable; probed with clear errors): `/dev/kvm`
-  present and accessible (user in the `kvm` group) and **root** — the bridge/taps still
-  need `CAP_NET_ADMIN` (root has it), plus `CAP_DAC_OVERRIDE` to write `ip_forward`, so
-  the preflight gates on `euid==0`, not on the capability. The CLI auto-elevates via sudo;
+  present and accessible (user in the `kvm` group) and **root** — the bridge/taps and the
+  nft firewall need `CAP_NET_ADMIN` (root has it), plus `CAP_DAC_OVERRIDE` to write the
+  per-interface forwarding sysctls under `/proc`, so the preflight gates on `euid==0`, not
+  on the capability. The CLI auto-elevates via sudo;
   library/tests run under sudo (ADR-0023). The cloud-hypervisor binary and firmware are
   downloaded and checksum-pinned to `~/.fleetbox/bin/` (ADR-0011); the Linux path is pure
   Go, no cgo.
 - **Nested virtualization** (consumers running KVM inside guests) needs M3+ on macOS,
   or the host KVM `nested` parameter on Linux. `fleetbox.NestedVirtSupported()` reports
-  availability; `fleetboxtest` skips when unsupported.
+  availability. The fixtures gate VM-boot tests on boot-capability, NOT nested virt
+  (`fleetboxtest.SkipIfCannotBootVM`: `/dev/kvm` openable on Linux, `NestedVirtSupported()`
+  on darwin) — so a leaf VM boots on an arm64 Linux guest where nested virt is unavailable.
 - **CI.** `ci.yml` has two jobs. The **macOS** (`macos-26`) job cannot boot VZ VMs (no
   nested virtualization): it runs lint (darwin/linux/fake) + darwin build + linux cross-build
   + unit + the **fake-backend coordination tests** (`make test-fake`). The **Linux**
@@ -357,10 +363,11 @@ The support matrix and how it is realized in build tags:
   client↔helper path — teardown and the holder protocol — gate pre-merge with no VM boot and
   no codesign, the one VM-free check of the bound-helper reap (ADR-0018/0020); everything runs
   under `-race`. Unlike VZ, the cloud-hypervisor backend *is* CI-testable on a GitHub x86-64
-  Linux runner, which exposes `/dev/kvm` (after a one-time udev rule): `vm-linux.yml` boots a
-  real VM there, now exercising the full client→RPC→helper path (the test binary is its own
-  helper via self-reexec). arm64 hosted Linux runners have no KVM. Do not switch the macOS CI
-  to ubuntu.
+  Linux runner, which exposes `/dev/kvm` (after a one-time udev rule): `vm-linux.yml` boots
+  real VMs there — the full capability-driven suite (conformance + a multi-node cluster, so
+  amd64 gets VM↔VM coverage; the nested dogfood self-skips, needing an M3+ macOS host) over
+  the full client→RPC→helper path (the test binary is its own helper via self-reexec). arm64
+  hosted Linux runners have no KVM. Do not switch the macOS CI to ubuntu.
 
 ## §5. Modules
 
@@ -406,8 +413,9 @@ When a PR changes any of these fields for a package, update its section.
   - `ErrClustersUnsupported` — returned when a 2nd member is requested on a non-clustering
     backend (macOS < 26, ADR-0012)
   - `NestedVirtSupported() bool`
-  - `Prune() error` — reclaim the inert host resources (Linux bridges, taps, iptables
-    rules) a crashed holder left, and restore `ip_forward`; no-op on macOS. Runs
+  - `Prune() error` — reclaim the inert host resources (Linux bridges, taps, nft firewall
+    tables) a crashed holder left, and restore the uplink forwarding flag; no-op on macOS.
+    Runs
     automatically on the CLI `down`, so cleanup is never the user's job (crashed VMs
     themselves die with their holder — `Pdeathsig` on Linux, the parent-pid poll on macOS,
     ADR-0013/ADR-0017); exported for library callers that want to sweep explicitly
@@ -458,19 +466,26 @@ When a PR changes any of these fields for a package, update its section.
 - Owns: stateless (cleanup registration only).
 - Depends on: `fleetbox` (public API only — no internal imports).
 - Public API: `Start(t, image, opts...) *fleetbox.VM`,
-  `StartN(t, prefix, n, opts...) []*fleetbox.VM`, `SkipIfShort(t, reason)`.
+  `StartN(t, prefix, n, opts...) []*fleetbox.VM`, `SkipIfShort(t, reason)`,
+  `SkipIfCannotBootVM(t)`, `BootTimeout(n int) time.Duration`.
 - Invariants:
   - Uses only the public `fleetbox` API.
   - Every VM it creates is destroyed via `t.Cleanup` — test VMs never outlive tests.
-  - Skips (not fails) on unsupported platforms (`skipIfUnsupported`).
+  - **Capability-driven, no selectors.** Tests skip (never fail) on a host that cannot
+    boot a VM via `SkipIfCannotBootVM` (`/dev/kvm` openable on Linux; vz M3+/macOS 26 via
+    `NestedVirtSupported()` on darwin) and on `-short` via `SkipIfShort`. `StartN` turns the
+    public `ErrClustersUnsupported` sentinel into `t.Skip`, so the cluster test self-skips on
+    macOS < 26. No `-run` filters or build tags select tests.
+  - Boot budgets come from `BootTimeout(n)`, which honors `FLEETBOX_IP_WAIT_TIMEOUT`
+    (else `n*5min`) — one knob widens the holder's IP-wait and the fixture context together.
   - VM names are derived from test names (`safeName`) so parallel tests don't collide.
-  - **Nested dogfood gate (`nested_test.go`, build tag `fleetbox_nested`).** The first
-    fleetbox-tests-fleetbox loop: on M3+ macOS it boots a Linux guest with nested
-    `/dev/kvm`, pushes a freshly built linux/arm64 fleetbox in, and boots a NESTED VM
-    there via the arm64 direct-kernel path (ADR-0024). LOCAL-ONLY for now — there is no
-    CI lane (the runner needs an M3+ macOS host); the vector is laid for a future job. Run
-    it with `FLEETBOX_HELPER=… go test -tags fleetbox_nested -run TestNestedLinuxBoot
-    -timeout 30m ./fleetboxtest`.
+  - **Nested dogfood (`nested_test.go`, `TestNestedLinuxBoot`).** The fleetbox-tests-fleetbox
+    loop: on M3+ macOS it boots an outer Linux guest with nested `/dev/kvm`, cross-builds the
+    linux/arm64 `fleetboxtest` binary, and runs this SAME unified suite inside the guest on
+    cloud-hypervisor via the arm64 direct-kernel path (ADR-0024); inner pass/fail is the inner
+    binary's exit code. Runtime-gated (darwin/arm64 + `NestedVirtSupported()` + `!-short` +
+    `FLEETBOX_HELPER` set) — no build tag. LOCAL-ONLY: no CI lane (the runner needs an M3+
+    macOS host). Reached via `make test-vm`.
 
 ### §5.3 `cmd/fleetbox`
 
@@ -527,7 +542,7 @@ When a PR changes any of these fields for a package, update its section.
     (ADR-0015). In a cluster every member gets the same fixtures.
   - Cleanup is automatic, never a user command: `down` (like `up`) runs the backend
     reconcile via `fleetbox.Prune()` to reclaim resources a crashed holder left, so on
-    Linux it too needs root for the `ip`/`iptables` calls (ADR-0013).
+    Linux it too needs root for the netlink/nf_tables calls (ADR-0013, ADR-0025).
   - **Linux auto-elevation (CLI-only — ADR-0023).** The privileged commands `up`/`down`/`rm`
     call `ensurePrivileged()` first (an allowlist in each `RunE`, never a root
     `PersistentPreRunE` — that would fire on `__complete`/`help`). Interactive (a `/dev/tty`
@@ -775,11 +790,16 @@ When a PR changes any of these fields for a package, update its section.
   kernel boot on arm64 (ADR-0024) — controlled over CH's REST API on a per-VM unix socket
   — pure Go, no cgo (ADR-0011).
 - Owns: the CH child process per VM and its `exited` channel; the `chNetwork` (Linux
-  bridge, subnet, taps, egress rules); the per-bridge write-ahead records and
-  `ip_forward` marker under `~/.fleetbox/networks/` (`netstate.go`); the pinned
-  binary/firmware table; the process-wide reserved-subnet set. **Build-tagged `linux`.**
-- Depends on: `internal/backend`, `internal/fetch`, stdlib (`os/exec`, `net/http` over a
-  unix socket). No cgo, no third-party module.
+  bridge, subnet, taps, uplink, nft firewall); the per-bridge write-ahead records and
+  per-uplink forwarding marker under `~/.fleetbox/networks/` (`netstate.go`); the pinned
+  binary/firmware table; the process-wide reserved-subnet set. **Build-tagged `linux`**
+  (except the portable `purehelpers.go` — table-name mapping, nf_tables errno
+  classification, uplink-name selection — which is untagged so it is unit-testable on the
+  darwin dev box).
+- Depends on: `internal/backend`, `internal/fetch`, `github.com/vishvananda/netlink` +
+  `github.com/google/nftables` (host networking — netlink and nf_tables over netlink),
+  `golang.org/x/sys/unix`, stdlib (`net/http` over a unix socket). Pure Go, no cgo, no
+  host binary (ADR-0025).
 - Public API (internal): `New(binDir, netDir) *Backend`; `Backend` (incl. `Reconcile`),
   `VM`, `chNetwork` satisfy the backend interfaces (`var _` checks present).
 - Invariants:
@@ -788,9 +808,11 @@ When a PR changes any of these fields for a package, update its section.
   - `NestedVirtSupported` probes `/dev/kvm` + the KVM `nested` parameter; `Create` opens
     `/dev/kvm`. Fixture images (`cfg.FixturePaths`) are appended as extra
     `path=…,readonly=on` values on the single `--disk` flag, after the seed — the guest
-    mounts each by `LABEL`, so order is irrelevant (ADR-0015). `CreateNetwork`'s first `ip`
-    call is the backstop permission check (it errors `create bridge (needs root)` if a
-    non-root holder ever reaches it; the preflight already gated on root — ADR-0023).
+    mounts each by `LABEL`, so order is irrelevant (ADR-0015). `CreateNetwork`'s first
+    netlink write (the bridge `LinkAdd`) is the backstop permission check
+    (`errors.Is(err, EPERM)` → `create bridge (needs root)` if a non-root holder ever
+    reaches it; the preflight already gated on root — ADR-0023), and an nf_tables probe
+    runs right after, discriminating "needs root" from "kernel lacks nf_tables" (ADR-0025).
   - **Arch-specific boot (ADR-0024, `boot_{amd64,arm64}.go`).** x86_64 boots via the PVH
     `rust-hypervisor-firmware` (`--kernel <fw>`), which chain-loads the guest kernel from
     the disk. arm64 boots the kernel **directly** — the aarch64 firmware does not execute
@@ -799,22 +821,29 @@ When a PR changes any of these fields for a package, update its section.
     needed; cached next to the disk) and passing `--kernel`/`--initramfs`/`--cmdline
     "console=ttyAMA0 root=/dev/vda1 rw"`. The extracted kernel is the image's at first
     boot (a later in-guest kernel update needs `rm`+`up`).
-  - `CreateNetwork` makes one bridge per cluster on a free `/24` (gateway `.1`) and
-    installs `iptables` MASQUERADE/FORWARD egress rules; `Network.Reserve(name, ipHint)`
-    allocates a member's static IP on that `/24` (lowest free, or the hint if free) — the
-    helper-side successor to the orchestrator's old client `allocateIP` (ADR-0020); `Create`
-    adds a tap enslaved to the bridge. `Network.Close` removes taps, egress rules, and the
-    bridge — real OS resources owned by the helper, so teardown is explicit, not GC.
-  - **Crash-safe lifecycle (ADR-0013, `netstate.go`):** every bridge/tap is mirrored to a
-    write-ahead record (`<bridge>.json{bridge,subnet,owner_pid,masquerade,taps}`) written
-    *before* the `ip` command and deleted *after* teardown is verified (`linkExists`), so
-    the record is always a superset of reality. `Reconcile` (run at each `CreateNetwork`
-    and on `down`) tears down every record whose `owner_pid` is dead — taps, rules,
-    bridge, and any orphaned CH process still naming those taps — then deletes the record;
-    a live owner is never touched.
-  - **`ip_forward` is flipped only if it was `0`**, with the original kept in an `O_EXCL`
-    marker and restored once no record and no `fbx-*` bridge remain (cross-process
-    "last one out"). A host that already forwarded is never touched.
+  - `CreateNetwork` makes one bridge per cluster on a free `/24` (gateway `.1`) via netlink
+    and installs an `ip`-family nft table (`nftTableName(bridge)`) holding a NAT-postrouting
+    masquerade rule plus a filter-forward chain (policy accept) carrying one subnet-scoped
+    drop of unsolicited inbound — the self-protecting filter (ADR-0025);
+    `Network.Reserve(name, ipHint)` allocates a member's static IP on that `/24` (lowest
+    free, or the hint if free) — the helper-side successor to the orchestrator's old client
+    `allocateIP` (ADR-0020); `Create` adds a tap enslaved to the bridge. `Network.Close`
+    removes taps, the nft table, and the bridge — real OS resources owned by the helper, so
+    teardown is explicit, not GC.
+  - **Crash-safe lifecycle (ADR-0013, ADR-0025, `netstate.go`):** every bridge/tap/uplink is
+    mirrored to a write-ahead record
+    (`<bridge>.json{bridge,subnet,owner_pid,uplink,uplink_fwd_orig,taps}`) written *before*
+    the netlink/nft call and deleted *after* teardown is verified (`linkExists`), so the
+    record is always a superset of reality. `Reconcile` (run at each `CreateNetwork` and on
+    `down`) tears down every record whose `owner_pid` is dead — taps, the nft table (deleted
+    whole by name), bridge, and any orphaned CH process still naming those taps — then
+    deletes the record; a live owner is never touched.
+  - **Per-interface forwarding, never the global switch (ADR-0025).** Forwarding is enabled
+    on the bridge and the discovered uplink (`conf.<iface>.forwarding` under `/proc`); the
+    global `ip_forward` is never written. On a host already forwarding globally nothing is
+    flipped. The uplink's original is kept in a first-writer-wins per-uplink marker
+    (`fwd-<iface>.orig`) and restored once no record and no `fbx-*` bridge remain
+    (cross-process "last one out"); the bridge's flag is ephemeral (dies with the bridge).
   - The VM gets its whole config on the CH command line (boots on launch) and is started
     with `Pdeathsig: SIGKILL`, so a dying holder takes its VMs with it (the holder pins
     its boot thread via `LockOSThread` so the signal fires only on real holder exit); the
@@ -1083,8 +1112,9 @@ Edges (verified by `go list -deps`):
   (depguard `backend-free-client`)
 - `internal/backend/vz` (darwin/arm64) → `internal/backend`, `internal/dhcp`, the vendored
   `third_party/vz` (+ `vmnet`) — the only vz import site (depguard `vz-isolation`, ADR-0008)
-- `internal/backend/cloudhypervisor` (linux) → `internal/backend`, `internal/fetch`, stdlib
-  only (the only CH import site; no third-party module, no cgo)
+- `internal/backend/cloudhypervisor` (linux) → `internal/backend`, `internal/fetch`,
+  `github.com/vishvananda/netlink` + `github.com/google/nftables` (host networking),
+  `golang.org/x/sys/unix`, stdlib (the only CH import site; pure Go, no cgo — ADR-0025)
 - `internal/image` → `internal/fetch`, `go-qcow2reader`, stdlib `embed` (the catalog);
   `internal/fixture` → `go-ext4fs` (its only import site)
 - `contrib/catalog` (build-time tool, not in any runtime binary) → `internal/image`
@@ -1166,8 +1196,9 @@ CLAUDE.md as checkable rules):
   that cluster. Single-VM `up` is unaffected (a cluster of one). We deliberately do not
   try to keep a cluster alive across a holder crash — but the crash is now clean: each VM
   carries a parent-death `SIGKILL`, so a SIGKILL'd/OOM'd holder takes its VMs with it
-  (no zombie processes), and the inert leftovers (bridge, taps, iptables rules,
-  `ip_forward`) are reclaimed automatically on the next `up` or `down` (ADR-0013). The
+  (no zombie processes), and the inert leftovers (bridge, taps, nft firewall table,
+  uplink forwarding flag) are reclaimed automatically on the next `up` or `down`
+  (ADR-0013, ADR-0025). The
   deferred `Cluster.Close` still does the clean-exit/SIGTERM/panic teardown inline.
 - **Linux reboot of a stopped VM depends on subnet stability.** The static IP and gateway
   are baked into the seed at first create; on a later `up`, `CreateNetwork` re-picks a
@@ -1192,13 +1223,18 @@ CLAUDE.md as checkable rules):
   folder share on either backend (cloud-hypervisor has no daemon-free one, so it was dropped
   on macOS too). The output direction is `fleetbox cp` / scp. Host permission and exec bits
   are not preserved — everything arrives world-readable, uid 0.
-- **`fleetboxtest` fixtures skip on Linux.** They target darwin/arm64 for now; the
-  package compiles everywhere but `skipIfUnsupported` skips non-darwin/arm64. Wiring
-  Linux fixtures (and Linux KVM CI) is a follow-up.
+- **`fleetboxtest` VM-boot tests are capability-driven on both backends.** They run wherever
+  the host can boot a VM — Linux (`/dev/kvm`) and darwin/arm64 (vz M3+/macOS 26) — skipping
+  (never failing) otherwise via `SkipIfCannotBootVM`, and skipping on `-short`. The VM-boot
+  suite (conformance, cluster, fixtures, nested) uses no `-run` selectors or build-tag gates:
+  `make test` (`-short`) is VM-free, `make test-vm` runs the full suite the host supports.
+  (`TestVMFixturesPersistAcrossReboot` keeps a runtime darwin/arm64 guard — it is a
+  backend-specific reboot test, not a build-tag selector.)
 - **macOS VM tests can't run on the macOS CI runner** (no nested virtualization). But the
   cloud-hypervisor backend *is* CI-testable on a GitHub x86-64 Linux runner, which exposes
   `/dev/kvm` after a one-time udev rule (arm64 hosted runners have no KVM) — the "develop on
-  a Mac, run in cheap hosted Linux CI" path (ADR-0017). Not yet wired.
+  a Mac, run in cheap hosted Linux CI" path (ADR-0017). Wired as `vm-linux.yml`, which now
+  runs the full capability-driven suite (conformance + cluster).
 - **First run downloads, then caches.** The cloud image (both platforms) and, on macOS, the
   signed `fleetbox-helper` are fetched once into `~/.fleetbox` and reused. Until the release
   pipeline publishes the helper, build it locally (`make helper`) and set `FLEETBOX_HELPER`
@@ -1222,10 +1258,13 @@ After implementation changes, verify:
 - **Dependencies**: direct requires in `go.mod` match the deps named in §5 module
   sections (currently: pilat/cloudiso, pilat/go-ext4fs, go-qcow2reader, x/crypto,
   spf13/cobra — the CLI framework, §5.3, ADR-0022, pulling spf13/pflag + inconshreveable/
-  mousetrap as indirects — and x/sys — now a direct dep, used by `internal/helperdist`
-  (quarantine xattr) and the darwin capability probes, as well as by the in-module vendored
-  vz; plus go-infinity-channel + x/mod pulled in by vz). The vz fork itself is not a require —
-  it is vendored in-module (see below).
+  mousetrap as indirects — vishvananda/netlink + google/nftables — the Linux host
+  networking, §5.12, ADR-0025, pulling vishvananda/netns + mdlayher/netlink + mdlayher/
+  socket + x/sync + google/go-cmp as indirects — and x/sys — now a direct dep, used by the
+  cloud-hypervisor backend (netlink errno matching), `internal/helperdist` (quarantine
+  xattr) and the darwin capability probes, as well as by the in-module vendored vz; plus
+  go-infinity-channel + x/mod pulled in by vz). The vz fork itself is not a require — it is
+  vendored in-module (see below).
   The vz fork is the import-path-renamed Code-Hex/vz + norio-nomura's unreleased
   vmnet patch (PR #205), regenerated from pinned sources by `make vendor-vz`. It is
   vendored in-module under `third_party/vz` — no separate go.mod, so a downstream

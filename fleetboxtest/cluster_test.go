@@ -1,5 +1,3 @@
-//go:build darwin && arm64
-
 package fleetboxtest_test
 
 import (
@@ -12,19 +10,25 @@ import (
 	"github.com/pilat/fleetbox/fleetboxtest"
 )
 
-// TestVMClusterConnectivity is the real proof of ADR-0008: VMs in a StartN
-// cluster share one vmnet SharedMode network and reach each other by IP — the
-// VM↔VM connectivity that VZ NAT could not provide. It also boots a second
-// cluster to verify the subnet detector hands out distinct /24s (R2) and that
-// the two networks are isolated from one another.
+// TestVMClusterConnectivity proves cluster networking on BOTH backends: VMs in a
+// StartN cluster share one network and reach each other by IP — over vmnet
+// SharedMode on macOS 26+ (ADR-0008) and over the shared Linux bridge on linux
+// (ADR-0011). It also boots a second cluster to verify the subnet detector hands
+// out distinct /24s (R2) and that the two networks are isolated from one another.
 //
-// Named with the TestVM prefix so `make test-vm` (-test.run TestVM) runs it.
-// Boots real VMs: skipped on unsupported platforms (via StartN) and in -short.
+// Cross-platform (no build tag): the same VM↔VM contract must hold whichever
+// backend runs. Named with the TestVM prefix (no longer load-bearing — there is no
+// -run selector). Boots real VMs: skipped on hosts that cannot boot one (via StartN →
+// SkipIfCannotBootVM) and in -short. On a backend without clustering (macOS < 26)
+// StartN returns ErrClustersUnsupported and the fixture skips it.
 func TestVMClusterConnectivity(t *testing.T) {
 	fleetboxtest.SkipIfShort(t, "boots real VMs")
 
-	// Cluster A: two nodes on one shared network.
-	clusterA := fleetboxtest.StartN(t, "node", 2, fleetbox.WithImage("debian-12"))
+	// Cluster A: two nodes on one shared network. Members are deliberately small
+	// (WithMemoryGB(2), WithCPUs(1)) so all four VMs across both clusters fit 8 GB —
+	// inside a 16 GB amd64 CI runner and inside the nested guest (Decision 8).
+	clusterA := fleetboxtest.StartN(t, "node", 2,
+		fleetbox.WithImage("debian-12"), fleetbox.WithMemoryGB(2), fleetbox.WithCPUs(1))
 	if len(clusterA) != 2 {
 		t.Fatalf("expected 2 VMs in cluster A, got %d", len(clusterA))
 	}
@@ -34,7 +38,8 @@ func TestVMClusterConnectivity(t *testing.T) {
 
 	// Cluster B: a second cluster started in the same process. R2 requires it
 	// to land on a distinct subnet rather than colliding with cluster A.
-	clusterB := fleetboxtest.StartN(t, "other", 2, fleetbox.WithImage("debian-12"))
+	clusterB := fleetboxtest.StartN(t, "other", 2,
+		fleetbox.WithImage("debian-12"), fleetbox.WithMemoryGB(2), fleetbox.WithCPUs(1))
 	if len(clusterB) != 2 {
 		t.Fatalf("expected 2 VMs in cluster B, got %d", len(clusterB))
 	}

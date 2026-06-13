@@ -1,7 +1,7 @@
 # ADR: Crash-Safe Linux Network Lifecycle, Guest DNS, and Download-Aware Readiness
 
 **Date:** 2026-06-07
-**Status:** Accepted (amended by [ADR-0020](0020-helper-thin-backend-server.md) — the network lifecycle and reconcile are now owned by the helper process, keyed on the helper PID)
+**Status:** Accepted (amended by [ADR-0020](0020-helper-thin-backend-server.md) — the network lifecycle and reconcile are now owned by the helper process, keyed on the helper PID; amended by [ADR-0025](0025-linux-netlink-nftables.md) — teardown/reconcile now program netlink + nftables instead of `ip`/`iptables`, the `netRecord` drops `masquerade` and gains the uplink + its original forwarding value, and the global `ip_forward` marker becomes a per-uplink forwarding marker)
 
 ## Context
 
