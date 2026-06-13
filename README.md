@@ -83,6 +83,7 @@ Prefer the CLI to the library? On macOS (Apple Silicon) it ships as a Homebrew c
 
 ```bash
 brew tap pilat/fleetbox
+brew trust --cask pilat/fleetbox/fleetbox
 brew install --cask fleetbox
 ```
 
@@ -305,6 +306,13 @@ way, the decision log lives in [docs/adr/](docs/adr/).
   brought back up needs its `/24` to still be free — on a contended host the auto-picked
   subnet can shift and the rebooted VM won't be reachable; bring clusters up fresh.
   arm64 Linux boot via rust-hypervisor-firmware is not yet validated on hardware.
+- **Docker on the Linux host blocks VM egress.** When Docker is running it sets the
+  iptables `FORWARD` policy to `DROP`, which drops a fleetbox VM's traffic to the internet
+  (VMs forward through their own bridge, not Docker's) — the same conflict libvirt and LXD
+  hit on Docker hosts. VM↔VM and host↔VM still work; only internet egress is affected.
+  fleetbox deliberately does not rewrite your host firewall, so allow its subnet range
+  yourself: `sudo iptables -I DOCKER-USER -s 192.168.0.0/16 -j ACCEPT` (add the matching
+  `-d 192.168.0.0/16` rule for the return path).
 - **v0 API.** Expect breaking changes until it stabilizes.
 
 ### CI
@@ -319,6 +327,9 @@ aren't re-downloaded every run):
 - run: |
     echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm.rules
     sudo udevadm control --reload-rules && sudo udevadm trigger
+    # Hosted runners run Docker (FORWARD policy DROP); allow the VM subnet to forward.
+    sudo iptables -I DOCKER-USER -s 192.168.0.0/16 -j ACCEPT
+    sudo iptables -I DOCKER-USER -d 192.168.0.0/16 -j ACCEPT
 - uses: actions/cache@v4
   with:
     path: |
@@ -328,8 +339,9 @@ aren't re-downloaded every run):
 ```
 
 arm64 hosted Linux runners do **not** have KVM ("not supported for this sku"); use an
-x86-64 runner for VM-boot CI. This is the "develop on a Mac, test in cheap x86-64 hosted
-Linux CI" story.
+x86-64 runner for VM-boot CI. Hosted runners also drop outbound **ICMP**, so check a
+guest's internet egress over TCP (a connect to `1.1.1.1:443`), not `ping`. This is the
+"develop on a Mac, test in cheap x86-64 hosted Linux CI" story.
 
 ## Roadmap
 

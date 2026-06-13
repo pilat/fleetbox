@@ -55,16 +55,16 @@ func TestVMConformance(t *testing.T) {
 		t.Errorf("SSH output = %q, want it to contain conformance-ok", out)
 	}
 
-	// Egress: the guest must reach the public internet. On Linux this drives the nft
-	// masquerade + per-interface forwarding end to end (ADR-0025) — a missing or
-	// silently-dropped masq rule fails here, which a plain echo-over-SSH would never
-	// catch. Ping by IP so the check does not depend on guest DNS.
-	out, err = vm.SSH(ctx, "ping -c1 -W5 1.1.1.1")
-	if err != nil {
-		t.Fatalf("egress ping failed (guest cannot reach the internet): %v\n%s", err, out)
-	}
-	if !strings.Contains(out, "0% packet loss") {
-		t.Fatalf("egress ping got no reply (no internet egress):\n%s", out)
+	// Egress: the guest must reach the public internet. This drives the nft masquerade
+	// + per-interface forwarding end to end (ADR-0025) — a missing or silently-dropped
+	// masq rule fails here, which a plain echo-over-SSH would never catch. Use a TCP
+	// connect, NOT ICMP ping: some CI networks (notably GitHub-hosted runners) drop
+	// outbound ICMP while allowing TCP, so a ping would be a false negative even when
+	// egress works. 1.1.1.1:443 is a stable, DNS-independent target; bash's /dev/tcp
+	// needs no extra package in the stock guest.
+	out, err = vm.SSH(ctx, "timeout 8 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443 && echo egress-ok'")
+	if err != nil || !strings.Contains(out, "egress-ok") {
+		t.Fatalf("egress failed (guest cannot open TCP to the internet): %v\n%s", err, out)
 	}
 
 	// Stop gracefully (disk preserved), then Destroy removes everything — the full

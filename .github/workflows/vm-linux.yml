@@ -45,6 +45,21 @@ jobs:
           key: fleetbox-linux-${{ hashFiles('**/go.sum') }}
           restore-keys: fleetbox-linux-
 
+      # Hosted runners run Docker, which sets the iptables FORWARD policy to DROP when
+      # it enables IP forwarding. fleetbox VMs forward through their own non-docker
+      # bridge, so without this their egress is dropped — the same conflict libvirt KVM
+      # and LXD hit on Docker hosts. fleetbox does not override the host firewall, so
+      # allow the VM subnet range (192.168.0.0/16, where the backend hands out /24s)
+      # through DOCKER-USER, which Docker evaluates before its DROP. Both directions:
+      # guest egress (src) and the de-masqueraded return (dst). No-op without Docker.
+      # (Egress is asserted over TCP, not ICMP — the runner network drops outbound ICMP.)
+      - name: Allow VM egress past Docker's FORWARD DROP policy
+        run: |
+          if sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+            sudo iptables -I DOCKER-USER -s 192.168.0.0/16 -j ACCEPT
+            sudo iptables -I DOCKER-USER -d 192.168.0.0/16 -j ACCEPT
+          fi
+
       - name: Boot real VMs (full capability-driven suite)
         run: |
           go test -c -o /tmp/fleetboxtest ./fleetboxtest
