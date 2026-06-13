@@ -127,7 +127,8 @@ ceiling is a documented limitation, not a code path.
   fail loudly unless the table, both chains, the masquerade verdict, and the forward
   drop's match all survived.
 - **Accepted egress ceiling.** On a host where Docker or ufw has clamped FORWARD to DROP,
-  the guests cannot reach the internet. Documented, not worked around.
+  the guests cannot reach the internet. Documented, not worked around (the README shows the
+  `DOCKER-USER` allow rules an operator can add if they want egress on such a host).
 - **Irreducible uplink-transit residual.** Keeping the uplink's forwarding flag on permits
   uplink-ingress transit to the host's other routed networks — the inherent cost of routed
   egress without a global clamp. Documented, not chased.
@@ -136,6 +137,9 @@ ceiling is a documented limitation, not a code path.
   (its `MASQUERADE` rule and global `ip_forward` flip are invisible to the new sweep).
   fleetbox is pre-release: delete `~/.fleetbox` by hand when upgrading across this change.
 - **Dogfood-proven, not just compiled.** For network code, compile and lint prove nothing.
-  The VM-boot CI (`vm-linux.yml`) now asserts internet egress over SSH from the booted
-  guest (`ping 1.1.1.1`), so a missing or silently-dropped masquerade rule fails CI rather
-  than passing a green build.
+  The VM-boot CI (`vm-linux.yml`) asserts real internet egress over SSH from the booted
+  guest — a TCP connect to `1.1.1.1:443`, **not** `ping`, because GitHub-hosted runners drop
+  outbound ICMP (the host itself cannot ping out). The runner is itself a Docker host
+  (FORWARD policy DROP), so the workflow first opens the VM subnet through `DOCKER-USER` —
+  the operator's job, per the egress ceiling above; fleetbox does not. A missing or
+  silently-dropped masquerade rule then fails CI rather than passing a green build.
