@@ -110,7 +110,8 @@ sudo -E env "HOME=$HOME" "PATH=$PATH" go test ./...
 ```
 
 `HOME` keeps fleetbox's state under your `~/.fleetbox` (not `/root`), and `PATH` lets the
-root process find the Go toolchain and the `ip`/`iptables` it shells out to.
+root process find the Go toolchain. The backend itself shells out to nothing — host
+networking is programmed directly via netlink and nf_tables (ADR-0025).
 
 The first boot also downloads the cloud image (a few hundred MB, cached in
 `~/.fleetbox/images/`) and prints a progress line so it doesn't look like a hung test.

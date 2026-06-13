@@ -2,8 +2,11 @@ name: VM boot (Linux)
 
 # Proves the Linux backend end-to-end in CI, AND gives the inverted client↔helper
 # protocol real-VM coverage (ADR-0020): x86-64 GitHub-hosted runners expose
-# /dev/kvm, so the cloud-hypervisor backend can boot a real VM after a one-time
-# udev tweak. The test binary is its own helper — fleetbox.Start re-execs it with
+# /dev/kvm, so the cloud-hypervisor backend can boot real VMs after a one-time
+# udev tweak. It runs the full capability-driven suite (no -run selector) — so on top
+# of the single-VM conformance check it now boots a multi-node cluster, giving amd64
+# its first VM↔VM connectivity coverage; the nested orchestrator self-skips (it needs
+# an M3+ macOS host). The test binary is its own helper — fleetbox.Start re-execs it with
 # --fleetbox-runner and internal/holder's init() interceptor turns that child into
 # the holder (real CH backend) — so this exercises the full client orchestrator →
 # RPC → helper path, not just the backend. Bridge/tap creation needs CAP_NET_ADMIN,
@@ -42,8 +45,8 @@ jobs:
           key: fleetbox-linux-${{ hashFiles('**/go.sum') }}
           restore-keys: fleetbox-linux-
 
-      - name: Boot a real VM (TestVMConformance)
+      - name: Boot real VMs (full capability-driven suite)
         run: |
           go test -c -o /tmp/fleetboxtest ./fleetboxtest
           sudo -E env "HOME=$HOME" "PATH=$PATH" \
-            /tmp/fleetboxtest -test.run TestVMConformance -test.v -test.timeout 15m
+            /tmp/fleetboxtest -test.v -test.timeout 30m

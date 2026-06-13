@@ -712,11 +712,11 @@ func (c *Cluster) Close() error {
 }
 
 // Prune reclaims the inert host network state a helper leaves behind if it dies
-// without running its teardown — on Linux, orphaned bridges, taps, firewall rules,
-// and a left-on ip_forward. It spawns a short-lived helper that reconciles and
-// exits, because reconcile needs CAP_NET_ADMIN (it runs ip/iptables), which the
-// Linux helper carries. On macOS the root's prune is a no-op and never calls this
-// (vmnet owns its own state) — ADR-0013/0020.
+// without running its teardown — on Linux, orphaned bridges, taps, nft firewall
+// tables, and a left-on uplink forwarding flag. It spawns a short-lived helper that
+// reconciles and exits, because reconcile needs CAP_NET_ADMIN (it programs netlink
+// and nf_tables), which the Linux helper carries. On macOS the root's prune is a
+// no-op and never calls this (vmnet owns its own state) — ADR-0013/0020/0025.
 func Prune() error {
 	st, err := store.New()
 	if err != nil {

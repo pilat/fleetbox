@@ -4,7 +4,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/pilat/fleetbox"
 	"github.com/pilat/fleetbox/fleetboxtest"
@@ -18,15 +17,13 @@ import (
 // tears it down, is idempotent on a second call, and removes the VM's store files.
 //
 // It carries no build tag, so it runs on both backends; it boots a real VM, so it
-// is skipped in -short and where the host can't nest-virtualize. Named with the
-// TestVM prefix so `make test-vm` runs it.
+// is skipped in -short and where the host cannot boot one (SkipIfCannotBootVM). Named
+// with the TestVM prefix so `make test-vm` runs it.
 func TestVMConformance(t *testing.T) {
 	fleetboxtest.SkipIfShort(t, "boots a real VM")
-	if !fleetbox.NestedVirtSupported() {
-		t.Skip("host lacks nested virtualization")
-	}
+	fleetboxtest.SkipIfCannotBootVM(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), fleetboxtest.BootTimeout(1))
 	defer cancel()
 
 	const name = "fbconformance"
@@ -56,6 +53,18 @@ func TestVMConformance(t *testing.T) {
 	}
 	if !strings.Contains(out, "conformance-ok") {
 		t.Errorf("SSH output = %q, want it to contain conformance-ok", out)
+	}
+
+	// Egress: the guest must reach the public internet. On Linux this drives the nft
+	// masquerade + per-interface forwarding end to end (ADR-0025) — a missing or
+	// silently-dropped masq rule fails here, which a plain echo-over-SSH would never
+	// catch. Ping by IP so the check does not depend on guest DNS.
+	out, err = vm.SSH(ctx, "ping -c1 -W5 1.1.1.1")
+	if err != nil {
+		t.Fatalf("egress ping failed (guest cannot reach the internet): %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "0% packet loss") {
+		t.Fatalf("egress ping got no reply (no internet egress):\n%s", out)
 	}
 
 	// Stop gracefully (disk preserved), then Destroy removes everything — the full

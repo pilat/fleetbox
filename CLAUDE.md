@@ -48,7 +48,7 @@ Module: `github.com/pilat/fleetbox`
 fleetbox.go                     public API (neutral): VM, Cluster, Options/Option/Fixture (aliases to opts), With*, StartN/StartCluster, NestedVirtSupported, Prune, ErrClustersUnsupported
 fleetbox_supported.go           the ONE client impl (darwin||linux): Start/NewCluster delegating to the client-side orchestrator + the clusterState wrapper (ADR-0020)
 fleetbox_{darwin_arm64,linux,unsupported}.go  per-platform host probes only (nestedVirtSupported/supportsClusteringHost/prune) — pure-Go, client-side, never spawn the helper (ADR-0017 R7); linux blank-imports holder for its self-reexec init()
-fleetboxtest/                   testing.TB fixtures: Start(t, image), StartN, SkipIfShort
+fleetboxtest/                   testing.TB fixtures: Start(t, image), StartN, SkipIfShort, SkipIfCannotBootVM, BootTimeout; capability-driven skips (no -run/build-tag selectors)
 internal/opts                   backend-free option data + Encode/Decode (ADR-0017)
 internal/control                backend-free CLIENT half of the holder protocol: Spawn/Status/WaitMembers/Stop/SendCommand + NDJSON wire types (createnetwork/reserve/boot-member, MemberSpec/Reservation) + bound-mode bind/version handshake (ADR-0017/0020)
 internal/orchestrator           CLIENT-side VM sequencer (resolveStartDeps/startOnNetwork/spawnHelper/fixtures/Cluster, helperExe/preflight per platform); drives the helper via the remote-proxy backend — links NO concrete backend (ADR-0020)
@@ -102,22 +102,50 @@ stay pure Go — no cgo; cgo lives only in the darwin helper.
   (incl. `darwin/amd64`) compile but error at runtime with "unsupported platform". Unit
   tests (`make test`) and `make lint` run on darwin/arm64; lint the Linux code with
   `GOOS=linux golangci-lint run ./...`.
-- VM-boot tests on macOS (`make test-vm`) need darwin/arm64, M3+, macOS 26+. Linux VM
-  tests need a host with `/dev/kvm` + `CAP_NET_ADMIN` (a real Linux box, a Lima VM with
-  `nestedVirtualization: true`, or a KVM-enabled CI runner) — not the macOS dev box and
-  not Docker Desktop (no `/dev/kvm`).
+- **Two test tiers, capability-driven — no `-run` filters, no build-tag selectors.** Each
+  test decides for itself whether to boot a VM, from the speed tier (`testing.Short()`) and
+  a runtime host probe (`/dev/kvm` openable on Linux; vz M3+/macOS 26 via
+  `NestedVirtSupported()` on darwin — `fleetboxtest.SkipIfCannotBootVM`), plus the public
+  `ErrClustersUnsupported` sentinel for the cluster test (so it self-skips on macOS < 26).
+  So there are exactly two entry points: `make test` (`-short -race`, quick, VM-free — the
+  dev inner loop and the CI unit lanes) and `make test-vm` (the full `go test ./fleetboxtest`
+  with NO selector — runs everything the host supports). The old `make test-nested` and the
+  `fleetbox_nested` build tag are gone, folded into `make test-vm`. (`make test-fake` /
+  `test-fake-linux` are a separate build-time *backend swap*, not part of this tiering — left
+  untouched.) The per-VM boot budget honors `FLEETBOX_IP_WAIT_TIMEOUT` (one knob widens both
+  the holder's IP-wait and the fixtures' boot context — `fleetboxtest.BootTimeout`), which the
+  nested orchestrator sets to 20m inside the slow guest.
+- VM-boot tests on macOS (`make test-vm`) need darwin/arm64, M3+, macOS 26+. `make test-vm`
+  runs the full suite: the single-VM conformance check (lifecycle + egress), the multi-node
+  cluster (VM↔VM + subnet isolation), and the nested dogfood (`TestNestedLinuxBoot`) — which
+  boots an outer Linux guest and runs this SAME unified suite inside it on the cloud-hypervisor
+  backend (the inner pass/fail is the inner binary's exit code, not a string match). Linux VM
+  tests need a host with `/dev/kvm` + `CAP_NET_ADMIN` (a real Linux box, a KVM-enabled CI
+  runner, or a Lima VM with `nestedVirtualization: true`) — NOT Docker Desktop (no
+  `/dev/kvm`). The **Apple-Silicon dev box (M4, macOS 26) CAN run the whole thing locally**:
+  M4 supports vz nested virtualization, so the nested dogfood's outer guest gets a real
+  `/dev/kvm` and the cross-compiled Linux `fleetboxtest` binary boots true nested VMs through
+  the cloud-hypervisor backend. So the Linux netlink/nftables path is dogfooded on this Mac by
+  `make test-vm` itself — do not claim "needs a separate Linux box". (The guest is arm64, so
+  this exercises the arm64 direct-kernel-boot path, ADR-0024 — which the amd64 CI
+  `vm-linux.yml` does not cover.) For an isolated manual run you can still cross-build
+  `GOOS=linux GOARCH=arm64 go test -c ./fleetboxtest`, copy it into a Lima guest, and run it
+  under `sudo`.
 - CI (`ci.yml`) has two jobs. The **macOS** job (macos-26) cannot boot VZ VMs, so it runs
   lint (darwin/linux/fake) + build + linux cross-build + unit + the fake coordination
   (`make test-fake`, the protocol gate with no VM). Do not switch it to ubuntu (it must keep
   building/linting the darwin code). The **linux** job (ubuntu) runs build + unit + the fake
   coordination via self-reexec (`make test-fake-linux`, no KVM needed). Unlike VZ, the
-  cloud-hypervisor backend *is* CI-testable with KVM: `vm-linux.yml` boots a real VM on an
-  x86-64 ubuntu runner, now exercising the full client↔helper protocol (the test binary is its
-  own helper via self-reexec). Releases run on tags: `release-helper.yml` (helper, macOS,
+  cloud-hypervisor backend *is* CI-testable with KVM: `vm-linux.yml` boots real VMs on an
+  x86-64 ubuntu runner — the full capability-driven suite (conformance + a multi-node cluster,
+  so amd64 now has VM↔VM coverage; the nested dogfood self-skips there) over the full
+  client↔helper protocol (the test binary is its own helper via self-reexec). Releases run on
+  tags: `release-helper.yml` (helper, macOS,
   codesign) and `release.yml` (CLI, goreleaser) — two independent channels (`helper-v*` / `v*`).
 - Commands: `make test` (unit), `make build` (compile the pure-Go CLI, no signing),
   `make helper` (build + ad-hoc-sign `cmd/fleetbox-helper`, darwin only), `make test-vm`
-  (builds+signs the helper, exports `FLEETBOX_HELPER`, boots real VMs), `make lint`,
+  (builds+signs the helper, exports `FLEETBOX_HELPER`, runs the full capability-driven suite —
+  conformance + cluster + nested), `make lint`,
   `make catalog` (refresh the pinned image catalog — `go run ./contrib/catalog`;
   streams the Debian images through the hashers to compute the sha256 Debian does not
   publish, so it pulls several GB when snapshots move; maintenance/CI only),
