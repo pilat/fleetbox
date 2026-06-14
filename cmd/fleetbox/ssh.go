@@ -12,9 +12,11 @@ import (
 	"github.com/pilat/fleetbox/internal/store"
 )
 
-// devNull is where ssh/scp point UserKnownHostsFile: a VM is cattle whose host
-// key changes every boot, so fleetbox never records it in the user's known_hosts.
-// Shared by ssh, cp, and ssh-config so the bit bucket is named in one place.
+// devNull is where ssh points UserKnownHostsFile: a VM is cattle whose host key
+// changes every boot, so fleetbox never records it in the user's known_hosts.
+// Shared by ssh and ssh-config so the bit bucket is named in one place. (cp no
+// longer needs it — it dials via the in-process copy primitive, which ignores host
+// keys directly.)
 const devNull = "/dev/null"
 
 // newSSHCmd builds the `ssh` command: open an interactive shell on a VM, or run

@@ -237,8 +237,10 @@ single NIC. How that is realized differs by backend.
   DUID-based identifiers instead of plain MACs — ADR-0007); cloud-hypervisor already
   knows the IP it assigned and just probes TCP :22. Both return the IP once port 22 is
   reachable.
-- SSH: library mode uses `golang.org/x/crypto/ssh` programmatically; CLI `ssh`/`cp`
-  exec the system `ssh`/`scp` binaries for a proper interactive terminal.
+- SSH: library mode uses `golang.org/x/crypto/ssh` programmatically; the CLI `ssh`
+  execs the system `ssh` binary for a proper interactive terminal. File copy (library
+  `VM.CopyTo`/`CopyFrom` and the CLI `cp`) is tar over the same `golang.org/x/crypto/ssh`
+  connection — no `scp` shell-out (ADR-0026).
 
 ### §4.4 Process model
 
@@ -419,8 +421,11 @@ When a PR changes any of these fields for a package, update its section.
     automatically on the CLI `down`, so cleanup is never the user's job (crashed VMs
     themselves die with their holder — `Pdeathsig` on Linux, the parent-pid poll on macOS,
     ADR-0013/ADR-0017); exported for library callers that want to sweep explicitly
-  - `type VM`: `Name()`, `IP() net.IP`, `SSH(ctx, cmd) (string, error)`, `Stop(ctx)`,
-    `Destroy(ctx)`, `State() string`
+  - `type VM`: `Name()`, `IP() net.IP`, `SSH(ctx, cmd) (string, error)`,
+    `CopyTo(ctx, hostPath, guestPath) error`, `CopyFrom(ctx, guestPath, hostPath) error`,
+    `Stop(ctx)`, `Destroy(ctx)`, `State() string` — copy is universal (file or directory,
+    both directions), exact-destination, modes-preserved/ownership-not, tar over the SSH
+    connection (ADR-0026)
   - `type Options{Image, CPUs, MemGB, DiskGB, Fixtures}`, `type Option func(*Options)`,
     `WithImage`, `WithCPUs`, `WithMemoryGB`, `WithDiskGB`, `WithFixture(hostDir, guestPath)`
   - `type Fixture{HostPath, GuestPath}` — a read-only host directory packed into the guest
@@ -492,7 +497,9 @@ When a PR changes any of these fields for a package, update its section.
 - Purpose: the CLI — `up`, `down`, `ls`, `ssh`, `cp`, `ssh-config`, `rm`, `version`, plus
   cobra's auto-generated `completion` and `help`. Aliases: `start`→`up`, `stop`/`halt`→`down`,
   `list`→`ls`, `shell`→`ssh`, `remove`/`destroy`/`delete`→`rm`.
-- Owns: a cobra command tree, terminal output, exec of system `ssh`/`scp`. It is built on
+- Owns: a cobra command tree, terminal output, exec of system `ssh` (for a proper
+  interactive terminal). `cp` no longer execs `scp` — it uses the library copy primitive
+  (`sshkey.Client.CopyTo`/`CopyFrom`, tar over SSH — ADR-0026). It is built on
   **cobra** (ADR-0022): `newRootCmd` in `root.go` assembles one `newXxxCmd` per command file
   (`up.go`, `down.go`, …); there is no `init()` and no package-level command globals (only the
   ldflags-set build-metadata `version/commit/date`). Each command's `RunE` calls a `runX`
@@ -504,7 +511,8 @@ When a PR changes any of these fields for a package, update its section.
   dispatch here (ADR-0020).
 - Depends on: `fleetbox` (public API), `internal/orchestrator` (to drive a detached helper
   for `up`), `internal/control` (status/stop for the per-name commands), `internal/store`
-  (incl. `ClusterName` for `down`/`rm` target resolution), and `github.com/spf13/cobra`
+  (incl. `ClusterName` for `down`/`rm` target resolution), `internal/sshkey` (the copy
+  primitive for `cp`), and `github.com/spf13/cobra`
   (+ `pflag`). It links no hypervisor on darwin (ADR-0017); on Linux it links the holder +
   cloud-hypervisor via the root's blank import (the accepted non-sever).
 - Public API: none (package main).
@@ -529,8 +537,10 @@ When a PR changes any of these fields for a package, update its section.
     multiple targets (per-target result lines, non-zero exit if any failed/unknown). `rm` is
     the only destructive command and confirms any non-empty removal unless `-f`/`--force`.
   - `ssh` requires `--` before a remote command (`ssh web -- uname -a`); trailing args without
-    it are rejected, not silently dropped. `ssh`/`cp` propagate the child `ssh`/`scp` exit code
-    verbatim. `cp` rejects VM↔VM copies (exactly one side is `name:/path`).
+    it are rejected, not silently dropped. `ssh` propagates the child `ssh` exit code
+    verbatim. `cp` rejects VM↔VM copies (exactly one side is `name:/path`); it dials the VM
+    via the copy primitive (no child process) and keeps scp's "copy into a directory"
+    convenience for a local destination above the exact-path library method (ADR-0026).
   - `ls` renders a human table (default), bare names (`-q`), or a JSON array (`-o json`, the
     pinned snake_case machine contract — `internal/store`-consistent keys, no `age` field).
     `ssh`/`cp`/`down` dynamically complete running VM names, `rm` all VM names
@@ -730,15 +740,24 @@ When a PR changes any of these fields for a package, update its section.
 
 ### §5.10 `internal/sshkey`
 
-- Purpose: per-installation ed25519 keypair + programmatic SSH client.
+- Purpose: per-installation ed25519 keypair + programmatic SSH client (command run +
+  file copy).
 - Owns: `~/.fleetbox/id_ed25519[.pub]` (via path given by store).
-- Depends on: `golang.org/x/crypto/ssh`.
+- Depends on: `golang.org/x/crypto/ssh` + stdlib (`archive/tar` for copy). No new module.
 - Public API (internal): `Manager` (`NewManager`, `EnsureKey`, `PrivateKey`, `Path`,
-  `Dial`, `DialIP`, `WaitForSSH`), `Client` (`Run`, `Close`).
+  `Dial`, `DialIP`, `WaitForSSH`), `Client` (`Run`, `CopyTo`, `CopyFrom`, `Close`).
 - Invariants:
   - One keypair per installation, generated lazily, injected into guests via cloud-init
     only.
   - Host key checking is intentionally disabled (ephemeral test VMs).
+  - **Copy is tar over the SSH session (ADR-0026).** `CopyTo`/`CopyFrom` build/extract a
+    tar in-process (stdlib `archive/tar`) and pipe it through a guest `tar -x`/`tar -c`,
+    so copy is universal (file or directory), exact-destination, modes-preserved but
+    ownership-not (`-p --no-same-owner`), streamed via `io.Pipe` (no full-payload buffer),
+    and adds zero dependencies. The in-process extractor refuses entries that escape the
+    destination (absolute names, `..`, escaping symlink targets, and entries routed
+    through a symlinked parent component planted earlier in the archive). The only guest
+    requirement is `tar`.
   - **Ownership fixup (ADR-0023).** `EnsureKey` chowns the key pair to `SUDO_UID:SUDO_GID`
     on every run (idempotent — `chownToInvoker`) when root-via-sudo, so a non-root `ssh -i`
     can read the `0600` private key a root `up` created. Mode stays `0600` (`ssh` refuses a
@@ -1223,6 +1242,14 @@ CLAUDE.md as checkable rules):
   folder share on either backend (cloud-hypervisor has no daemon-free one, so it was dropped
   on macOS too). The output direction is `fleetbox cp` / scp. Host permission and exec bits
   are not preserved — everything arrives world-readable, uid 0.
+- **Programmatic copy is tar-over-SSH, quiescent-file only.** `VM.CopyTo`/`CopyFrom` (and
+  the CLI `cp`, now built on them rather than shelling out to `scp`) move a file or
+  directory in/out over the SSH connection via the guest's `tar`, preserving modes but not
+  ownership (ADR-0026). v1 does not honor `ctx` cancellation mid-transfer (it matches
+  `VM.SSH`), treats any non-zero guest `tar` exit as an error (so copying an
+  actively-written file can fail), and offers no `io.Reader`/`io.Writer` variants — all
+  deferred. This is distinct from fixtures (read-only host→guest at boot, above), which are
+  unchanged.
 - **`fleetboxtest` VM-boot tests are capability-driven on both backends.** They run wherever
   the host can boot a VM — Linux (`/dev/kvm`) and darwin/arm64 (vz M3+/macOS 26) — skipping
   (never failing) otherwise via `SkipIfCannotBootVM`, and skipping on `-short`. The VM-boot

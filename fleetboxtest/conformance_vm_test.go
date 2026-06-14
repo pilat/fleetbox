@@ -2,6 +2,8 @@ package fleetboxtest_test
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -65,6 +67,68 @@ func TestVMConformance(t *testing.T) {
 	out, err = vm.SSH(ctx, "timeout 8 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443 && echo egress-ok'")
 	if err != nil || !strings.Contains(out, "egress-ok") {
 		t.Fatalf("egress failed (guest cannot open TCP to the internet): %v\n%s", err, out)
+	}
+
+	// Programmatic copy in/out over the same SSH connection (ADR-0026). This is the
+	// ONLY coverage of the real guest `tar` commands: the hermetic unit tests
+	// substitute Go's archive/tar for GNU tar and so cannot validate mode
+	// preservation across the hop, --no-same-owner, or the guest-side mkdir -p of a
+	// missing parent. A wrong tar flag / -C / basename fails here, not in unit tests.
+	hostDir := t.TempDir()
+
+	// CopyTo a 0755 file to a guest path whose parent dir does NOT pre-exist: proves
+	// mkdir -p (parent created), -p (mode restored, so it stays executable), and
+	// --no-same-owner (extraction as the connecting user succeeds).
+	execSrc := filepath.Join(hostDir, "app")
+	if err := os.WriteFile(execSrc, []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
+		t.Fatalf("write exec source: %v", err)
+	}
+	if err := os.Chmod(execSrc, 0o755); err != nil { // defeat umask so the mode is exactly 0755
+		t.Fatalf("chmod exec source: %v", err)
+	}
+	if err := vm.CopyTo(ctx, execSrc, "/tmp/fbcopy/sub/app"); err != nil {
+		t.Fatalf("CopyTo file: %v", err)
+	}
+	out, err = vm.SSH(ctx, "cat /tmp/fbcopy/sub/app")
+	if err != nil || !strings.Contains(out, "echo hi") {
+		t.Fatalf("copied file content wrong: %v\n%s", err, out)
+	}
+	out, err = vm.SSH(ctx, "test -x /tmp/fbcopy/sub/app && echo exec-ok")
+	if err != nil || !strings.Contains(out, "exec-ok") {
+		t.Fatalf("copied file is not executable (mode not preserved): %v\n%s", err, out)
+	}
+
+	// CopyTo a small directory tree → assert structure and contents over SSH.
+	treeSrc := filepath.Join(hostDir, "tree")
+	if err := os.MkdirAll(filepath.Join(treeSrc, "sub"), 0o755); err != nil {
+		t.Fatalf("mkdir tree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(treeSrc, "a.txt"), []byte("alpha"), 0o644); err != nil {
+		t.Fatalf("write a.txt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(treeSrc, "sub", "b.txt"), []byte("beta"), 0o644); err != nil {
+		t.Fatalf("write b.txt: %v", err)
+	}
+	if err := vm.CopyTo(ctx, treeSrc, "/tmp/fbtree"); err != nil {
+		t.Fatalf("CopyTo dir: %v", err)
+	}
+	out, err = vm.SSH(ctx, "cat /tmp/fbtree/a.txt /tmp/fbtree/sub/b.txt")
+	if err != nil || !strings.Contains(out, "alpha") || !strings.Contains(out, "beta") {
+		t.Fatalf("copied tree wrong: %v\n%s", err, out)
+	}
+
+	// CopyFrom the whole directory back → assert structure and contents on the host,
+	// exercising the guest `tar -c` of a directory and the in-process extractor's
+	// top-component rename (/tmp/fbtree → back) over real GNU tar.
+	back := filepath.Join(t.TempDir(), "back")
+	if err := vm.CopyFrom(ctx, "/tmp/fbtree", back); err != nil {
+		t.Fatalf("CopyFrom dir: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(back, "a.txt")); err != nil || string(got) != "alpha" {
+		t.Fatalf("CopyFrom a.txt = %q (err %v), want alpha", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(back, "sub", "b.txt")); err != nil || string(got) != "beta" {
+		t.Fatalf("CopyFrom sub/b.txt = %q (err %v), want beta", got, err)
 	}
 
 	// Stop gracefully (disk preserved), then Destroy removes everything — the full
