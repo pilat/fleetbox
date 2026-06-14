@@ -491,6 +491,38 @@ func (v *VM) SSH(_ context.Context, cmd string) (string, error) {
 	return out, nil
 }
 
+// CopyTo copies hostPath into the guest at guestPath over SSH. Like SSH it dials
+// the VM IP directly; the 30s bounds only the dial/handshake (the transfer itself
+// is unbounded and ctx is not honored in v1, matching SSH).
+func (v *VM) CopyTo(_ context.Context, hostPath, guestPath string) error {
+	client, err := v.sshMgr.DialIP(v.ip, defaultUser, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	if err := client.CopyTo(hostPath, guestPath); err != nil {
+		return fmt.Errorf("copy to %q: %w", guestPath, err)
+	}
+	return nil
+}
+
+// CopyFrom copies guestPath out of the guest to hostPath over SSH. Like SSH it
+// dials the VM IP directly; the 30s bounds only the dial/handshake (the transfer
+// itself is unbounded and ctx is not honored in v1, matching SSH).
+func (v *VM) CopyFrom(_ context.Context, guestPath, hostPath string) error {
+	client, err := v.sshMgr.DialIP(v.ip, defaultUser, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	if err := client.CopyFrom(guestPath, hostPath); err != nil {
+		return fmt.Errorf("copy from %q: %w", guestPath, err)
+	}
+	return nil
+}
+
 // Stop gracefully shuts down the VM via the helper. The disk is preserved; the
 // helper closes its own serial log file as part of Stop (Decision 7). For a solo
 // VM this stops the helper's only member, so the helper exits, and ownsSession

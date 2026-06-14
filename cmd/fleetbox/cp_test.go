@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -35,6 +36,38 @@ func TestCpRemoteSide(t *testing.T) {
 			}
 			if name != tc.wantName {
 				t.Errorf("name = %q, want %q", name, tc.wantName)
+			}
+		})
+	}
+}
+
+func TestResolveLocalDest(t *testing.T) {
+	cases := []struct {
+		name     string
+		dst      string
+		srcBase  string
+		dstIsDir bool
+		want     string
+	}{
+		{name: "dot copies into cwd", dst: ".", srcBase: "x", want: filepath.Join(".", "x")},
+		{name: "dotdot copies into parent", dst: "..", srcBase: "x", want: filepath.Join("..", "x")},
+		{name: "trailing slash copies inside", dst: "out/", srcBase: "x", want: filepath.Join("out", "x")},
+		{
+			name:     "existing dir copies inside",
+			dst:      "existing",
+			srcBase:  "x",
+			dstIsDir: true,
+			want:     filepath.Join("existing", "x"),
+		},
+		{name: "explicit name passes through", dst: "renamed.txt", srcBase: "x", want: "renamed.txt"},
+		{name: "explicit path passes through", dst: "sub/renamed.txt", srcBase: "x", want: "sub/renamed.txt"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveLocalDest(tc.dst, tc.srcBase, tc.dstIsDir); got != tc.want {
+				t.Errorf("resolveLocalDest(%q, %q, %v) = %q, want %q",
+					tc.dst, tc.srcBase, tc.dstIsDir, got, tc.want)
 			}
 		})
 	}

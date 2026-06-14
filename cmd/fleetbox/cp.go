@@ -3,13 +3,17 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
-	"os/exec"
+	"path"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/pilat/fleetbox/internal/control"
+	"github.com/pilat/fleetbox/internal/sshkey"
 	"github.com/pilat/fleetbox/internal/store"
 )
 
@@ -98,37 +102,66 @@ func runCp(args []string) error {
 		return fmt.Errorf("VM %q is not running", name)
 	}
 
-	// Rewrite the remote side's path with the actual IP.
+	// Status.IP is a string; the copy primitive dials the parsed IP directly, the
+	// same per-installation key the library uses, the same "fleetbox" user the
+	// guest's cloud-init created.
+	ip := net.ParseIP(status.IP)
+	if ip == nil {
+		return fmt.Errorf("VM %q has no usable IP (%q)", name, status.IP)
+	}
+	client, err := sshkey.NewManager(st.SSHKeyPath()).DialIP(ip, "fleetbox", 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("dial %s: %w", name, err)
+	}
+	defer func() { _ = client.Close() }()
+
 	if strings.Contains(src, ":") {
-		parts := strings.SplitN(src, ":", 2)
-		src = fmt.Sprintf("fleetbox@%s:%s", status.IP, parts[1])
-	}
-	if strings.Contains(dst, ":") {
-		parts := strings.SplitN(dst, ":", 2)
-		dst = fmt.Sprintf("fleetbox@%s:%s", status.IP, parts[1])
-	}
-
-	scpArgs := []string{
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=" + devNull,
-		"-i", st.SSHKeyPath(),
-		src, dst,
-	}
-
-	scpCmd := exec.Command("scp", scpArgs...)
-	scpCmd.Stdin = os.Stdin
-	scpCmd.Stdout = os.Stdout
-	scpCmd.Stderr = os.Stderr
-
-	if err := scpCmd.Run(); err != nil {
-		// Propagate scp's own exit code without an extra "error:" line (scp wrote
-		// its own stderr) — the shared cliExit scheme (Task 1).
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return &cliExit{code: exitErr.ExitCode(), silent: true}
+		// Download: guest -> local. The CLI keeps scp's convenience of copying into
+		// a directory destination; the library method itself is exact-path.
+		guestPath := remotePath(src)
+		// The guest root has no basename to copy into a directory destination
+		// (path.Base("/") is "/"); require an explicit local target instead of
+		// resolving to a surprising one.
+		srcBase := path.Base(path.Clean(guestPath))
+		if srcBase == "/" || srcBase == "." {
+			return errors.New("copying the guest root needs an explicit local destination path")
 		}
-		return fmt.Errorf("scp: %w", err)
+		localDst := resolveLocalDest(dst, srcBase, isExistingDir(dst))
+		if err := client.CopyFrom(guestPath, localDst); err != nil {
+			return fmt.Errorf("copy from %s: %w", name, err)
+		}
+		return nil
 	}
 
+	// Upload: local -> guest. The guest destination is exact (the CLI cannot stat
+	// the guest to decide "copy into a directory"); guestPath must be absolute.
+	if err := client.CopyTo(src, remotePath(dst)); err != nil {
+		return fmt.Errorf("copy to %s: %w", name, err)
+	}
 	return nil
+}
+
+// remotePath returns the path component of a name:/path side.
+func remotePath(side string) string {
+	return strings.SplitN(side, ":", 2)[1]
+}
+
+// resolveLocalDest applies scp's "copy into a directory" convenience for a local
+// download destination: when dst names a directory — ".", "..", a trailing
+// separator, or an existing directory — the item lands inside it as
+// <dst>/<srcBase>; otherwise dst is the exact destination path. It is pure (the
+// "is dst a directory" decision is passed in) so the resolution is unit-testable
+// without a VM.
+func resolveLocalDest(dst, srcBase string, dstIsDir bool) string {
+	if dst == "." || dst == ".." || dstIsDir ||
+		strings.HasSuffix(dst, string(filepath.Separator)) {
+		return filepath.Join(dst, srcBase)
+	}
+	return dst
+}
+
+// isExistingDir reports whether p exists and is a directory.
+func isExistingDir(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && info.IsDir()
 }

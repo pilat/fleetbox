@@ -181,6 +181,9 @@ if err != nil {
 	log.Fatalf("%v\n%s", err, out)
 }
 
+_ = vm.CopyTo(ctx, "./app", "/srv/app")                // file or dir, in…
+_ = vm.CopyFrom(ctx, "/var/log/app.log", "./app.log")  // …or out; modes preserved
+
 _ = vm.Stop(ctx)                  // graceful shutdown, disk preserved
 // vm.Destroy(ctx) deletes it entirely
 ```
@@ -347,15 +350,16 @@ guest's internet egress over TCP (a connect to `1.1.1.1:443`), not `ping`. This 
 
 Roughly in priority order:
 
-- **Programmatic file copy** — a library-side copy in/out for cases a fixture doesn't
-  fit (the CLI already has `cp` over scp).
 - **Preserve host permissions** in fixtures (they currently arrive world-readable,
   uid 0).
 
-Recently landed: read-only host→guest fixtures (`WithFixture` / `--fixture`, identical
-on macOS and Linux), VM-to-VM networking over a real network (vmnet SharedMode), and CLI
-clustering (`fleetbox up node -n 3`) — so a kubeadm cluster, an etcd quorum, or a Raft
-group runs on real interconnected nodes, not mocks.
+Recently landed: programmatic file copy in/out (`VM.CopyTo` / `VM.CopyFrom` — universal
+file-or-directory, both directions, modes preserved; `fleetbox cp` is now built on it,
+tar over the SSH connection, no `scp` shell-out), read-only host→guest fixtures
+(`WithFixture` / `--fixture`, identical on macOS and Linux), VM-to-VM networking over a
+real network (vmnet SharedMode), and CLI clustering (`fleetbox up node -n 3`) — so a
+kubeadm cluster, an etcd quorum, or a Raft group runs on real interconnected nodes, not
+mocks.
 
 ## License
 

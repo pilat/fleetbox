@@ -28,7 +28,6 @@ package fleetboxtest
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -84,13 +83,11 @@ func TestNestedLinuxBoot(t *testing.T) {
 		t.Fatalf("guest has no /dev/kvm (nested virt unavailable?): %v\n%s", err, out)
 	}
 
-	// 3. Push the test binary in (the public VM API exposes SSH but not copy, so scp
-	//    directly against the VM IP with fleetbox's per-installation key).
-	scp := exec.CommandContext(ctx, "scp",
-		"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-		"-i", sshKeyPath(t), bin, "fleetbox@"+outer.IP().String()+":/tmp/fleetboxtest")
-	if out, err := scp.CombinedOutput(); err != nil {
-		t.Fatalf("scp test binary into guest: %v\n%s", err, out)
+	// 3. Push the test binary in via the public copy API (it now exposes CopyTo, so
+	//    no scp shell-out and no hand-reconstructed key path). The cross-built binary
+	//    is 0755 and CopyTo preserves the mode, so it lands executable in the guest.
+	if err := outer.CopyTo(ctx, bin, "/tmp/fleetboxtest"); err != nil {
+		t.Fatalf("copy test binary into guest: %v", err)
 	}
 
 	// 4. Run the FULL suite inside the guest: no -run selector, no -short, so capability
@@ -98,23 +95,12 @@ func TestNestedLinuxBoot(t *testing.T) {
 	//    cloud-hypervisor backend; the orchestrator self-skips (not darwin). A nested
 	//    boot is slow, hence the generous inner -test.timeout and the widened
 	//    FLEETBOX_IP_WAIT_TIMEOUT in elevateInGuest. Pass/fail is the binary's exit code
-	//    (surfaced as the SSH error), NOT a string match on the output.
-	cmd := fmt.Sprintf("chmod +x /tmp/fleetboxtest && %s /tmp/fleetboxtest "+
-		"-test.v -test.timeout 30m", elevateInGuest)
+	//    (surfaced as the SSH error), NOT a string match on the output. The binary
+	//    arrived executable via CopyTo's preserved mode, so no in-guest chmod.
+	cmd := elevateInGuest + " /tmp/fleetboxtest -test.v -test.timeout 30m"
 	out, err := outer.SSH(ctx, cmd)
 	t.Logf("in-guest unified suite output:\n%s", out)
 	if err != nil {
 		t.Fatalf("in-guest unified suite failed (inner exit non-zero): %v", err)
 	}
-}
-
-// sshKeyPath returns fleetbox's per-installation SSH private key, used to scp into
-// the guest. The library boots in bound mode against the real ~/.fleetbox, where
-// Start has already generated the key.
-func sshKeyPath(t testing.TB) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatalf("home dir: %v", err)
-	}
-	return filepath.Join(home, ".fleetbox", "id_ed25519")
 }

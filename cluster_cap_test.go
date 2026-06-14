@@ -33,12 +33,14 @@ type fakeVMState struct {
 	destroyed int
 }
 
-func (f *fakeVMState) Name() string                                { return f.name }
-func (f *fakeVMState) IP() net.IP                                  { return nil }
-func (f *fakeVMState) SSH(context.Context, string) (string, error) { return "", nil }
-func (f *fakeVMState) Stop(context.Context) error                  { return nil }
-func (f *fakeVMState) Destroy(context.Context) error               { f.destroyed++; return nil }
-func (f *fakeVMState) State() string                               { return "running" }
+func (f *fakeVMState) Name() string                                   { return f.name }
+func (f *fakeVMState) IP() net.IP                                     { return nil }
+func (f *fakeVMState) SSH(context.Context, string) (string, error)    { return "", nil }
+func (f *fakeVMState) CopyTo(context.Context, string, string) error   { return nil }
+func (f *fakeVMState) CopyFrom(context.Context, string, string) error { return nil }
+func (f *fakeVMState) Stop(context.Context) error                     { return nil }
+func (f *fakeVMState) Destroy(context.Context) error                  { f.destroyed++; return nil }
+func (f *fakeVMState) State() string                                  { return "running" }
 
 // TestClusterAddRejectsSecondMemberWithoutClustering pins the macOS <26 guard
 // (ADR-0012): adding a second member on a non-clustering backend fails with

@@ -87,6 +87,8 @@ type vmState interface {
 	Name() string
 	IP() net.IP
 	SSH(ctx context.Context, cmd string) (string, error)
+	CopyTo(ctx context.Context, hostPath, guestPath string) error
+	CopyFrom(ctx context.Context, guestPath, hostPath string) error
 	Stop(ctx context.Context) error
 	Destroy(ctx context.Context) error
 	State() string
@@ -117,6 +119,25 @@ func (v *VM) IP() net.IP { return v.st.IP() }
 // SSH executes a command on the VM via SSH and returns the output.
 func (v *VM) SSH(ctx context.Context, cmd string) (string, error) {
 	return v.st.SSH(ctx, cmd) //nolint:wrapcheck // transparent delegate; the platform impl wraps
+}
+
+// CopyTo copies hostPath (a file or a directory tree) into the guest, placing it
+// at guestPath exactly — CopyTo(ctx, "./app", "/srv/app") makes the file or
+// directory "/srv/app", creating any missing parent directories. File modes are
+// preserved (an executable stays executable); ownership is not (the copied tree
+// belongs to the connecting user). guestPath must be absolute. It streams over the
+// same SSH connection SSH uses, dialing the VM's IP directly.
+func (v *VM) CopyTo(ctx context.Context, hostPath, guestPath string) error {
+	return v.st.CopyTo(ctx, hostPath, guestPath) //nolint:wrapcheck // transparent delegate; the platform impl wraps
+}
+
+// CopyFrom copies guestPath (a file or a directory tree) out of the guest, placing
+// it at hostPath exactly — CopyFrom(ctx, "/var/log/app", "./app") makes the host
+// file or directory "./app", creating any missing parent directories. File modes
+// are preserved; ownership is not. guestPath must be absolute. It streams over the
+// same SSH connection SSH uses, dialing the VM's IP directly.
+func (v *VM) CopyFrom(ctx context.Context, guestPath, hostPath string) error {
+	return v.st.CopyFrom(ctx, guestPath, hostPath) //nolint:wrapcheck // transparent delegate; the platform impl wraps
 }
 
 // Stop gracefully shuts down the VM. The disk is preserved.
