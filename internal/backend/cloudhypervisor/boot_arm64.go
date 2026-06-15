@@ -3,15 +3,14 @@
 package cloudhypervisor
 
 import (
-	"bytes"
-	"compress/gzip"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
-	"time"
+
+	"github.com/diskfs/go-diskfs/backend"
+	"github.com/diskfs/go-diskfs/backend/file"
+	"github.com/diskfs/go-diskfs/filesystem/ext4"
+	"github.com/diskfs/go-diskfs/partition/gpt"
 )
 
 // arm64RootCmdline is the kernel command line for a direct boot of fleetbox's
@@ -21,6 +20,22 @@ import (
 // cloud image puts root on p1. The seed and fixtures are later --disk values
 // (vdb+), mounted by LABEL, so they do not affect root=.
 const arm64RootCmdline = "console=ttyAMA0 root=/dev/vda1 rw"
+
+// diskSectorSize is the disk's logical/physical sector size used to read the GPT
+// and to window the partition for ext4.Read. It is the sector size, not the ext4
+// block size — ext4.Read reads the real block size from the superblock itself.
+const diskSectorSize = 512
+
+// bootFS is satisfied by go-diskfs's *ext4.FileSystem. This is the one place the
+// seam (bootextract.go) is tied to go-diskfs, keeping the ext4 package imported
+// only by the linux && arm64 binary (the seam stays library-agnostic).
+var _ bootFS = (*ext4.FileSystem)(nil)
+
+// diskPartition is a byte range within the disk to probe for an ext4 filesystem.
+type diskPartition struct {
+	start int64
+	size  int64
+}
 
 // bootArgs returns an aarch64 DIRECT KERNEL boot for cloud-hypervisor, bypassing
 // rust-hypervisor-firmware. The firmware's aarch64 build does not execute the
@@ -49,217 +64,89 @@ func (v *VM) bootArgs() ([]string, error) {
 	}, nil
 }
 
-func fileExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
-}
-
 // extractKernel pulls the kernel and initrd out of the raw disk image into
-// kernelOut/initrdOut. It loopback-attaches the image with partition scanning,
-// finds the partition holding the kernel (debian keeps /boot inside root; ubuntu
-// uses a separate /boot partition), copies the kernel (decompressing a gzip Image,
-// which cloud-hypervisor needs raw) and the initrd, then detaches. It runs as root
-// — the Linux holder is root (ADR-0023), the only context that can losetup+mount.
+// kernelOut/initrdOut, reading the image in-process with pure-Go go-diskfs (no
+// loopback mount, no shell-out, no global host state to leak on SIGKILL, no root
+// required — read-only file access suffices; ADR-0026). It opens the disk
+// read-only, enumerates its partitions, reads each as ext4 until one holds a
+// kernel (debian keeps /boot inside root; ubuntu uses a separate /boot partition),
+// then copies the kernel (decompressing a gzip Image, which cloud-hypervisor needs
+// raw) and the initrd.
 func extractKernel(diskPath, kernelOut, initrdOut string) error {
-	loop, err := loopAttach(diskPath)
+	stor, err := file.OpenFromPath(diskPath, true)
 	if err != nil {
-		return err
+		return fmt.Errorf("open %s: %w", diskPath, err)
 	}
-	defer func() { _ = loopDetach(loop) }()
+	defer func() { _ = stor.Close() }()
 
-	mnt, err := os.MkdirTemp("", "fb-kernel-")
-	if err != nil {
-		return fmt.Errorf("temp mount dir: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(mnt) }()
-
-	bootDir, unmount, err := mountKernelPartition(loop, mnt)
-	if err != nil {
-		return err
-	}
-	defer unmount()
-
-	kSrc, err := resolveBootFile(bootDir, "vmlinuz")
-	if err != nil {
-		return fmt.Errorf("locate kernel: %w", err)
-	}
-	iSrc, err := resolveBootFile(bootDir, "initrd.img")
-	if err != nil {
-		return fmt.Errorf("locate initrd: %w", err)
-	}
-
-	if err := copyKernel(kSrc, kernelOut); err != nil {
-		return fmt.Errorf("copy kernel: %w", err)
-	}
-	if err := copyFile(iSrc, initrdOut); err != nil {
-		return fmt.Errorf("copy initrd: %w", err)
-	}
-	return nil
-}
-
-// loopAttach binds the image to a loop device with partition scanning and returns
-// the device path (e.g. /dev/loop3).
-func loopAttach(diskPath string) (string, error) {
-	out, err := exec.Command("losetup", "--find", "--partscan", "--show", diskPath).Output()
-	if err != nil {
-		return "", fmt.Errorf("losetup %s: %w", diskPath, err)
-	}
-	loop := strings.TrimSpace(string(out))
-	if loop == "" {
-		return "", fmt.Errorf("losetup returned no device for %s", diskPath)
-	}
-	// losetup --partscan creates the per-partition device nodes (loopNp1, …)
-	// asynchronously via udev, so a Glob right after attach can race and find
-	// none. Wait for them to appear before mountKernelPartition looks.
-	waitForLoopPartitions(loop)
-	return loop, nil
-}
-
-// waitForLoopPartitions blocks until the loop device's partition nodes appear (or
-// a short timeout), settling the udev race after losetup --partscan.
-func waitForLoopPartitions(loop string) {
-	_ = exec.Command("udevadm", "settle", "--timeout=5").Run() // best-effort
-	for range 50 {
-		if hits, _ := filepath.Glob(loop + "p*"); len(hits) > 0 {
-			return
+	// lastErr keeps the most recent partition failure so a total miss reports the
+	// real cause (a corrupt superblock, a missing initrd) rather than the bare
+	// "no partition with a kernel"; it is only consulted if no partition succeeds.
+	var lastErr error
+	for _, p := range diskPartitions(stor, diskPath) {
+		efs, err := ext4.Read(stor, p.size, p.start, diskSectorSize)
+		if err != nil {
+			lastErr = err // not ext4 (e.g. the vfat ESP) — try the next partition
+			continue
 		}
-		time.Sleep(100 * time.Millisecond)
+		dir, ok := findBootDir(efs)
+		if !ok {
+			continue
+		}
+		kSrc, err := resolveBootFile(efs, dir, "vmlinuz")
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		iSrc, err := resolveBootFile(efs, dir, "initrd.img")
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if err := copyKernel(efs, kSrc, kernelOut); err != nil {
+			return fmt.Errorf("copy kernel: %w", err)
+		}
+		if err := copyFile(efs, iSrc, initrdOut); err != nil {
+			return fmt.Errorf("copy initrd: %w", err)
+		}
+		return nil
 	}
+	if lastErr != nil {
+		return fmt.Errorf("no partition with a kernel in %s: %w", diskPath, lastErr)
+	}
+	return fmt.Errorf("no partition with a kernel in %s", diskPath)
 }
 
-func loopDetach(loop string) error {
-	if err := exec.Command("losetup", "--detach", loop).Run(); err != nil {
-		return fmt.Errorf("losetup --detach %s: %w", loop, err)
+// diskPartitions enumerates the byte ranges to probe for an ext4 root filesystem.
+// It reads the GPT and returns each partition's (start, size) in bytes; if the disk
+// has no usable GPT (a read error or zero usable partitions) it falls back to
+// treating the whole device as one bare ext4 at offset 0 — mirroring the old mount
+// path's "no partition table → try the whole device" branch. The catalog is
+// GPT-only (ADR-0019), so the fallback is purely defensive; ext4.Read on a
+// partitioned disk with start=0 simply errors (the superblock check fails), so the
+// whole-device entry is harmless on a GPT disk.
+func diskPartitions(stor backend.Storage, diskPath string) []diskPartition {
+	whole := func() []diskPartition {
+		fi, err := os.Stat(diskPath)
+		if err != nil {
+			return nil
+		}
+		return []diskPartition{{start: 0, size: fi.Size()}}
 	}
-	return nil
-}
 
-// mountKernelPartition mounts whichever scanned partition of loop holds the
-// kernel and returns the directory to read it from (the partition's /boot, or the
-// partition root when /boot is itself a separate partition) plus an unmount
-// closure. It tries each loopNpX partition until one yields a vmlinuz.
-func mountKernelPartition(loop, mnt string) (bootDir string, unmount func(), err error) {
-	parts, _ := filepath.Glob(loop + "p*")
+	tbl, err := gpt.Read(stor, diskSectorSize, diskSectorSize)
+	if err != nil {
+		return whole()
+	}
+	var parts []diskPartition
+	for _, p := range tbl.GetPartitions() {
+		if p.GetSize() <= 0 {
+			continue
+		}
+		parts = append(parts, diskPartition{start: p.GetStart(), size: p.GetSize()})
+	}
 	if len(parts) == 0 {
-		parts = []string{loop} // no partition table: try the whole device
+		return whole()
 	}
-	for _, part := range parts {
-		if mErr := mount(part, mnt); mErr != nil {
-			continue
-		}
-		for _, dir := range []string{filepath.Join(mnt, "boot"), mnt} {
-			if hits, _ := filepath.Glob(filepath.Join(dir, "vmlinuz*")); len(hits) > 0 {
-				return dir, func() { _ = unmountPath(mnt) }, nil
-			}
-		}
-		_ = unmountPath(mnt)
-	}
-	return "", nil, fmt.Errorf("no partition with a kernel in %s", loop)
-}
-
-func mount(dev, mnt string) error {
-	if err := exec.Command("mount", "-o", "ro", dev, mnt).Run(); err != nil {
-		return fmt.Errorf("mount %s: %w", dev, err)
-	}
-	return nil
-}
-
-func unmountPath(mnt string) error {
-	if err := exec.Command("umount", mnt).Run(); err != nil {
-		return fmt.Errorf("umount %s: %w", mnt, err)
-	}
-	return nil
-}
-
-// resolveBootFile picks the real boot file for a name like "vmlinuz" or
-// "initrd.img": it prefers the unversioned symlink (resolving it to its target),
-// else the newest versioned file, skipping ".old" links.
-func resolveBootFile(dir, name string) (string, error) {
-	link := filepath.Join(dir, name)
-	if target, err := filepath.EvalSymlinks(link); err == nil {
-		if fi, err := os.Stat(target); err == nil && fi.Mode().IsRegular() {
-			return target, nil
-		}
-	}
-	hits, _ := filepath.Glob(filepath.Join(dir, name+"-*"))
-	var best string
-	var bestTime int64
-	for _, h := range hits {
-		if strings.HasSuffix(h, ".old") {
-			continue
-		}
-		fi, err := os.Stat(h)
-		if err != nil || !fi.Mode().IsRegular() {
-			continue
-		}
-		if mt := fi.ModTime().UnixNano(); mt >= bestTime {
-			bestTime, best = mt, h
-		}
-	}
-	if best == "" {
-		return "", fmt.Errorf("no %s under %s", name, dir)
-	}
-	return best, nil
-}
-
-// copyKernel copies src to dst, decompressing it first if it is a gzip image:
-// cloud-hypervisor's aarch64 --kernel needs an uncompressed Image (debian ships
-// one; ubuntu gzips it).
-func copyKernel(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", src, err)
-	}
-	defer func() { _ = in.Close() }()
-
-	magic := make([]byte, 2)
-	if _, err := io.ReadFull(in, magic); err != nil {
-		return fmt.Errorf("read kernel magic: %w", err)
-	}
-	reader := io.MultiReader(bytes.NewReader(magic), in)
-	if magic[0] == 0x1f && magic[1] == 0x8b {
-		gz, gzErr := gzip.NewReader(reader)
-		if gzErr != nil {
-			return fmt.Errorf("gunzip kernel: %w", gzErr)
-		}
-		defer func() { _ = gz.Close() }()
-		reader = gz
-	}
-	return atomicWrite(dst, reader)
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", src, err)
-	}
-	defer func() { _ = in.Close() }()
-	return atomicWrite(dst, in)
-}
-
-// atomicWrite streams r into dst via a sibling temp file renamed on success, so an
-// interrupted copy (I/O error, ENOSPC, a SIGKILL from the holder's Pdeathsig)
-// never leaves a truncated file behind. A later boot would treat that file as a
-// valid cache (fileExists short-circuits re-extraction) and boot a corrupt kernel;
-// the rename makes the cache all-or-nothing.
-func atomicWrite(dst string, r io.Reader) error {
-	tmp := dst + ".tmp"
-	out, err := os.Create(tmp)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", tmp, err)
-	}
-	defer func() {
-		_ = out.Close()
-		_ = os.Remove(tmp) // best-effort: a no-op once renamed, cleanup on failure
-	}()
-	if _, err := io.Copy(out, r); err != nil {
-		return fmt.Errorf("write %s: %w", tmp, err)
-	}
-	if err := out.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		return fmt.Errorf("rename %s to %s: %w", tmp, dst, err)
-	}
-	return nil
+	return parts
 }
