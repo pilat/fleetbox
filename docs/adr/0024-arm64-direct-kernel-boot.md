@@ -1,7 +1,9 @@
 # ADR: Direct Kernel Boot on arm64 (cloud-hypervisor)
 
 **Date:** 2026-06-12
-**Status:** Accepted
+**Status:** Accepted (extraction mechanism amended by
+[ADR-0027](0027-arm64-kernel-extraction-in-process.md) — the loopback mount is replaced by
+an in-process pure-Go image read; the direct-boot decision and boot ABI below are unchanged)
 
 ## Context
 
@@ -38,10 +40,12 @@ The boot configuration is now arch-specific (`bootArgs` in `boot_amd64.go` /
 - **amd64** — unchanged: `--kernel <rust-hypervisor-firmware>`.
 - **arm64** — `--kernel <vmlinux> --initramfs <initrd> --cmdline "console=ttyAMA0
   root=/dev/vda1 rw"`. The kernel and initrd are extracted once from the image's
-  own `/boot` (loopback-attach the raw disk with partition scanning, mount the
-  partition holding the kernel, copy `vmlinuz`/`initrd.img`, decompressing a gzip
-  Image since cloud-hypervisor's aarch64 `--kernel` needs it raw) and cached next to
-  `disk.raw`. The extraction runs as root — the Linux holder already is (ADR-0023).
+  own `/boot` (find the partition holding the kernel, copy `vmlinuz`/`initrd.img`,
+  decompressing a gzip Image since cloud-hypervisor's aarch64 `--kernel` needs it
+  raw) and cached next to `disk.raw`. *(Originally this loopback-attached the raw
+  disk with partition scanning and mounted the partition, which ran as root; ADR-0027
+  replaced that with an in-process pure-Go image read that needs only read-only file
+  access.)*
 
 ## Alternatives Considered
 
@@ -60,8 +64,9 @@ linux/arm64 support, and the firmware path simply does not boot there.
 
 ## Consequences
 
-- arm64 pays a one-time per-image extraction (loopback mount + copy) at first boot;
-  it is cached in the VM dir, so reboots skip it.
+- arm64 pays a one-time per-image extraction (read the image, copy out the kernel +
+  initrd) at first boot; it is cached in the VM dir, so reboots skip it. (The
+  extraction mechanism is the in-process pure-Go read of ADR-0027.)
 - **Stale-kernel tradeoff:** the extracted kernel is the image's kernel at first
   boot. A guest that later updates its own kernel keeps booting the original until
   `rm`+`up`. Acceptable for cattle VMs (the firmware path read the on-disk kernel

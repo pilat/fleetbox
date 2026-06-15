@@ -129,8 +129,8 @@ on-disk state deletes `~/.fleetbox` by hand, the ADR-0014 stance).
   back has `fleetbox cp` / scp for the output direction; there is no live bind mount on
   either platform. This is the deliberate trade for one daemon-free cross-platform path.
 - **A new module dependency.** `github.com/pilat/go-ext4fs` provides the ext4 writer (with
-  the custom volume label + two-way resize this design relies on), pinned to its `v1.0.0`
-  release. Pure Go, no cgo — the Linux path stays cgo-free.
+  the custom volume label + two-way resize this design relies on). Pure Go, no cgo — the
+  Linux path stays cgo-free.
 - **Fixture filenames are unconstrained** (255-byte names, spaces, unicode, symlinks) — the
   ISO9660 limitation that prompted the switch is resolved.
 - **Host file permissions and exec bits are not preserved** — everything arrives `0444` /

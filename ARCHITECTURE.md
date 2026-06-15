@@ -817,8 +817,10 @@ When a PR changes any of these fields for a package, update its section.
   darwin dev box).
 - Depends on: `internal/backend`, `internal/fetch`, `github.com/vishvananda/netlink` +
   `github.com/google/nftables` (host networking — netlink and nf_tables over netlink),
+  `github.com/diskfs/go-diskfs` (arm64 only — the in-process kernel/initrd read for direct
+  boot, surgical `backend`+`backend/file`+`partition/gpt`+`filesystem/ext4`; ADR-0027),
   `golang.org/x/sys/unix`, stdlib (`net/http` over a unix socket). Pure Go, no cgo, no
-  host binary (ADR-0025).
+  host binary (ADR-0025, ADR-0027).
 - Public API (internal): `New(binDir, netDir) *Backend`; `Backend` (incl. `Reconcile`),
   `VM`, `chNetwork` satisfy the backend interfaces (`var _` checks present).
 - Invariants:
@@ -836,10 +838,14 @@ When a PR changes any of these fields for a package, update its section.
     `rust-hypervisor-firmware` (`--kernel <fw>`), which chain-loads the guest kernel from
     the disk. arm64 boots the kernel **directly** — the aarch64 firmware does not execute
     the guest under Apple-Silicon nested virt and is untested on bare metal — extracting
-    the image's own `vmlinuz`/`initrd` from `disk.raw` once (loopback mount, gunzip if
-    needed; cached next to the disk) and passing `--kernel`/`--initramfs`/`--cmdline
+    the image's own `vmlinuz`/`initrd` from `disk.raw` once (an **in-process pure-Go read**
+    of the raw image via go-diskfs — `backend/file` → `partition/gpt` → `filesystem/ext4`
+    (+ `backend` for the storage type), read-only, no loopback mount, no shell-out, no root;
+    gunzip if needed; cached next to the disk) and passing `--kernel`/`--initramfs`/`--cmdline
     "console=ttyAMA0 root=/dev/vda1 rw"`. The extracted kernel is the image's at first
-    boot (a later in-guest kernel update needs `rm`+`up`).
+    boot (a later in-guest kernel update needs `rm`+`up`). The search/copy seam is the
+    untagged `bootextract.go` (unit-tested on darwin, like `purehelpers.go`); the go-diskfs
+    wiring is in `boot_arm64.go` (ADR-0024, ADR-0027).
   - `CreateNetwork` makes one bridge per cluster on a free `/24` (gateway `.1`) via netlink
     and installs an `ip`-family nft table (`nftTableName(bridge)`) holding a NAT-postrouting
     masquerade rule plus a filter-forward chain (policy accept) carrying one subnet-scoped
@@ -1133,9 +1139,12 @@ Edges (verified by `go list -deps`):
   `third_party/vz` (+ `vmnet`) — the only vz import site (depguard `vz-isolation`, ADR-0008)
 - `internal/backend/cloudhypervisor` (linux) → `internal/backend`, `internal/fetch`,
   `github.com/vishvananda/netlink` + `github.com/google/nftables` (host networking),
-  `golang.org/x/sys/unix`, stdlib (the only CH import site; pure Go, no cgo — ADR-0025)
+  `github.com/diskfs/go-diskfs` (arm64 only — the in-process kernel/initrd read, the only
+  go-diskfs import site), `golang.org/x/sys/unix`, stdlib (the only CH import site; pure Go,
+  no cgo — ADR-0025, ADR-0027)
 - `internal/image` → `internal/fetch`, `go-qcow2reader`, stdlib `embed` (the catalog);
-  `internal/fixture` → `go-ext4fs` (its only import site)
+  `internal/fixture` → `go-ext4fs` (its only import site — the fixture **writer**; reads use
+  go-diskfs in the CH backend, ADR-0027)
 - `contrib/catalog` (build-time tool, not in any runtime binary) → `internal/image`
   (for the `ImageInfo`/`ArchImage` types), stdlib only; run via `make catalog` and the
   monthly `catalog-refresh.yml` (ADR-0019)
@@ -1283,11 +1292,15 @@ After implementation changes, verify:
   `fleetboxtest`, and `cmd/fleetbox` excludes `internal/backend/vz` and `third_party/vz`,
   and the three build with `CGO_ENABLED=0` (§6.9, ADR-0017).
 - **Dependencies**: direct requires in `go.mod` match the deps named in §5 module
-  sections (currently: pilat/cloudiso, pilat/go-ext4fs, go-qcow2reader, x/crypto,
+  sections (currently: pilat/cloudiso, pilat/go-ext4fs — the fixture **writer** (§5.14),
+  go-qcow2reader, x/crypto,
   spf13/cobra — the CLI framework, §5.3, ADR-0022, pulling spf13/pflag + inconshreveable/
   mousetrap as indirects — vishvananda/netlink + google/nftables — the Linux host
   networking, §5.12, ADR-0025, pulling vishvananda/netns + mdlayher/netlink + mdlayher/
-  socket + x/sync + google/go-cmp as indirects — and x/sys — now a direct dep, used by the
+  socket + x/sync + google/go-cmp as indirects — diskfs/go-diskfs — the arm64 in-process
+  kernel/initrd **read** for direct boot (§5.12, ADR-0027), surgically imported (only
+  `backend`+`backend/file`+`partition/gpt`+`filesystem/ext4`), pulling google/uuid as its
+  one new indirect — and x/sys — now a direct dep, used by the
   cloud-hypervisor backend (netlink errno matching), `internal/helperdist` (quarantine
   xattr) and the darwin capability probes, as well as by the in-module vendored vz; plus
   go-infinity-channel + x/mod pulled in by vz). The vz fork itself is not a require — it is
