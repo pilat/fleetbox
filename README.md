@@ -76,8 +76,8 @@ go get github.com/pilat/fleetbox
 That's the whole install: nothing to build, nothing to codesign. Your test binary stays
 pure Go. On macOS, all the Virtualization.framework work lives in a small signed
 `fleetbox-helper` that fleetbox downloads, checksum-pinned, into `~/.fleetbox/bin/` the
-first time you boot a VM. Linux is the same story with different binaries: the
-cloud-hypervisor VMM and its firmware are fetched and pinned on first use.
+first time you boot a VM. Linux is the same story with a different binary: the
+cloud-hypervisor VMM is fetched and pinned on first use.
 
 Prefer the CLI to the library? On macOS (Apple Silicon) it ships as a Homebrew cask:
 
@@ -310,7 +310,8 @@ way, the decision log lives in [docs/adr/](docs/adr/).
   macOS below 26 runs a single VM; Intel macOS is unsupported. On Linux, a stopped VM
   brought back up needs its `/24` to still be free — on a contended host the auto-picked
   subnet can shift and the rebooted VM won't be reachable; bring clusters up fresh.
-  arm64 Linux boot via rust-hypervisor-firmware is not yet validated on hardware.
+  arm64 Linux boot is exercised only via the nested dogfood on Apple Silicon (a real
+  nested-KVM boot), not yet on bare-metal arm64 hardware.
 - **Docker on the Linux host blocks VM egress.** When Docker is running it sets the
   iptables `FORWARD` policy to `DROP`, which drops a fleetbox VM's traffic to the internet
   (VMs forward through their own bridge, not Docker's) — the same conflict libvirt and LXD

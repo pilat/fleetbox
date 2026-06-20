@@ -14,22 +14,40 @@ import (
 
 // TestVMConformance is the cross-platform behavioral guard that the public VM
 // lifecycle behaves identically whether the orchestration runs in-process (Linux)
-// or in the downloaded, signed helper (macOS) — ADR-0017 R2. It boots one real VM
-// through the public API and exercises Name/IP/State/SSH, then verifies Destroy
+// or in the downloaded, signed helper (macOS) — ADR-0017 R2. It boots a real VM per
+// catalog image (ADR-0030) and exercises Name/IP/State/SSH, then verifies Destroy
 // tears it down, is idempotent on a second call, and removes the VM's store files.
 //
 // It carries no build tag, so it runs on both backends; it boots a real VM, so it
-// is skipped in -short and where the host cannot boot one (SkipIfCannotBootVM). Named
-// with the TestVM prefix so `make test-vm` runs it.
+// is skipped in -short and where the host cannot boot one (SkipIfCannotBootVM). The
+// image set comes from MatrixImages (FLEETBOX_TEST_IMAGES, defaulting to the full
+// catalog); subtests run serially because each VM is heavy.
 func TestVMConformance(t *testing.T) {
 	fleetboxtest.SkipIfShort(t, "boots a real VM")
 	fleetboxtest.SkipIfCannotBootVM(t)
 
+	for _, img := range fleetboxtest.MatrixImages(t) {
+		t.Run(img, func(t *testing.T) {
+			runConformance(t, img)
+		})
+	}
+}
+
+// runConformance boots one image through the public API and runs the full lifecycle
+// + egress + copy assertions against it. Each call gets its own boot budget and a
+// store-safe VM name so one image's failure cannot leak into another's.
+func runConformance(t *testing.T, image string) {
+	// A FRESH per-image budget: hoisting one shared context across all serial boots
+	// would let early images burn the whole deadline and starve later ones.
 	ctx, cancel := context.WithTimeout(context.Background(), fleetboxtest.BootTimeout(1))
 	defer cancel()
 
-	const name = "fbconformance"
-	vm, err := fleetbox.Start(ctx, name, fleetbox.WithImage("debian-12"))
+	// Store-safe, unique-per-image VM name. The store derives the cluster by
+	// stripping a trailing -<digits> and rejects dots, so the raw alias (debian-13,
+	// ubuntu-26.04) is unusable; strip both → fbconfdebian13, fbconfubuntu2604.
+	name := "fbconf" + strings.NewReplacer(".", "", "-", "").Replace(image)
+
+	vm, err := fleetbox.Start(ctx, name, fleetbox.WithImage(image))
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}

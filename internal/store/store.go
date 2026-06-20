@@ -141,10 +141,10 @@ func (s *Store) ImagesDir() string {
 	return filepath.Join(s.baseDir, "images")
 }
 
-// BinDir returns the cache directory for downloaded executables and firmware (the
-// storage root's bin/, default <home>/.fleetbox/bin). The Linux backend caches the
-// checksum-pinned cloud-hypervisor binary and its firmware here; it is created on
-// first download rather than by New, so macOS installs never grow an empty bin dir.
+// BinDir returns the cache directory for downloaded executables (the storage
+// root's bin/, default <home>/.fleetbox/bin). The Linux backend caches the
+// checksum-pinned cloud-hypervisor binary here; it is created on first download
+// rather than by New, so macOS installs never grow an empty bin dir.
 func (s *Store) BinDir() string {
 	return filepath.Join(s.baseDir, "bin")
 }

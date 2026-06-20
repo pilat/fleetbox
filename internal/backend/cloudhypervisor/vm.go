@@ -25,7 +25,6 @@ import (
 type VM struct {
 	name         string
 	chBin        string
-	fwPath       string
 	diskPath     string
 	seedPath     string
 	fixturePaths []string
@@ -45,15 +44,14 @@ type VM struct {
 }
 
 // newVM assembles a VM from the backend config, the tap it will use, and the
-// resolved binary/firmware paths. The api socket and serial log live in the VM's
-// store directory, derived from the disk path (the store owns the layout).
-func newVM(cfg backend.Config, nw *chNetwork, chBin, fwPath, tap string) *VM {
+// resolved cloud-hypervisor binary path. The api socket and serial log live in the
+// VM's store directory, derived from the disk path (the store owns the layout).
+func newVM(cfg backend.Config, nw *chNetwork, chBin, tap string) *VM {
 	vmDir := filepath.Dir(cfg.DiskPath)
 
 	return &VM{
 		name:         cfg.Name,
 		chBin:        chBin,
-		fwPath:       fwPath,
 		diskPath:     cfg.DiskPath,
 		seedPath:     cfg.SeedPath,
 		fixturePaths: cfg.FixturePaths,
@@ -190,13 +188,12 @@ func (v *VM) WaitForIP(ctx context.Context) (string, error) {
 	}
 }
 
-// buildArgs renders the full cloud-hypervisor command line: the boot config
-// (arch-specific — firmware on x86_64, direct kernel on arm64, via bootArgs), the
-// raw disk, the read-only seed ISO and any read-only fixture images, cpu/memory,
-// the tap NIC with the VM's MAC, and serial to the log file. All block devices
-// share one --disk flag (cloud-hypervisor takes multiple space-separated values);
-// the guest mounts fixtures by LABEL, so their order after the seed does not
-// matter (ADR-0015).
+// buildArgs renders the full cloud-hypervisor command line: the boot config (a
+// direct kernel boot on both arches, via bootArgs), the raw disk, the read-only
+// seed ISO and any read-only fixture images, cpu/memory, the tap NIC with the VM's
+// MAC, and serial to the log file. All block devices share one --disk flag
+// (cloud-hypervisor takes multiple space-separated values); the guest mounts
+// fixtures by LABEL, so their order after the seed does not matter (ADR-0015).
 func (v *VM) buildArgs() ([]string, error) {
 	disks := make([]string, 0, 2+len(v.fixturePaths))
 	disks = append(disks, "path="+v.diskPath, "path="+v.seedPath+",readonly=on")
@@ -204,9 +201,9 @@ func (v *VM) buildArgs() ([]string, error) {
 		disks = append(disks, "path="+p+",readonly=on")
 	}
 
-	// How the guest kernel is booted differs by arch (bootArgs lives in
-	// boot_{amd64,arm64}.go): x86_64 chain-loads via rust-hypervisor-firmware,
-	// arm64 boots the extracted kernel directly (ADR-0024).
+	// Both arches direct-boot the image's own extracted kernel+initrd; only the
+	// per-arch console/root cmdline differs (bootCmdline in boot_{amd64,arm64}.go).
+	// The extraction and shared bootArgs live in extract_linux.go (ADR-0029).
 	boot, err := v.bootArgs()
 	if err != nil {
 		return nil, err

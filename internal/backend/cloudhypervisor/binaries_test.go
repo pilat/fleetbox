@@ -10,10 +10,10 @@ import (
 	"time"
 )
 
-// TestEnsureBinaries fetches the pinned cloud-hypervisor binary and firmware,
-// verifies their SHA256, and confirms the second call is a cache no-op. It is
-// network-gated: if the release host is unreachable it skips rather than fails,
-// so it is safe offline. It runs only on linux (the backend's platform).
+// TestEnsureBinaries fetches the pinned cloud-hypervisor binary, verifies its
+// SHA256, and confirms the second call is a cache no-op. It is network-gated: if
+// the release host is unreachable it skips rather than fails, so it is safe
+// offline. It runs only on linux (the backend's platform).
 func TestEnsureBinaries(t *testing.T) {
 	if _, ok := chBinaries[runtime.GOARCH]; !ok {
 		t.Skipf("no pinned cloud-hypervisor binary for %s", runtime.GOARCH)
@@ -24,7 +24,7 @@ func TestEnsureBinaries(t *testing.T) {
 
 	binDir := t.TempDir()
 
-	chPath, fwPath, err := ensureBinaries(binDir)
+	chPath, err := ensureBinaries(binDir)
 	if err != nil {
 		t.Fatalf("ensureBinaries: %v", err)
 	}
@@ -36,17 +36,14 @@ func TestEnsureBinaries(t *testing.T) {
 	if info.Mode().Perm()&0o100 == 0 {
 		t.Errorf("cloud-hypervisor binary %s is not executable (mode %v)", chPath, info.Mode())
 	}
-	if _, err := os.Stat(fwPath); err != nil {
-		t.Fatalf("stat firmware: %v", err)
-	}
 
-	// Second call is a no-op: the verified files are already cached.
-	chPath2, fwPath2, err := ensureBinaries(binDir)
+	// Second call is a no-op: the verified binary is already cached.
+	chPath2, err := ensureBinaries(binDir)
 	if err != nil {
 		t.Fatalf("ensureBinaries (cached): %v", err)
 	}
-	if chPath2 != chPath || fwPath2 != fwPath {
-		t.Errorf("cached paths differ: got (%q,%q), want (%q,%q)", chPath2, fwPath2, chPath, fwPath)
+	if chPath2 != chPath {
+		t.Errorf("cached path differs: got %q, want %q", chPath2, chPath)
 	}
 }
 

@@ -103,7 +103,7 @@ ethernets:
     addresses:
       - 192.168.5.2/24
     routes:
-      - to: default
+      - to: 0.0.0.0/0
         via: 192.168.5.1
     nameservers:
       addresses: [1.1.1.1, 8.8.8.8]

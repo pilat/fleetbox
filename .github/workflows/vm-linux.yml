@@ -12,9 +12,19 @@ name: VM boot (Linux)
 # RPC → helper path, not just the backend. Bridge/tap creation needs CAP_NET_ADMIN,
 # so the binary runs as root with the runner's HOME preserved (so ~/.fleetbox
 # caching still applies). arm64 hosted runners have no KVM, so this is amd64 only.
+#
+# The conformance check is matrixed over the catalog (ADR-0030): a non-bootable
+# catalog image (e.g. a firmware-only boot path choking on a modern initrd, ADR-0029)
+# can no longer ship green behind debian-12. PR/push lanes boot a fixed 3-image subset
+# (debian-12 baseline + the two newest kernels) to bound wait; a nightly schedule and
+# manual dispatch boot the FULL catalog (FLEETBOX_TEST_IMAGES empty → all aliases).
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 4 * * *'
   workflow_dispatch: {}
 
 jobs:
@@ -60,8 +70,24 @@ jobs:
             sudo iptables -I DOCKER-USER -d 192.168.0.0/16 -j ACCEPT
           fi
 
-      - name: Boot real VMs (full capability-driven suite)
+      # PR/push: a fixed 3-image subset bounds how long the lane waits on real boots.
+      # schedule (nightly) and manual dispatch: an EMPTY value, which MatrixImages reads
+      # as the FULL catalog (NOT "none" — see fleetboxtest.MatrixImages / ADR-0030).
+      - name: Select catalog images
+        run: |
+          case "${{ github.event_name }}" in
+            schedule|workflow_dispatch)
+              echo "FLEETBOX_TEST_IMAGES=" >> "$GITHUB_ENV" ;;
+            *)
+              echo "FLEETBOX_TEST_IMAGES=debian-12,debian-13,ubuntu-26.04" >> "$GITHUB_ENV" ;;
+          esac
+
+      # sudo drops env vars not explicitly passed, so FLEETBOX_TEST_IMAGES is named in
+      # the env list alongside HOME/PATH. The timeout clears the worst case: six serial
+      # boots on the nightly run, each preceded by a first-run image download + qcow2→raw
+      # convert of the four Ubuntu images.
+      - name: Boot real VMs (catalog-matrix capability-driven suite)
         run: |
           go test -c -o /tmp/fleetboxtest ./fleetboxtest
-          sudo -E env "HOME=$HOME" "PATH=$PATH" \
-            /tmp/fleetboxtest -test.v -test.timeout 30m
+          sudo -E env "HOME=$HOME" "PATH=$PATH" "FLEETBOX_TEST_IMAGES=$FLEETBOX_TEST_IMAGES" \
+            /tmp/fleetboxtest -test.v -test.timeout 60m

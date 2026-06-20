@@ -142,7 +142,11 @@ func buildNetworkConfig(n NetworkConfig) string {
 	b.WriteString("    addresses:\n")
 	fmt.Fprintf(&b, "      - %s/%d\n", n.IP, prefixLen(n.Netmask))
 	b.WriteString("    routes:\n")
-	b.WriteString("      - to: default\n")
+	// Spell the default route as 0.0.0.0/0, not the "default" keyword: debian-11's
+	// cloud-init 20.4.1 mistranslates "to: default" into a bogus "0.0.0.0/24" ifupdown
+	// route, leaving the guest with no default gateway (no egress). 0.0.0.0/0 renders
+	// correctly on that old renderer and is identical on netplan-native distros.
+	b.WriteString("      - to: 0.0.0.0/0\n")
 	fmt.Fprintf(&b, "        via: %s\n", n.Gateway)
 	b.WriteString("    nameservers:\n")
 	fmt.Fprintf(&b, "      addresses: [%s]\n", publicDNS)

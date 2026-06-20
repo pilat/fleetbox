@@ -202,7 +202,7 @@ Commits follow **Conventional Commits** (`<type>[(scope)][!]: <description>`):
   platform inside the **helper** (`internal/holder/backend_darwin_arm64.go` → vz,
   `backend_linux.go` → cloud-hypervisor, `backend_fake.go` → fake under `-tags fleetbox_fake`,
   `backend_unsupported.go` → clear error) — NOT the orchestrator anymore (ADR-0020). On Linux
-  the VMM is a downloaded, checksum-pinned cloud-hypervisor binary + firmware (cached in
+  the VMM is a downloaded, checksum-pinned cloud-hypervisor binary (cached in
   `~/.fleetbox/bin/`), run as a subprocess and controlled over its unix-socket REST API with
   stdlib — pure Go, no cgo. Linux networking is a shared bridge + per-VM tap with static IPs
   the helper allocates via `Network.Reserve` and the client injects via cloud-init

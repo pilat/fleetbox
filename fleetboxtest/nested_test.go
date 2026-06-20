@@ -3,10 +3,11 @@
 // the SAME unified fleetboxtest suite — cross-built for linux/arm64 — runs INSIDE that
 // guest on the cloud-hypervisor backend via the arm64 direct-kernel path (ADR-0024).
 // Inside, the conformance test (single-VM lifecycle + egress through the nft
-// masquerade, ADR-0025) and the cluster test (VM↔VM over the shared bridge + subnet
-// isolation, ADR-0011) run against a live kernel; the orchestrator below self-skips
-// there (it is darwin-only), so there is no recursion. fleetbox testing fleetbox,
-// exercising the real netlink/nftables code end to end.
+// masquerade, ADR-0025) — matrixed over a debian baseline plus ubuntu-26.04, the
+// first real arm64-ubuntu boot (ADR-0030) — and the cluster test (VM↔VM over the
+// shared bridge + subnet isolation, ADR-0011) run against a live kernel; the
+// orchestrator below self-skips there (it is darwin-only), so there is no recursion.
+// fleetbox testing fleetbox, exercising the real netlink/nftables code end to end.
 //
 // There is no separate in-guest test: the dogfood is the real suite. The inner run's
 // PASS/FAIL is the inner process's exit code (which VM.SSH surfaces as a non-nil error
@@ -44,7 +45,11 @@ import (
 // elevated environment (the backend itself no longer shells out — host networking
 // is netlink/nftables, ADR-0025), and FLEETBOX_IP_WAIT_TIMEOUT widens both the
 // holder's IP-wait and the fixtures' BootTimeout because a doubly-nested boot is slow.
+// FLEETBOX_TEST_IMAGES matrixes the inner conformance run over a debian baseline plus
+// one ubuntu — the first real arm64-ubuntu boot, exercising ubuntu's separate-/boot
+// layout through the shared arm64 direct-kernel path (ADR-0029/0030).
 const elevateInGuest = "sudo -n env FLEETBOX_IP_WAIT_TIMEOUT=20m " +
+	"FLEETBOX_TEST_IMAGES=debian-12,ubuntu-26.04 " +
 	"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 // TestNestedLinuxBoot is the Mac-side orchestrator (see the file comment).
@@ -60,7 +65,10 @@ func TestNestedLinuxBoot(t *testing.T) {
 		t.Skip("set FLEETBOX_HELPER to the signed helper (see `make helper` / make test-vm)")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Minute)
+	// Generous: cross-build + outer boot + two inner conformance boots (debian +
+	// ubuntu, 20m IP-wait each) + the inner cluster. A Go -timeout kills without
+	// running t.Cleanup, leaking VMs, so this must clear the real worst case.
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Minute)
 	defer cancel()
 
 	// 1. Cross-build the linux/arm64 fleetboxtest *test binary* that will run inside
@@ -74,9 +82,10 @@ func TestNestedLinuxBoot(t *testing.T) {
 	}
 
 	// 2. Boot the outer Linux guest; on M3+ it gets a working /dev/kvm (nested virt).
-	//    Sized with headroom for the inner cluster (peak 8 GB across 4 small members).
+	//    Sized with headroom for the inner cluster (peak 8 GB across 4 small members)
+	//    and the two inner cloud images + their disks cached inside the guest.
 	outer := Start(t, "debian-12",
-		fleetbox.WithCPUs(8), fleetbox.WithMemoryGB(16), fleetbox.WithDiskGB(60))
+		fleetbox.WithCPUs(8), fleetbox.WithMemoryGB(16), fleetbox.WithDiskGB(100))
 
 	if out, err := outer.SSH(ctx, "test -e /dev/kvm && echo kvm-ok"); err != nil ||
 		!strings.Contains(out, "kvm-ok") {
@@ -97,7 +106,7 @@ func TestNestedLinuxBoot(t *testing.T) {
 	//    FLEETBOX_IP_WAIT_TIMEOUT in elevateInGuest. Pass/fail is the binary's exit code
 	//    (surfaced as the SSH error), NOT a string match on the output. The binary
 	//    arrived executable via CopyTo's preserved mode, so no in-guest chmod.
-	cmd := elevateInGuest + " /tmp/fleetboxtest -test.v -test.timeout 30m"
+	cmd := elevateInGuest + " /tmp/fleetboxtest -test.v -test.timeout 60m"
 	out, err := outer.SSH(ctx, cmd)
 	t.Logf("in-guest unified suite output:\n%s", out)
 	if err != nil {
