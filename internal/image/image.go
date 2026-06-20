@@ -4,8 +4,7 @@
 // pins a dated upstream snapshot and, per GOARCH, a download URL plus the SHA256
 // fetch verifies before use. The snapshot is stamped into the cache filename (for
 // both the source and the converted raw) so an upstream bump is a cache miss, not
-// a stale hit — images are pinned the way the VMM binary and firmware are
-// (ADR-0011, ADR-0019).
+// a stale hit — images are pinned the way the VMM binary is (ADR-0011, ADR-0019).
 package image
 
 import (
@@ -17,6 +16,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
@@ -137,6 +137,24 @@ func Ensure(cacheDir, urlOrAlias string) (string, error) {
 	_ = os.Remove(srcPath)
 
 	return rawPath, nil
+}
+
+// Aliases returns the catalog's image aliases (e.g. "debian-12", "ubuntu-26.04")
+// sorted lexically — the set of OS names fleetbox can boot out of the box. It is
+// the programmatic source of truth for the VM-boot test matrix (ADR-0030), so a new
+// catalog entry is covered without editing a hand-maintained list. A malformed
+// embedded catalog surfaces as an error, exactly as it does for Ensure.
+func Aliases() ([]string, error) {
+	catalog, err := loadCatalog()
+	if err != nil {
+		return nil, fmt.Errorf("load catalog: %w", err)
+	}
+	aliases := make([]string, 0, len(catalog))
+	for alias := range catalog {
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
+	return aliases, nil
 }
 
 // CopyDisk copies the source disk image to the destination with the given size.

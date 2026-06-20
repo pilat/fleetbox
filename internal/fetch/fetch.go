@@ -1,7 +1,7 @@
-// Package fetch downloads and caches remote files (cloud images, VMM binaries,
-// firmware), verifying an optional SHA256 and writing atomically so a cached
-// file is always complete. It is the shared download primitive behind
-// internal/image and the cloud-hypervisor backend (ADR-0011).
+// Package fetch downloads and caches remote files (cloud images, VMM binaries),
+// verifying an optional SHA256 and writing atomically so a cached file is always
+// complete. It is the shared download primitive behind internal/image and the
+// cloud-hypervisor backend (ADR-0011).
 package fetch
 
 import (

@@ -1,13 +1,13 @@
 package cloudhypervisor
 
-// This file carries the pure, library-agnostic seam of the arm64 direct-kernel-boot
+// This file carries the pure, library-agnostic seam of the both-arch direct-kernel-boot
 // extraction: locating and copying the guest kernel+initrd out of an already-opened
-// guest filesystem. The only non-test caller is extractKernel (boot_arm64.go,
-// //go:build linux && arm64), so — exactly like purehelpers.go — these helpers live
-// untagged and get darwin-runnable tests (bootextract_test.go) against a fake bootFS,
-// their only caller on the dev box. go-diskfs is NOT imported here (the seam stays
-// library-agnostic); the *ext4.FileSystem that satisfies bootFS, and the disk/partition
-// wiring around it, live in boot_arm64.go.
+// guest filesystem. The only non-test caller is extractKernel (extract_linux.go,
+// //go:build linux), so — exactly like purehelpers.go — these helpers live untagged and
+// get darwin-runnable tests (bootextract_test.go) against a fake bootFS, their only caller
+// on the dev box. go-diskfs is NOT imported here (the seam stays library-agnostic); the
+// *ext4.FileSystem that satisfies bootFS, and the disk/partition wiring around it, live in
+// extract_linux.go.
 
 import (
 	"bytes"
@@ -24,7 +24,7 @@ import (
 // bootFS is the read-only filesystem surface the extraction needs from the guest
 // root image: list a directory, open a file, and read a symlink's target. It is
 // satisfied by go-diskfs's *ext4.FileSystem (the satisfaction check lives in
-// boot_arm64.go, the only place go-diskfs is imported). Paths are io/fs-style:
+// extract_linux.go, the only place go-diskfs is imported). Paths are io/fs-style:
 // slash-separated, no leading slash, root is ".".
 type bootFS interface {
 	ReadDir(string) ([]fs.DirEntry, error)

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/pilat/fleetbox"
+	imagecatalog "github.com/pilat/fleetbox/internal/image"
 )
 
 const (
@@ -144,6 +145,47 @@ func BootTimeout(n int) time.Duration {
 		n = 1
 	}
 	return time.Duration(n) * 5 * time.Minute
+}
+
+// MatrixImages returns the catalog image aliases the VM-boot conformance test
+// should cover (ADR-0030). It reads FLEETBOX_TEST_IMAGES (a comma-separated alias
+// list): unset OR empty returns the FULL catalog (image.Aliases) — so CI's nightly
+// lane sets the var to an empty string to mean "everything", and empty must NOT
+// collapse to "none" — while a non-empty value is the explicit subset. Each alias
+// is validated against the catalog: an unknown alias is a fatal test error rather
+// than a silent literal-URL fetch that fails confusingly later in image.Ensure.
+func MatrixImages(tb testing.TB) []string {
+	tb.Helper()
+
+	aliases, err := imagecatalog.Aliases()
+	if err != nil {
+		tb.Fatalf("load catalog aliases: %v", err)
+	}
+	raw := os.Getenv("FLEETBOX_TEST_IMAGES")
+	if strings.TrimSpace(raw) == "" {
+		return aliases
+	}
+
+	known := make(map[string]bool, len(aliases))
+	for _, a := range aliases {
+		known[a] = true
+	}
+
+	var selected []string
+	for part := range strings.SplitSeq(raw, ",") {
+		img := strings.TrimSpace(part)
+		if img == "" {
+			continue
+		}
+		if !known[img] {
+			tb.Fatalf("unknown catalog image %q (known: %v)", img, aliases)
+		}
+		selected = append(selected, img)
+	}
+	if len(selected) == 0 {
+		return aliases
+	}
+	return selected
 }
 
 // SkipIfShort skips the test if -short is set.

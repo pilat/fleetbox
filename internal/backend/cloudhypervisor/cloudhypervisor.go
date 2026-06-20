@@ -1,10 +1,11 @@
 //go:build linux
 
 // Package cloudhypervisor implements the backend interface using
-// cloud-hypervisor on Linux. It boots a stock cloud image with the pinned
-// rust-hypervisor-firmware and controls the VM over cloud-hypervisor's REST API
-// on a per-VM unix socket, using only the Go standard library — no cgo. It is
-// the only package that knows cloud-hypervisor specifics (ADR-0002, ADR-0011).
+// cloud-hypervisor on Linux. It boots a stock cloud image by direct kernel boot —
+// extracting the image's own kernel+initrd and handing them to cloud-hypervisor
+// (ADR-0029) — and controls the VM over cloud-hypervisor's REST API on a per-VM
+// unix socket, using only the Go standard library — no cgo. It is the only package
+// that knows cloud-hypervisor specifics (ADR-0002, ADR-0011).
 package cloudhypervisor
 
 import (
@@ -24,9 +25,9 @@ var (
 
 // Backend implements the cloud-hypervisor backend.
 type Backend struct {
-	// binDir is where the pinned cloud-hypervisor binary and firmware are cached
-	// (typically ~/.fleetbox/bin); the root package injects it so this package
-	// does not depend on internal/store.
+	// binDir is where the pinned cloud-hypervisor binary is cached (typically
+	// ~/.fleetbox/bin); the root package injects it so this package does not depend
+	// on internal/store.
 	binDir string
 	// netDir is where per-network write-ahead records and the ip_forward marker
 	// live (typically ~/.fleetbox/networks); injected for the same reason. The
@@ -34,8 +35,8 @@ type Backend struct {
 	netDir string
 }
 
-// New creates a cloud-hypervisor backend caching its binary and firmware under
-// binDir and keeping network teardown records under netDir.
+// New creates a cloud-hypervisor backend caching its binary under binDir and
+// keeping network teardown records under netDir.
 func New(binDir, netDir string) *Backend {
 	return &Backend{binDir: binDir, netDir: netDir}
 }
@@ -77,7 +78,7 @@ func (b *Backend) Create(cfg backend.Config, nw backend.Network) (backend.VM, er
 		return nil, fmt.Errorf("network is not a cloud-hypervisor network: %T", nw)
 	}
 
-	chBin, fwPath, err := ensureBinaries(b.binDir)
+	chBin, err := ensureBinaries(b.binDir)
 	if err != nil {
 		return nil, fmt.Errorf("ensure binaries: %w", err)
 	}
@@ -93,7 +94,7 @@ func (b *Backend) Create(cfg backend.Config, nw backend.Network) (backend.VM, er
 		return nil, fmt.Errorf("create tap: %w", err)
 	}
 
-	return newVM(cfg, chNet, chBin, fwPath, tap), nil
+	return newVM(cfg, chNet, chBin, tap), nil
 }
 
 func validateConfig(cfg backend.Config) error {

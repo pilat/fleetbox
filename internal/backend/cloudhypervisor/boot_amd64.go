@@ -2,12 +2,11 @@
 
 package cloudhypervisor
 
-// bootArgs returns the x86_64 boot configuration: the pinned PVH
-// rust-hypervisor-firmware as the "kernel". The firmware chain-loads the guest
-// kernel from the disk's boot entry, so nothing has to be extracted. This is the
-// validated path on x86_64 (ADR-0011); arm64 cannot use it (the aarch64 firmware
-// does not boot under Apple-Silicon nested virt and is untested on bare metal), so
-// it boots the kernel directly instead — see boot_arm64.go and ADR-0024.
-func (v *VM) bootArgs() ([]string, error) {
-	return []string{"--kernel", v.fwPath}, nil
-}
+// bootCmdline is the kernel command line for a direct boot of fleetbox's catalog
+// cloud image on x86_64. console=ttyS0 targets the 16550 UART cloud-hypervisor
+// exposes on x86_64 (so the serial log fills); root is the first virtio-blk
+// partition — the disk is the first --disk value (vda) and every catalog image puts
+// root on p1. The seed and fixtures are later --disk values (vdb+), mounted by
+// LABEL, so they do not affect root=. Deriving root= from an arbitrary image is
+// deferred (ADR-0029).
+const bootCmdline = "console=ttyS0 root=/dev/vda1 rw"

@@ -70,13 +70,13 @@ test-fake-linux:
 # The test binary itself links no hypervisor and needs neither cgo nor codesign — the
 # whole point of the sever (ADR-0017). The -timeout is a generous backstop, not a per-test
 # budget: each VM boot is capped by FLEETBOX_IP_WAIT_TIMEOUT / BootTimeout and the nested
-# orchestrator self-caps at 40m, so a true hang is caught long before this fires. It must
-# clear the SUM of the direct boots (conformance + cluster + fixtures) AND the nested
-# orchestrator's 40m, because a Go -timeout kills the binary without running t.Cleanup —
-# leaking VMs. Hence 90m.
+# orchestrator self-caps at 75m, so a true hang is caught long before this fires. It must
+# clear the SUM of the direct boots — now the full catalog matrix (six conformance boots)
+# + cluster + fixtures — AND the nested orchestrator's 75m, because a Go -timeout kills the
+# binary without running t.Cleanup — leaking VMs. Hence 120m (ADR-0030).
 test-vm: helper
 	FLEETBOX_HELPER=$(CURDIR)/bin/fleetbox-helper \
-		go test -count=1 -v -timeout 90m ./fleetboxtest
+		go test -count=1 -v -timeout 120m ./fleetboxtest
 
 # Refresh the pinned cloud-image catalog (internal/image/catalog.json). The
 # human-authored keys decide which OSes exist; the tool only refreshes the values

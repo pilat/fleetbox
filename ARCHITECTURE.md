@@ -65,7 +65,7 @@ Where the canonical version of each thing lives. When two files disagree, the So
 | Backend contract | `internal/backend/backend.go` | `Backend`, `VM`, `Network`, `Config`, `State`. |
 | On-disk state layout | `internal/store/store.go` path methods | §4.2 summarizes. |
 | Image catalog | `internal/image/catalog.json` (embedded) + `internal/image/image.go` | Alias → dated snapshot + per-GOARCH URL + sha256 (pinned, verified); refreshed by `contrib/catalog`. |
-| Pinned VMM binaries | `internal/backend/cloudhypervisor/binaries.go` | cloud-hypervisor + firmware: version + per-arch URL + sha256. |
+| Pinned VMM binaries | `internal/backend/cloudhypervisor/binaries.go` | cloud-hypervisor: version + per-arch URL + sha256 (direct kernel boot, no firmware — ADR-0029). |
 | macOS helper catalog | `internal/helperdist/helperdist.go` `catalog` map | fleetbox-helper: version + per-arch URL + sha256; `FLEETBOX_HELPER` override (ADR-0017). |
 | Holder protocol | `internal/control/control.go` (client) + `internal/holder/holder.go` (server) | Wire commands + states + bound-mode bind/version handshake. |
 | Coordination test seam | `internal/backend/fake` + the `fleetbox_fake` build tag | Fake backend so CI gates teardown + the holder protocol with no VM boot; `make test-fake`/`make lint-fake` (ADR-0018). |
@@ -78,7 +78,7 @@ Where the canonical version of each thing lives. When two files disagree, the So
 | Build & signing recipe | `Makefile` + `entitlements.plist` | `com.apple.security.virtualization` entitlement. |
 | Vendored vz provenance & regen | `third_party/vz/NOTICE` + `hack/vendor-vz.sh` | Pinned upstream + vmnet-patch SHAs; `make vendor-vz` regenerates (ADR-0008, ADR-0016). |
 | CI behavior | `.github/workflows/ci.yml` | macOS job: lint + linux/darwin build + unit + fake coordination (no VZ boot). Linux job: build + unit + fake coordination via self-reexec. |
-| Linux VM-boot CI | `.github/workflows/vm-linux.yml` | Runs the full capability-driven suite (conformance + cluster) on an x86-64 KVM runner. |
+| Linux VM-boot CI | `.github/workflows/vm-linux.yml` | Runs the full capability-driven suite (conformance + cluster) on an x86-64 KVM runner; conformance is matrixed over the catalog — 3-image subset on PR/push, full on nightly/dispatch (ADR-0030). |
 | Release pipelines | `.github/workflows/{release-helper,release}.yml` + `.goreleaser.yaml` | Two channels: helper (`helper-v*`, macOS, codesign) and CLI (`v*`, goreleaser; also pushes a macOS Homebrew cask to the `pilat/homebrew-fleetbox` tap, ADR-0021). |
 | Working specs (local only) | `ai/tasks/` | Gitignored. Durable decisions must graduate to ADRs. |
 
@@ -160,7 +160,7 @@ All persistent state lives under `~/.fleetbox/` (the default; `FLEETBOX_HOME` /
 │   ├── <hash>.sock        #   per-member control socket (status/stop; the primary also carries createnetwork/reserve/boot-member)
 │   └── <hash>.ctl         #   bound-mode holder-wide socket (bind handshake + EOF teardown)
 ├── images/                # downloaded + converted raw cloud images (cache)
-├── bin/                   # downloaded checksum-pinned binaries: cloud-hypervisor + firmware (Linux), fleetbox-helper-<ver> (macOS)
+├── bin/                   # downloaded checksum-pinned binaries: cloud-hypervisor (Linux), fleetbox-helper-<ver> (macOS)
 ├── networks/              # Linux: per-bridge write-ahead records (<bridge>.json) + per-uplink forwarding markers (fwd-<iface>.orig) (ADR-0013, ADR-0025)
 ├── id_ed25519, id_ed25519.pub   # per-installation SSH keypair
 └── runner-<name>.log      # holder process output, named after the first member
@@ -352,9 +352,9 @@ The support matrix and how it is realized in build tags:
   nft firewall need `CAP_NET_ADMIN` (root has it), plus `CAP_DAC_OVERRIDE` to write the
   per-interface forwarding sysctls under `/proc`, so the preflight gates on `euid==0`, not
   on the capability. The CLI auto-elevates via sudo;
-  library/tests run under sudo (ADR-0023). The cloud-hypervisor binary and firmware are
-  downloaded and checksum-pinned to `~/.fleetbox/bin/` (ADR-0011); the Linux path is pure
-  Go, no cgo.
+  library/tests run under sudo (ADR-0023). The cloud-hypervisor binary is downloaded and
+  checksum-pinned to `~/.fleetbox/bin/` (ADR-0011); both arches direct-boot the guest
+  kernel, so there is no firmware artifact (ADR-0029); the Linux path is pure Go, no cgo.
 - **Nested virtualization** (consumers running KVM inside guests) needs M3+ on macOS,
   or the host KVM `nested` parameter on Linux. `fleetbox.NestedVirtSupported()` reports
   availability. The fixtures gate VM-boot tests on boot-capability, NOT nested virt
@@ -371,8 +371,10 @@ The support matrix and how it is realized in build tags:
   Linux runner, which exposes `/dev/kvm` (after a one-time udev rule): `vm-linux.yml` boots
   real VMs there — the full capability-driven suite (conformance + a multi-node cluster, so
   amd64 gets VM↔VM coverage; the nested dogfood self-skips, needing an M3+ macOS host) over
-  the full client→RPC→helper path (the test binary is its own helper via self-reexec). arm64
-  hosted Linux runners have no KVM. Do not switch the macOS CI to ubuntu.
+  the full client→RPC→helper path (the test binary is its own helper via self-reexec).
+  Conformance is matrixed over the catalog (ADR-0030): PR/push boot a 3-image subset, the
+  nightly schedule + manual dispatch boot the full catalog (`FLEETBOX_TEST_IMAGES` empty →
+  all aliases). arm64 hosted Linux runners have no KVM. Do not switch the macOS CI to ubuntu.
 
 ## §5. Modules
 
@@ -481,7 +483,9 @@ When a PR changes any of these fields for a package, update its section.
 - Depends on: `fleetbox` (public API only — no internal imports).
 - Public API: `Start(t, image, opts...) *fleetbox.VM`,
   `StartN(t, prefix, n, opts...) []*fleetbox.VM`, `SkipIfShort(t, reason)`,
-  `SkipIfCannotBootVM(t)`, `BootTimeout(n int) time.Duration`.
+  `SkipIfCannotBootVM(t)`, `BootTimeout(n int) time.Duration`,
+  `MatrixImages(tb) []string` (the conformance boot matrix — `FLEETBOX_TEST_IMAGES`, else the
+  full catalog; ADR-0030).
 - Invariants:
   - Uses only the public `fleetbox` API.
   - Every VM it creates is destroyed via `t.Cleanup` — test VMs never outlive tests.
@@ -645,7 +649,8 @@ When a PR changes any of these fields for a package, update its section.
 - Depends on: `go-qcow2reader`, `internal/fetch`, stdlib (incl. `embed`).
 - Public API (internal): the `ImageInfo`/`ArchImage` types (also imported by
   `contrib/catalog`), `Ensure(cacheDir, urlOrAlias) (string, error)`,
-  `CopyDisk(src, dst, sizeBytes)`. The catalog itself is an embedded JSON data file
+  `Aliases() ([]string, error)` (sorted catalog keys — the source of the VM-boot test
+  matrix, ADR-0030), `CopyDisk(src, dst, sizeBytes)`. The catalog itself is an embedded JSON data file
   (`catalog.json`, `//go:embed`), parsed once via `loadCatalog()` (sync.Once →
   wrapped error on malformed JSON); there is no exported `Catalog` var (ADR-0019).
 - Invariants:
@@ -823,20 +828,20 @@ When a PR changes any of these fields for a package, update its section.
 ### §5.12 `internal/backend/cloudhypervisor`
 
 - Purpose: the cloud-hypervisor implementation of `backend.Backend` on Linux. Boots a
-  stock cloud image — via the pinned `rust-hypervisor-firmware` on x86_64, or a direct
-  kernel boot on arm64 (ADR-0024) — controlled over CH's REST API on a per-VM unix socket
-  — pure Go, no cgo (ADR-0011).
+  stock cloud image by a direct kernel boot on both arches (ADR-0024 arm64, ADR-0029
+  x86_64 — no firmware), controlled over CH's REST API on a per-VM unix socket — pure Go,
+  no cgo (ADR-0011).
 - Owns: the CH child process per VM and its `exited` channel; the `chNetwork` (Linux
   bridge, subnet, taps, uplink, nft firewall); the per-bridge write-ahead records and
   per-uplink forwarding marker under `~/.fleetbox/networks/` (`netstate.go`); the pinned
-  binary/firmware table; the process-wide reserved-subnet set. **Build-tagged `linux`**
+  cloud-hypervisor binary table; the process-wide reserved-subnet set. **Build-tagged `linux`**
   (except the portable `purehelpers.go` — table-name mapping, nf_tables errno
   classification, uplink-name selection — which is untagged so it is unit-testable on the
   darwin dev box).
 - Depends on: `internal/backend`, `internal/fetch`, `github.com/vishvananda/netlink` +
   `github.com/google/nftables` (host networking — netlink and nf_tables over netlink),
-  `github.com/diskfs/go-diskfs` (arm64 only — the in-process kernel/initrd read for direct
-  boot, surgical `backend`+`backend/file`+`partition/gpt`+`filesystem/ext4`; ADR-0027),
+  `github.com/diskfs/go-diskfs` (both arches — the in-process kernel/initrd read for direct
+  boot, surgical `backend`+`backend/file`+`partition/gpt`+`filesystem/ext4`; ADR-0027, ADR-0029),
   `golang.org/x/sys/unix`, stdlib (`net/http` over a unix socket). Pure Go, no cgo, no
   host binary (ADR-0025, ADR-0027).
 - Public API (internal): `New(binDir, netDir) *Backend`; `Backend` (incl. `Reconcile`),
@@ -852,18 +857,19 @@ When a PR changes any of these fields for a package, update its section.
     (`errors.Is(err, EPERM)` → `create bridge (needs root)` if a non-root holder ever
     reaches it; the preflight already gated on root — ADR-0023), and an nf_tables probe
     runs right after, discriminating "needs root" from "kernel lacks nf_tables" (ADR-0025).
-  - **Arch-specific boot (ADR-0024, `boot_{amd64,arm64}.go`).** x86_64 boots via the PVH
-    `rust-hypervisor-firmware` (`--kernel <fw>`), which chain-loads the guest kernel from
-    the disk. arm64 boots the kernel **directly** — the aarch64 firmware does not execute
-    the guest under Apple-Silicon nested virt and is untested on bare metal — extracting
-    the image's own `vmlinuz`/`initrd` from `disk.raw` once (an **in-process pure-Go read**
-    of the raw image via go-diskfs — `backend/file` → `partition/gpt` → `filesystem/ext4`
-    (+ `backend` for the storage type), read-only, no loopback mount, no shell-out, no root;
-    gunzip if needed; cached next to the disk) and passing `--kernel`/`--initramfs`/`--cmdline
-    "console=ttyAMA0 root=/dev/vda1 rw"`. The extracted kernel is the image's at first
-    boot (a later in-guest kernel update needs `rm`+`up`). The search/copy seam is the
-    untagged `bootextract.go` (unit-tested on darwin, like `purehelpers.go`); the go-diskfs
-    wiring is in `boot_arm64.go` (ADR-0024, ADR-0027).
+  - **Direct kernel boot on both arches (ADR-0024 arm64, ADR-0029 x86_64; no firmware).**
+    Both arches extract the image's own `vmlinuz`/`initrd` from `disk.raw` once (an
+    **in-process pure-Go read** of the raw image via go-diskfs — `backend/file` →
+    `partition/gpt` → `filesystem/ext4` (+ `backend` for the storage type), read-only, no
+    loopback mount, no shell-out, no root; gunzip the arm64 gzip Image if needed, the x86
+    bzImage passes through; cached next to the disk) and pass
+    `--kernel`/`--initramfs`/`--cmdline`. `bootArgs` is unified in `extract_linux.go`; only
+    `bootCmdline` is per-arch (`boot_{amd64,arm64}.go`: `console=ttyS0` vs `console=ttyAMA0`,
+    both `root=/dev/vda1 rw`). The extracted kernel is the image's at first boot (a later
+    in-guest kernel update needs `rm`+`up`); deriving `root=` from a non-catalog image is
+    deferred (ADR-0029). The search/copy seam is the untagged `bootextract.go` (unit-tested
+    on darwin, like `purehelpers.go`); the go-diskfs wiring is in `extract_linux.go`
+    (ADR-0027, ADR-0029).
   - `CreateNetwork` makes one bridge per cluster on a free `/24` (gateway `.1`) via netlink
     and installs an `ip`-family nft table (`nftTableName(bridge)`) holding a NAT-postrouting
     masquerade rule plus a filter-forward chain (policy accept) carrying one subnet-scoped
@@ -1157,9 +1163,9 @@ Edges (verified by `go list -deps`):
   `third_party/vz` (+ `vmnet`) — the only vz import site (depguard `vz-isolation`, ADR-0008)
 - `internal/backend/cloudhypervisor` (linux) → `internal/backend`, `internal/fetch`,
   `github.com/vishvananda/netlink` + `github.com/google/nftables` (host networking),
-  `github.com/diskfs/go-diskfs` (arm64 only — the in-process kernel/initrd read, the only
+  `github.com/diskfs/go-diskfs` (both arches — the in-process kernel/initrd read, the only
   go-diskfs import site), `golang.org/x/sys/unix`, stdlib (the only CH import site; pure Go,
-  no cgo — ADR-0025, ADR-0027)
+  no cgo — ADR-0025, ADR-0027, ADR-0029)
 - `internal/image` → `internal/fetch`, `go-qcow2reader`, stdlib `embed` (the catalog);
   `internal/fixture` → `go-ext4fs` (its only import site — the fixture **writer**; reads use
   go-diskfs in the CH backend, ADR-0027)
@@ -1315,8 +1321,8 @@ After implementation changes, verify:
   spf13/cobra — the CLI framework, §5.3, ADR-0022, pulling spf13/pflag + inconshreveable/
   mousetrap as indirects — vishvananda/netlink + google/nftables — the Linux host
   networking, §5.12, ADR-0025, pulling vishvananda/netns + mdlayher/netlink + mdlayher/
-  socket + x/sync + google/go-cmp as indirects — diskfs/go-diskfs — the arm64 in-process
-  kernel/initrd **read** for direct boot (§5.12, ADR-0027), surgically imported (only
+  socket + x/sync + google/go-cmp as indirects — diskfs/go-diskfs — the both-arch in-process
+  kernel/initrd **read** for direct boot (§5.12, ADR-0027, ADR-0029), surgically imported (only
   `backend`+`backend/file`+`partition/gpt`+`filesystem/ext4`), pulling google/uuid as its
   one new indirect — and x/sys — now a direct dep, used by the
   cloud-hypervisor backend (netlink errno matching), `internal/helperdist` (quarantine
