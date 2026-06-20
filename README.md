@@ -191,6 +191,8 @@ _ = vm.Stop(ctx)                  // graceful shutdown, disk preserved
 `Start` is idempotent: call it again with the same name and it boots the existing VM
 instead of recreating it. State lives under `~/.fleetbox/clusters/<cluster>/<name>/` and
 survives reboots; `Destroy` (or `fleetbox rm`) is the only thing that deletes a disk.
+(`fleetbox.SetStorageRoot` / `FLEETBOX_HOME` moves that root if a `~/.fleetbox` in your
+users' home would be surprising.)
 Full API on [pkg.go.dev](https://pkg.go.dev/github.com/pilat/fleetbox).
 
 ### Handing a VM a directory

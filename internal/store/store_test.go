@@ -103,6 +103,46 @@ func TestResolveBaseHome(t *testing.T) {
 	}
 }
 
+// TestNewHonorsEnvHome pins the FLEETBOX_HOME precedence (ADR-0028): when the env
+// is set, New roots there verbatim and skips the SUDO_USER dance, creating the
+// eager dirs (clusters/ images/ run/) under it. bin/ and networks/ are lazy, so
+// they are not asserted.
+func TestNewHonorsEnvHome(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "branded")
+	t.Setenv(EnvHome, root)
+
+	st, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if st.BaseDir() != root {
+		t.Errorf("BaseDir = %q, want %q", st.BaseDir(), root)
+	}
+	for _, sub := range []string{"clusters", "images", "run"} {
+		if _, err := os.Stat(filepath.Join(root, sub)); err != nil {
+			t.Errorf("subdir %s not created: %v", sub, err)
+		}
+	}
+}
+
+// TestNewDefaultUnchanged guards the no-knob default: with FLEETBOX_HOME unset, New
+// roots at <home>/.fleetbox. HOME is redirected to a temp dir so the assertion does
+// not depend on — or create — a real ~/.fleetbox on the dev/CI box.
+func TestNewDefaultUnchanged(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv(EnvHome, "") // empty is treated as unset by New
+
+	st, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	want := filepath.Join(home, ".fleetbox")
+	if st.BaseDir() != want {
+		t.Errorf("BaseDir = %q, want %q", st.BaseDir(), want)
+	}
+}
+
 func TestStoreBasic(t *testing.T) {
 	tmpDir := t.TempDir()
 	st, err := NewAt(tmpDir)
