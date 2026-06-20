@@ -12,6 +12,7 @@ package cloudhypervisor
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -20,6 +21,11 @@ import (
 	"strings"
 	"time"
 )
+
+// ext4MaxBlockSize is the largest standard ext4 block size (mkfs defaults to 4 KiB;
+// 64 KiB covers every standard block size). It is the alignment blockAlignedReader
+// enforces on the underlying File — see that type for why.
+const ext4MaxBlockSize = 64 << 10
 
 // bootFS is the read-only filesystem surface the extraction needs from the guest
 // root image: list a directory, open a file, and read a symlink's target. It is
@@ -30,6 +36,60 @@ type bootFS interface {
 	ReadDir(string) ([]fs.DirEntry, error)
 	Open(string) (fs.File, error)
 	ReadLink(string) (string, error)
+}
+
+// blockAlignedReader buffers a go-diskfs ext4 File in whole blocks so that every Read
+// issued to the underlying File starts at an ext4MaxBlockSize-aligned offset, however
+// few bytes the consumer asks for.
+//
+// WHY THIS EXISTS — do not "simplify" it away: go-diskfs v1.9.3's ext4.File.Read
+// (filesystem/ext4/file.go:55-90) has an off-by-one in its extent-skip loop. Read a
+// FRAGMENTED (multi-extent) file from a NON-block-aligned offset and it computes a
+// negative byte count, then panics in make([]byte, negative) ("makeslice: len out of
+// range"). copyKernel's 2-byte magic sniff leaves the File at offset 2, so reading the
+// File directly afterwards detonates it on ubuntu's separate, fragmented /boot kernel.
+// Routing every read through this buffer makes the alignment invariant EXPLICIT instead
+// of borrowing it from whatever buffer size a downstream io.Copy / gzip / bufio happens
+// to use (those sizes are 4 KiB/32 KiB today only by accident).
+type blockAlignedReader struct {
+	src io.Reader
+	buf []byte
+	off int
+	end int
+	eof bool
+}
+
+var _ io.Reader = (*blockAlignedReader)(nil)
+
+// newBlockAlignedReader wraps src (a go-diskfs ext4 File) to guarantee block-aligned
+// underlying reads.
+func newBlockAlignedReader(src io.Reader) *blockAlignedReader {
+	return &blockAlignedReader{src: src, buf: make([]byte, ext4MaxBlockSize)}
+}
+
+// Read serves from the block buffer, refilling it with one block-multiple read from src
+// whenever it drains. io.ReadFull keeps each refill a full block (or the final short
+// chunk at EOF), so src's offset only ever advances by block multiples.
+func (r *blockAlignedReader) Read(p []byte) (int, error) {
+	if r.off >= r.end {
+		if r.eof {
+			return 0, io.EOF
+		}
+		n, err := io.ReadFull(r.src, r.buf)
+		switch {
+		case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+			r.eof = true
+		case err != nil:
+			return 0, fmt.Errorf("read block: %w", err)
+		}
+		r.off, r.end = 0, n
+		if n == 0 {
+			return 0, io.EOF
+		}
+	}
+	n := copy(p, r.buf[r.off:r.end])
+	r.off += n
+	return n, nil
 }
 
 // fileExists reports whether p names an existing host path. bootArgs uses it to
@@ -99,11 +159,14 @@ func copyKernel(fsys bootFS, src, dst string) error {
 	}
 	defer func() { _ = in.Close() }()
 
+	// The 2-byte magic sniff leaves the File mid-block; reading it directly afterwards
+	// panics go-diskfs on a fragmented kernel — read through blockAlignedReader instead.
+	r := newBlockAlignedReader(in)
 	magic := make([]byte, 2)
-	if _, err := io.ReadFull(in, magic); err != nil {
+	if _, err := io.ReadFull(r, magic); err != nil {
 		return fmt.Errorf("read kernel magic: %w", err)
 	}
-	reader := io.MultiReader(bytes.NewReader(magic), in)
+	reader := io.MultiReader(bytes.NewReader(magic), r)
 	if magic[0] == 0x1f && magic[1] == 0x8b {
 		gz, gzErr := gzip.NewReader(reader)
 		if gzErr != nil {
@@ -123,7 +186,9 @@ func copyFile(fsys bootFS, src, dst string) error {
 		return fmt.Errorf("open %s: %w", src, err)
 	}
 	defer func() { _ = in.Close() }()
-	return atomicWrite(dst, in)
+	// Block-align reads as copyKernel does: defense in depth against the same go-diskfs
+	// panic should a large initrd ever fragment across extents.
+	return atomicWrite(dst, newBlockAlignedReader(in))
 }
 
 // atomicWrite streams r into dst via a sibling temp file renamed on success, so an

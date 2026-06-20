@@ -3,6 +3,8 @@ package cloudhypervisor
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -402,5 +404,60 @@ func TestFileExists(t *testing.T) {
 	}
 	if fileExists(filepath.Join(t.TempDir(), "missing")) {
 		t.Errorf("fileExists(missing) = true, want false")
+	}
+}
+
+// blockProbeReader models go-diskfs's ext4.File closely enough to catch the bug the
+// fakeFS (a plain bytes.Reader, immune to it) cannot: it serves data in block-sized
+// pieces and PANICS if asked to read from a non-block-aligned offset while bytes
+// remain — the exact condition that detonates ext4.File.Read on a fragmented file.
+type blockProbeReader struct {
+	data  []byte
+	off   int
+	block int
+}
+
+func (r *blockProbeReader) Read(p []byte) (int, error) {
+	if r.off < len(r.data) && r.off%r.block != 0 {
+		panic("ext4 misaligned read into a fragmented file")
+	}
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := min(r.block, len(p), len(r.data)-r.off)
+	copy(p, r.data[r.off:r.off+n])
+	r.off += n
+	return n, nil
+}
+
+func TestBlockAlignedReaderKeepsUnderlyingReadsAligned(t *testing.T) {
+	// 40000 bytes: several 4 KiB blocks plus a non-block-multiple tail, so the final
+	// underlying chunk is short — exactly where a naive alignment check slips.
+	data := bytes.Repeat([]byte("fleetbox-"), 4445)[:40000]
+	// Cover tiny consumer reads (the 2-byte magic sniff is len 2) through over-sized.
+	for _, chunk := range []int{1, 2, 3, 7, 511, 4095, 4096, 5000, 131072} {
+		probe := &blockProbeReader{data: data, block: 4096}
+		got, err := readAllChunked(newBlockAlignedReader(probe), chunk)
+		if err != nil {
+			t.Fatalf("chunk=%d: read: %v", chunk, err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("chunk=%d: round-trip mismatch (%d bytes)", chunk, len(got))
+		}
+	}
+}
+
+func readAllChunked(r io.Reader, chunk int) ([]byte, error) {
+	buf := make([]byte, chunk)
+	var out []byte
+	for {
+		n, err := r.Read(buf)
+		out = append(out, buf[:n]...)
+		if errors.Is(err, io.EOF) {
+			return out, nil
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 }
