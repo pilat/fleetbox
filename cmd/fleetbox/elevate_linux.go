@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+
+	"github.com/pilat/fleetbox/internal/store"
 )
 
 // envElevated marks a process that a prior auto-elevation already re-exec'd via
@@ -105,22 +107,33 @@ func printElevation() error {
 
 // elevatedArgv builds the argv for the re-exec:
 //
-//	sudo env FLEETBOX_ELEVATED=1 PATH=<current> <abs self> <original args...>
+//	sudo env FLEETBOX_ELEVATED=1 PATH=<current> [FLEETBOX_HOME=<root>] <abs self> <original args...>
 //
 // FLEETBOX_ELEVATED and PATH go in the `env` prefix, NOT via `sudo -E`: many
 // sudoers policies reject -E (SETENV not granted) and env_reset drops the process
 // environment, so the loop-guard flag and PATH must be set by `env` (which runs
 // after sudo authenticates). The self path is absolute (os.Executable), which is
 // what fixes `sudo: fleetbox: command not found` when sudo's secure_path omits the
-// Go/mise bin dir. HOME is deliberately NOT forwarded — the store resolves the
-// SUDO_USER passwd home, not $HOME, in the root case (Task 2 / ADR-0023).
+// Go/mise bin dir. HOME is deliberately NOT forwarded — by default the store
+// resolves the SUDO_USER passwd home, not $HOME, in the root case (ADR-0023).
+//
+// FLEETBOX_HOME, in contrast, IS forwarded when set: it is an explicit absolute root
+// (ADR-0028), so handing the elevated child the same value keeps root and the
+// invoking user on one storage tree — strictly better than re-deriving it from
+// SUDO_USER, and required to avoid a split-brain where the non-root client wrote to
+// the branded root but the elevated `up` fell back to ~/.fleetbox. It is skipped
+// entirely when unset so the ADR-0023 default path is untouched (no bare assignment).
 func elevatedArgv() ([]string, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("resolve own path: %w", err)
 	}
-	argv := make([]string, 0, 5+len(os.Args)-1)
-	argv = append(argv, "sudo", "env", envElevated+"=1", "PATH="+ensureSbinInPath(os.Getenv("PATH")), self)
+	argv := make([]string, 0, 6+len(os.Args)-1)
+	argv = append(argv, "sudo", "env", envElevated+"=1", "PATH="+ensureSbinInPath(os.Getenv("PATH")))
+	if home := os.Getenv(store.EnvHome); home != "" {
+		argv = append(argv, store.EnvHome+"="+home)
+	}
+	argv = append(argv, self)
 	argv = append(argv, os.Args[1:]...)
 	return argv, nil
 }

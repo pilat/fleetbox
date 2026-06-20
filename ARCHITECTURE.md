@@ -139,7 +139,9 @@ Destroy is the only destructive operation.
 
 ### §4.2 State & persistence
 
-All persistent state lives under `~/.fleetbox/` and is owned by `internal/store`:
+All persistent state lives under `~/.fleetbox/` (the default; `FLEETBOX_HOME` /
+`fleetbox.SetStorageRoot` relocates the whole tree below — ADR-0028) and is owned by
+`internal/store`:
 
 ```
 ~/.fleetbox/
@@ -398,7 +400,9 @@ When a PR changes any of these fields for a package, update its section.
   pure-Go capability probes (`nestedVirtSupported`/`supportsClusteringHost`/`prune`). It owns
   no backend objects directly.
 - Depends on:
-  - neutral (`fleetbox.go`): `internal/opts` (re-exported option types).
+  - neutral (`fleetbox.go`): `internal/opts` (re-exported option types) and
+    `internal/store` (for the `store.EnvHome` const that `SetStorageRoot` sets —
+    stdlib-only, so it does not perturb the sever gate, ADR-0028).
   - supported (`fleetbox_supported.go`, `darwin||linux`): `internal/orchestrator`.
   - darwin probes (`fleetbox_darwin_arm64.go`): `golang.org/x/sys/unix` only.
   - linux probes (`fleetbox_linux.go`): `internal/orchestrator` + a blank import of
@@ -428,6 +432,10 @@ When a PR changes any of these fields for a package, update its section.
     connection (ADR-0026)
   - `type Options{Image, CPUs, MemGB, DiskGB, Fixtures}`, `type Option func(*Options)`,
     `WithImage`, `WithCPUs`, `WithMemoryGB`, `WithDiskGB`, `WithFixture(hostDir, guestPath)`
+  - `SetStorageRoot(path) error` — relocate the **entire** on-disk tree (state and the
+    image/binary caches) off `~/.fleetbox` so an embedding project can brand its own
+    root; sets `FLEETBOX_HOME`, must be called before `Start`/`StartN`/`StartCluster`
+    (ADR-0028)
   - `type Fixture{HostPath, GuestPath}` — a read-only host directory packed into the guest
     at boot as an ext4 payload (ADR-0015)
   - image aliases are plain strings resolved against the embedded catalog (e.g.
@@ -687,15 +695,24 @@ When a PR changes any of these fields for a package, update its section.
   `EnsureDir`, `Exists/Create/Save/Load/Delete/List`, `TryLock`), `ClusterName` (the
   documented `-<digits>` member→cluster rule, exported so the CLI's `down`/`rm` resolution
   reuses it), `VM` config struct (incl. `Fixtures`, `IP`),
-  `Fixture{HostPath, GuestPath, Label}`, `Lock.Unlock`.
+  `Fixture{HostPath, GuestPath, Label}`, `Lock.Unlock`, the `EnvHome`
+  (`"FLEETBOX_HOME"`) const.
 - Invariants:
-  - **One base dir, the invoking user's home (ADR-0023).** `New` resolves the base via the
-    pure `resolveBaseHome`: when root-via-sudo (`euid==0 && SUDO_USER != ""`) it uses
-    `SUDO_USER`'s passwd home (`os/user.Lookup`), NOT `$HOME` — a manual `sudo fleetbox`
-    leaves `HOME=/root` while `SUDO_USER=alice`, so trusting `$HOME` would split state into
-    `/root/.fleetbox`. Every other case (non-root, no `SUDO_USER`, or a failed/empty lookup)
-    falls back to `os.UserHomeDir()` and never errors. This is the single place the rule
-    lives, so CLI, orchestrator, and holder all agree on `~alice/.fleetbox`.
+  - **`FLEETBOX_HOME` overrides the base dir (ADR-0028).** When `EnvHome` is set
+    (non-empty), `New` uses its value verbatim as the base dir and skips the
+    `resolveBaseHome` dance below — an explicit absolute root the non-root client and a
+    sudo-elevated child both read, so they agree without re-derivation. It relocates the
+    *entire* tree (state and the `images/`/`bin/` caches); `fleetbox.SetStorageRoot` sets
+    it and `cmd/fleetbox`'s `elevatedArgv` forwards it through sudo when present. `New`
+    does not normalize the value — `SetStorageRoot` does.
+  - **Default base dir: the invoking user's home (ADR-0023).** With `FLEETBOX_HOME`
+    unset, `New` resolves the base via the pure `resolveBaseHome`: when root-via-sudo
+    (`euid==0 && SUDO_USER != ""`) it uses `SUDO_USER`'s passwd home (`os/user.Lookup`),
+    NOT `$HOME` — a manual `sudo fleetbox` leaves `HOME=/root` while `SUDO_USER=alice`, so
+    trusting `$HOME` would split state into `/root/.fleetbox`. Every other case (non-root,
+    no `SUDO_USER`, or a failed/empty lookup) falls back to `os.UserHomeDir()` and never
+    errors. This is the single place the rule lives, so CLI, orchestrator, and holder all
+    agree on `~alice/.fleetbox`.
   - Every path under `~/.fleetbox/` is produced by a `Store` method — no other package
     builds those paths by hand. `BinDir` (`~/.fleetbox/bin`) and `NetworkStateDir`
     (`~/.fleetbox/networks`, the Linux backend's write-ahead records — ADR-0013) are

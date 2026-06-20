@@ -1,5 +1,6 @@
-// Package store manages VM state directories under
-// ~/.fleetbox/clusters/<cluster>/<member>/.
+// Package store manages VM state directories under the storage root's
+// clusters/<cluster>/<member>/. The root defaults to <home>/.fleetbox and is
+// overridable via FLEETBOX_HOME (ADR-0028).
 package store
 
 import (
@@ -14,6 +15,15 @@ import (
 	"syscall"
 	"time"
 )
+
+// EnvHome names the environment variable that overrides the storage root. When it
+// is set (non-empty), New uses its value verbatim as the base dir, relocating the
+// ENTIRE on-disk tree — state and caches alike — under it (ADR-0028). It is the
+// load-bearing transport for fleetbox.SetStorageRoot: the helper runs in a separate
+// process and inherits it through the env, and the Linux reexec child reads it in
+// init() before any consumer code could call SetStorageRoot. The value must be an
+// absolute path — New does not normalize it; SetStorageRoot does.
+const EnvHome = "FLEETBOX_HOME"
 
 // VM represents a stored VM configuration.
 type VM struct {
@@ -49,12 +59,20 @@ type Store struct {
 	baseDir string
 }
 
-// New creates a Store at the default location (<home>/.fleetbox). When the process
-// is root via sudo it resolves the INVOKING user's home, not /root, so state never
-// splits between /root/.fleetbox and ~/.fleetbox across an auto-elevated `up` and a
-// non-root `ls`/`ssh` (ADR-0023). This is the single place the base-dir rule lives,
-// so every process — CLI, orchestrator, holder — agrees.
+// New creates a Store. When EnvHome (FLEETBOX_HOME) is set it wins outright: the
+// value is used verbatim as the base dir and the SUDO_USER dance below is skipped,
+// because an explicit absolute root is shared by the non-root client and any
+// sudo-elevated child without re-derivation (ADR-0028). Otherwise the store roots at
+// the default location (<home>/.fleetbox); when the process is root via sudo it
+// resolves the INVOKING user's home, not /root, so state never splits between
+// /root/.fleetbox and ~/.fleetbox across an auto-elevated `up` and a non-root
+// `ls`/`ssh` (ADR-0023). This is the single place the base-dir rule lives, so every
+// process — CLI, orchestrator, holder — agrees.
 func New() (*Store, error) {
+	if v := os.Getenv(EnvHome); v != "" {
+		return NewAt(v)
+	}
+
 	home, err := resolveBaseHome(
 		os.Geteuid(),
 		os.Getenv("SUDO_USER"),
@@ -123,19 +141,19 @@ func (s *Store) ImagesDir() string {
 	return filepath.Join(s.baseDir, "images")
 }
 
-// BinDir returns the cache directory for downloaded executables and firmware
-// (~/.fleetbox/bin). The Linux backend caches the checksum-pinned
-// cloud-hypervisor binary and its firmware here; it is created on first download
-// rather than by New, so macOS installs never grow an empty bin directory.
+// BinDir returns the cache directory for downloaded executables and firmware (the
+// storage root's bin/, default <home>/.fleetbox/bin). The Linux backend caches the
+// checksum-pinned cloud-hypervisor binary and its firmware here; it is created on
+// first download rather than by New, so macOS installs never grow an empty bin dir.
 func (s *Store) BinDir() string {
 	return filepath.Join(s.baseDir, "bin")
 }
 
 // NetworkStateDir returns the directory holding the Linux backend's per-network
-// write-ahead records and ip_forward marker (~/.fleetbox/networks). It lets a
-// crashed cluster's bridges/taps/iptables rules be reclaimed on the next up or
-// via prune (ADR-0013); it is created on first network create, so macOS installs
-// never grow it.
+// write-ahead records and ip_forward marker (the storage root's networks/, default
+// <home>/.fleetbox/networks). It lets a crashed cluster's bridges/taps/iptables
+// rules be reclaimed on the next up or via prune (ADR-0013); it is created on first
+// network create, so macOS installs never grow it.
 func (s *Store) NetworkStateDir() string {
 	return filepath.Join(s.baseDir, "networks")
 }
@@ -290,12 +308,12 @@ func (s *Store) PidfilePath(name string) string {
 	return filepath.Join(s.VMDir(name), "pid")
 }
 
-// SocketPath returns the path to a member's holder control socket. It lives in
-// ~/.fleetbox/run/ under a hash of the name, NOT in the member directory: a unix
-// socket path must fit the 104-byte sun_path limit, and the nested member dir
-// (clusters/<cluster>/<member>/) plus a long name and a long home dir blows past
-// it. The hash keeps the path short and bounded regardless of name length
-// (amends ADR-0014, which had placed it in the member dir).
+// SocketPath returns the path to a member's holder control socket. It lives in the
+// storage root's run/ (default ~/.fleetbox/run/) under a hash of the name, NOT in
+// the member directory: a unix socket path must fit the 104-byte sun_path limit, and
+// the nested member dir (clusters/<cluster>/<member>/) plus a long name and a long
+// home dir blows past it. The hash keeps the path short and bounded regardless of
+// name length (amends ADR-0014, which had placed it in the member dir).
 func (s *Store) SocketPath(name string) string {
 	return filepath.Join(s.baseDir, "run", sockHash(name)+".sock")
 }

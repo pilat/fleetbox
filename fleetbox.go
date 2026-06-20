@@ -29,8 +29,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/pilat/fleetbox/internal/opts"
+	"github.com/pilat/fleetbox/internal/store"
 )
 
 // ErrClustersUnsupported is returned when a second cluster member is requested
@@ -78,6 +82,46 @@ func WithDiskGB(n int) Option { return opts.WithDiskGB(n) }
 // owned by root. In a StartN or StartCluster every member receives the same
 // fixtures (ADR-0015).
 func WithFixture(hostDir, guestPath string) Option { return opts.WithFixture(hostDir, guestPath) }
+
+// SetStorageRoot points the entire on-disk state tree at path instead of the
+// default ~/.fleetbox, so a project embedding fleetbox can brand its own root
+// (e.g. ~/.aaa) and not surprise its users with a ~/.fleetbox directory. EVERYTHING
+// moves under path — per-cluster state AND the expensive caches (the multi-GB image
+// cache, the downloaded helper/cloud-hypervisor binaries) — so switching roots
+// re-downloads them; old VMs under a prior root become invisible by design
+// (ADR-0028).
+//
+// It works by setting the FLEETBOX_HOME environment variable, which is the transport
+// the separate helper process inherits, so it must be called BEFORE Start, StartN, or
+// StartCluster — the root is read once at store creation, which happens inside those
+// calls and in the spawned helper. The intended home is an init() or TestMain. A
+// leading ~ or ~/ is expanded via the user's home directory (~user is not supported
+// — it is treated as a literal path segment); the result is made absolute (a relative
+// path resolves against the current directory). It returns an error for an empty path
+// or a failed ~ expansion.
+func SetStorageRoot(path string) error {
+	if path == "" {
+		return errors.New("fleetbox: storage root path is empty")
+	}
+
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("fleetbox: expand ~ in storage root: %w", err)
+		}
+		path = filepath.Join(home, path[1:])
+	}
+
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("fleetbox: resolve storage root %q: %w", path, err)
+	}
+
+	if err := os.Setenv(store.EnvHome, abs); err != nil {
+		return fmt.Errorf("fleetbox: set %s: %w", store.EnvHome, err)
+	}
+	return nil
+}
 
 // vmState is the per-platform implementation behind a VM: orchestrator.VM in
 // process on linux, a client handle that talks to the downloaded helper on

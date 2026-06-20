@@ -86,6 +86,58 @@ func TestCoordHappyPath(t *testing.T) {
 	assertProcessDeadWithin(t, helperPID, 5*time.Second)
 }
 
+// TestCoordHonorsStorageRoot proves the load-bearing claim of ADR-0028:
+// FLEETBOX_HOME crosses the client→helper process boundary and the SEPARATELY
+// spawned helper roots its state there, not at $HOME/.fleetbox. The helper computes
+// its store from store.New() in its own process, so its pidfile/socket landing under
+// the branded root — while a decoy $HOME points elsewhere — is end-to-end proof both
+// that the env transport works and that it wins over the SUDO_USER/$HOME default.
+func TestCoordHonorsStorageRoot(t *testing.T) {
+	requireFakeHelper(t)
+	t.Log(coordBanner)
+
+	// The branded root IS the base dir (no .fleetbox suffix), unlike shortHome. Short
+	// because the helper's run/<hash>.sock must fit the 104-byte sun_path limit.
+	brand, err := os.MkdirTemp("/tmp", "fbbrand")
+	if err != nil {
+		t.Fatalf("mkdir branded root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(brand) })
+	st, err := store.NewAt(brand)
+	if err != nil {
+		t.Fatalf("store.NewAt: %v", err)
+	}
+	raw := filepath.Join(st.ImagesDir(), "fbtiny.raw")
+	if err := os.WriteFile(raw, []byte("fleetbox-fake-tiny-image\n"), 0o644); err != nil {
+		t.Fatalf("seed image %s: %v", raw, err)
+	}
+
+	// Decoy $HOME proves precedence: were the helper to ignore FLEETBOX_HOME it would
+	// root at <decoy>/.fleetbox and the branded-root assertions below would fail.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(store.EnvHome, brand)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	vm, err := fleetbox.Start(ctx, "solo", fleetbox.WithImage(coordImageURL), fleetbox.WithDiskGB(1))
+	if err != nil {
+		t.Fatalf("fleetbox.Start: %v", err)
+	}
+
+	// The helper, in its own process, wrote these under the branded root from the
+	// inherited FLEETBOX_HOME — the cross-process transport proof.
+	assertExists(t, st.PidfilePath("solo"))
+	assertExists(t, st.SocketPath("solo"))
+	helperPID := readPID(t, st.PidfilePath("solo"))
+
+	if err := vm.Destroy(ctx); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	assertPathGoneWithin(t, st.PidfilePath("solo"), 5*time.Second)
+	assertPathGoneWithin(t, st.SocketPath("solo"), 5*time.Second)
+	assertProcessDeadWithin(t, helperPID, 5*time.Second)
+}
+
 // TestCoordReapOnKillNine is the crown jewel: it kills the spawning process with
 // SIGKILL — no cleanup runs — and asserts the bound helper reaps itself and its
 // (fake) VM anyway, via its reparent poll and control-connection EOF. A leaked
