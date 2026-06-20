@@ -37,17 +37,20 @@ type catalogEntry struct {
 
 // catalog maps GOOS/GOARCH to the published helper. Only darwin/arm64 needs a
 // downloaded helper (linux self-reexecs the client binary into the holder —
-// ADR-0020). The version is pinned to the current protocol: the ADR-0020
-// inversion bumped the wire protocol to "2", so the helper is helper-v0.2.0; the
-// older helper-v0.1.0 speaks the previous protocol and is rejected at the bind
-// handshake. The url/sha256 are the published, ad-hoc-signed darwin/arm64 release
-// asset (release-helper.yml), checksum-pinned so an unverified entitlement-bearing
-// binary is never run (ADR-0017, R5).
+// ADR-0020). The pin tracks both the wire protocol and the helper's own behavior:
+// the helper-v0.2.x line speaks protocol "2" (the ADR-0020 inversion; the older
+// helper-v0.1.0 speaks protocol "1" and is rejected at the bind handshake), and
+// within that line helper-v0.2.1 is the first whose store.New honors FLEETBOX_HOME,
+// so a client-set storage root actually reaches the separate helper process
+// (ADR-0028) — the 0.2.0 helper ignored the env and split state across two roots on
+// macOS. The url/sha256 are the published, ad-hoc-signed darwin/arm64 release asset
+// (release-helper.yml), checksum-pinned so an unverified entitlement-bearing binary
+// is never run (ADR-0017, R5).
 var catalog = map[string]catalogEntry{
 	"darwin/arm64": {
-		version: "0.2.0",
-		url:     "https://github.com/pilat/fleetbox/releases/download/helper-v0.2.0/fleetbox-helper-darwin-arm64",
-		sha256:  "984e5f5ea0fefc3a304ba37fe8d115bb3c487e32ccdaba4a7b787b7352d7f7d6",
+		version: "0.2.1",
+		url:     "https://github.com/pilat/fleetbox/releases/download/helper-v0.2.1/fleetbox-helper-darwin-arm64",
+		sha256:  "09b5f5f1e03169a8bc05a41d0e276ee3aff88f1138d4416ea7550c49dcce7cba",
 	},
 }
 

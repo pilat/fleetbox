@@ -93,9 +93,10 @@ stay pure Go — no cgo; cgo lives only in the darwin helper.
   NO codesign — that's the ADR-0017 sever, kept and generalized by ADR-0020. Only
   `cmd/fleetbox-helper` carries the `com.apple.security.virtualization` entitlement (ad-hoc
   codesign). For dev/VM tests, `make helper` builds+signs it and `make test-vm` points the
-  library at it via `FLEETBOX_HELPER`. The published helper (release `helper-v0.2.0` — bumped
-  for the protocol-v2 inversion; the old `helper-v0.1.0` is rejected at the version handshake)
-  auto-downloads on first use, no override needed. The signed helper is now a thin
+  library at it via `FLEETBOX_HELPER`. The published helper (release `helper-v0.2.1` — the
+  `0.2.x` line carries the protocol-v2 inversion, `0.2.1` adds `FLEETBOX_HOME` support per
+  ADR-0028; the old `helper-v0.1.0` is rejected at the version handshake) auto-downloads on
+  first use, no override needed. The signed helper is now a thin
   backend-server: the client resolves images and builds disks/seeds/fixtures, so the catalog
   is NOT in the signed binary.
 - The module compiles on `darwin/arm64`, `linux/amd64`, and `linux/arm64`. Other targets
