@@ -342,8 +342,9 @@ The support matrix and how it is realized in build tags:
   test binary and the CLI link no vz and need neither cgo nor codesign. `make build`
   compiles the pure-Go CLI (no signing, any platform); `make helper` builds + ad-hoc-signs
   the helper; `make test-vm` builds+signs the helper and points the library at it via
-  `FLEETBOX_HELPER`. The published helper is `helper-v0.2.0` (the ADR-0020 protocol bump;
-  the old `helper-v0.1.0` speaks the v1 protocol and is rejected at the handshake),
+  `FLEETBOX_HELPER`. The published helper is `helper-v0.2.1` (the `helper-v0.2.x` line is
+  the ADR-0020 protocol-2 bump; `0.2.1` adds `FLEETBOX_HOME` support, ADR-0028; the old
+  `helper-v0.1.0` speaks the v1 protocol and is rejected at the handshake),
   auto-downloaded and checksum-pinned via the `internal/helperdist` catalog;
   `FLEETBOX_HELPER` overrides it for dev/offline.
 - **Linux host prerequisites** (not provisionable; probed with clear errors): `/dev/kvm`
@@ -1042,7 +1043,7 @@ When a PR changes any of these fields for a package, update its section.
 - Public API: none (package main).
 - Invariants:
   - Ad-hoc-signed with `entitlements.plist` (`make helper`), downloaded + cached by the
-    client (`helper-v0.2.0`), launched with `--fleetbox-runner` (or `--fleetbox-reconcile`)
+    client (`helper-v0.2.1`), launched with `--fleetbox-runner` (or `--fleetbox-reconcile`)
     + `FLEETBOX_PARENT_PID` in bound mode. The user's test/CLI binary never links it (ADR-0017).
 
 ### §5.20 `internal/backend/fake`
