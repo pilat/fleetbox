@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -39,7 +39,7 @@ jobs:
         run: go run ./contrib/catalog
 
       - name: Open PR if the catalog moved
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           # A PAT or GitHub App token, NOT the default GITHUB_TOKEN: a PR opened
           # with GITHUB_TOKEN does not trigger pull_request workflows, so CI —
