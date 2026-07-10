@@ -43,14 +43,15 @@ type catalogEntry struct {
 // within that line helper-v0.2.1 is the first whose store.New honors FLEETBOX_HOME,
 // so a client-set storage root actually reaches the separate helper process
 // (ADR-0028) — the 0.2.0 helper ignored the env and split state across two roots on
-// macOS. The url/sha256 are the published, ad-hoc-signed darwin/arm64 release asset
+// macOS; helper-v0.2.2 makes a guest hang recoverable (force-stop escalation + vmnet
+// subnet rotation, ADR-0031). The url/sha256 are the published, ad-hoc-signed darwin/arm64 release asset
 // (release-helper.yml), checksum-pinned so an unverified entitlement-bearing binary
 // is never run (ADR-0017, R5).
 var catalog = map[string]catalogEntry{
 	"darwin/arm64": {
-		version: "0.2.1",
-		url:     "https://github.com/pilat/fleetbox/releases/download/helper-v0.2.1/fleetbox-helper-darwin-arm64",
-		sha256:  "09b5f5f1e03169a8bc05a41d0e276ee3aff88f1138d4416ea7550c49dcce7cba",
+		version: "0.2.2",
+		url:     "https://github.com/pilat/fleetbox/releases/download/helper-v0.2.2/fleetbox-helper-darwin-arm64",
+		sha256:  "7dbfed23deb5d0db2e77eb3db46c31571fb4cfc038ec35bdef2d0a7000cf699e",
 	},
 }
 
