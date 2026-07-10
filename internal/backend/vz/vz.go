@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"os"
@@ -22,6 +23,16 @@ import (
 	"github.com/pilat/fleetbox/internal/dhcp"
 	"github.com/pilat/fleetbox/third_party/vz"
 	"github.com/pilat/fleetbox/third_party/vz/vmnet"
+)
+
+// Stop grace windows; vars, not consts, so unit tests can shrink them. Kept under
+// the client's 30s stop deadline so the ACPI→force escalation still lands within it.
+var (
+	// acpiStopGrace bounds the guest's chance to power off via ACPI before Stop
+	// escalates to a forceful VZ stop.
+	acpiStopGrace = 15 * time.Second
+	// forceStopGrace bounds the wait for the state to reflect a forceful stop.
+	forceStopGrace = 10 * time.Second
 )
 
 // reservedSubnets records every /24 handed out by detectFreeIPv4Subnet in this
@@ -130,11 +141,10 @@ type vzNetwork struct {
 	network *vmnet.Network
 }
 
-// Close is a no-op. The vmnet network is released by the Go runtime
-// (runtime.AddCleanup inside the vmnet package) once every VM holding a
-// reference to it is unreferenced. Phase 1 never calls Close — releasing a
-// network that a cluster's other VMs still share would break them (ADR-0008,
-// R3). It exists for explicit whole-cluster teardown / Phase 2.
+// Close is a no-op. On a clean holder exit the OS reaps the vmnet network's
+// reservation, and a fresh up dodges a subnet leaked by an abnormal exit via the
+// randomized detectFreeIPv4Subnet, so no explicit framework-level release is
+// needed. On the <26 NAT path network is nil regardless.
 func (n *vzNetwork) Close() error {
 	return nil
 }
@@ -158,6 +168,13 @@ func (n *vzNetwork) Reserve(name, _ string) (ip, mac string, err error) {
 // host interface and has not already been handed out in this process. The
 // chosen subnet is reserved (see reservedSubnets) so a later call picks a
 // different one even before this network's host bridge interface appears.
+//
+// The scan starts at a random octet, not 0. A SIGKILLed holder leaks its vmnet
+// subnet reservation at the framework level (no finalizer runs; there is no
+// reclaim API — only sleep/wake or reboot). Its host bridge is already gone, so a
+// deterministic-from-0 scan would re-pick the exact same wedged /24 on every
+// retry and fail with VMNET_FAILURE forever. A random start dodges it, turning an
+// unrecoverable wedge into a soft leak that drains at reboot.
 func detectFreeIPv4Subnet() (netip.Prefix, error) {
 	occupied, err := occupiedPrivatePrefixes()
 	if err != nil {
@@ -167,7 +184,9 @@ func detectFreeIPv4Subnet() (netip.Prefix, error) {
 	reservedSubnetsMu.Lock()
 	defer reservedSubnetsMu.Unlock()
 
-	for octet := range 256 {
+	start := rand.IntN(256)
+	for i := range 256 {
+		octet := (start + i) % 256
 		candidate := netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 168, byte(octet), 0}), 24)
 		if _, taken := reservedSubnets[candidate]; taken {
 			continue
@@ -414,10 +433,22 @@ func validateConfig(cfg backend.Config) error {
 	return nil
 }
 
+// vmController is the slice of *vz.VirtualMachine that VM drives. Extracted so the
+// Stop escalation state machine is unit-testable without booting a real VM.
+type vmController interface {
+	Start(...vz.VirtualMachineStartOption) error
+	State() vz.VirtualMachineState
+	CanRequestStop() bool
+	RequestStop() (bool, error)
+	Stop() error
+}
+
+var _ vmController = (*vz.VirtualMachine)(nil)
+
 // VM represents a VZ virtual machine.
 type VM struct {
 	name string
-	vm   *vz.VirtualMachine
+	vm   vmController
 	// network is retained for the VM's whole lifetime so the shared vmnet
 	// network is not released by GC while the VM (or a cluster sibling) runs
 	// (ADR-0008, R3).
@@ -510,47 +541,67 @@ func (v *VM) Start(ctx context.Context) error {
 	return errors.New("timeout waiting for vm to start")
 }
 
-// Stop gracefully shuts down the VM via ACPI.
-// Returns nil if the VM is already stopped.
+// Stop shuts the VM down. It first asks the guest to power off via ACPI, and if
+// the guest has not stopped within acpiStopGrace it escalates to VZ's forceful
+// stop — a hung guest must not keep disk.raw open past Stop, which is what
+// invalidates the next boot's storage attachment. Returns nil if already stopped.
 func (v *VM) Stop(ctx context.Context) error {
 	// Release the serial log file/pipe on any exit path — the VM is being torn
 	// down whether or not it was already stopped (idempotent via closeSerial).
 	defer v.closeSerial()
 
-	// Already stopped? Not an error.
 	if v.vm.State() == vz.VirtualMachineStateStopped {
 		return nil
 	}
 
-	if !v.vm.CanRequestStop() {
-		return fmt.Errorf("vm cannot be stopped (state: %v)", v.vm.State())
+	// Best-effort ACPI: a healthy guest powers off in seconds; a hung one ignores
+	// it and the escalation below handles it. A failed request is not fatal — fall
+	// through to the forceful stop.
+	if v.vm.CanRequestStop() {
+		if stopped, err := v.vm.RequestStop(); err == nil && stopped {
+			done, werr := v.waitStopped(ctx, acpiStopGrace)
+			if werr != nil {
+				return werr
+			}
+			if done {
+				return nil
+			}
+		}
 	}
 
-	stopped, err := v.vm.RequestStop()
-	if err != nil {
-		return fmt.Errorf("request stop: %w", err)
+	// Escalate: forcefully stop the VM so it releases the disk. Destructive by
+	// design — the guest gets no clean shutdown, but the disk is crash-consistent
+	// and fleetbox treats VMs as cattle.
+	if err := v.vm.Stop(); err != nil {
+		return fmt.Errorf("force stop: %w", err)
 	}
-	if !stopped {
-		return errors.New("stop request failed")
+	done, werr := v.waitStopped(ctx, forceStopGrace)
+	if werr != nil {
+		return werr
 	}
+	if !done {
+		return errors.New("vm still running after force stop")
+	}
+	return nil
+}
 
-	// Wait for stopped state
-	deadline := time.Now().Add(30 * time.Second)
+// waitStopped polls until the VM reaches the stopped state, ctx is cancelled, or
+// timeout elapses. It returns (true, nil) once stopped, (false, nil) on timeout,
+// and (false, ctx.Err()) if ctx is cancelled first.
+func (v *VM) waitStopped(ctx context.Context, timeout time.Duration) (bool, error) {
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return false, ctx.Err()
 		default:
 		}
-
-		state := v.vm.State()
-		if state == vz.VirtualMachineStateStopped {
-			return nil
+		if v.vm.State() == vz.VirtualMachineStateStopped {
+			return true, nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-
-	return errors.New("timeout waiting for vm to stop")
+	return false, nil
 }
 
 // State returns the current VM state.
