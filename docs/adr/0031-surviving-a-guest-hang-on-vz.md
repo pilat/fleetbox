@@ -41,8 +41,11 @@ Two changes in `internal/backend/vz`, no vendored-fork edits:
   the holder died abnormally.
 - **Random subnet start (cheap insurance).** `detectFreeIPv4Subnet` starts its circular
   scan at a random octet, so if the holder *does* die abnormally (panic in a boot
-  goroutine, OOM, a cgo crash — rare), a fresh `up` dodges the leaked `/24` instead of
-  re-picking it. Turns a would-be wedge into a soft leak that drains at reboot.
+  goroutine, OOM, a cgo crash — rare), a fresh `up` most likely picks a different `/24`
+  than the leaked one. This is best-effort, not a guarantee: if the random scan happens to
+  start on the leaked subnet it is re-picked and that `up` still fails with
+  `VMNET_FAILURE` — a retry (or, worst case, a reboot) clears it. It trades a deterministic
+  wedge for a low-probability, self-clearing one.
 
 ## Alternatives Considered
 
@@ -63,8 +66,9 @@ Two changes in `internal/backend/vz`, no vendored-fork edits:
 ## Consequences
 
 - A guest hang is recoverable by fleetbox alone: `down`/`rm` force-stop and release the
-  disk; a subnet leaked by a rare abnormal exit is dodged on the next `up`. No `kill -9`,
-  no host reboot.
+  disk; a subnet leaked by a rare abnormal exit is *most likely* dodged on the next `up`
+  (see the best-effort caveat above). No `kill -9`, and a reboot is needed only in the
+  low-probability case where the scan re-picks the leaked subnet.
 - Subnet selection is now non-deterministic. Correctness is unchanged (overlap + dedup
   checks still hold); only the chosen `/24` varies.
 - rotation is a bridge, not a cure: the `/24` pool is finite, so a host that accumulates

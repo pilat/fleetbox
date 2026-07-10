@@ -555,15 +555,11 @@ func (v *VM) Stop(ctx context.Context) error {
 	}
 
 	// Best-effort ACPI: a healthy guest powers off in seconds; a hung one ignores
-	// it and the escalation below handles it. A failed request is not fatal — fall
-	// through to the forceful stop.
+	// it and the escalation below handles it. A cancelled ctx just cuts the grace
+	// short and drops us to the forceful stop — it must never skip escalation.
 	if v.vm.CanRequestStop() {
 		if stopped, err := v.vm.RequestStop(); err == nil && stopped {
-			done, werr := v.waitStopped(ctx, acpiStopGrace)
-			if werr != nil {
-				return werr
-			}
-			if done {
+			if v.waitStopped(ctx, acpiStopGrace) {
 				return nil
 			}
 		}
@@ -571,37 +567,38 @@ func (v *VM) Stop(ctx context.Context) error {
 
 	// Escalate: forcefully stop the VM so it releases the disk. Destructive by
 	// design — the guest gets no clean shutdown, but the disk is crash-consistent
-	// and fleetbox treats VMs as cattle.
+	// and fleetbox treats VMs as cattle. The wait runs on a context independent of
+	// the caller's: a short or cancelled deadline must not prevent releasing
+	// disk.raw, which is the whole reason to force-stop.
 	if err := v.vm.Stop(); err != nil {
 		return fmt.Errorf("force stop: %w", err)
 	}
-	done, werr := v.waitStopped(ctx, forceStopGrace)
-	if werr != nil {
-		return werr
-	}
-	if !done {
+	forceCtx, cancel := context.WithTimeout(context.Background(), forceStopGrace)
+	defer cancel()
+	//nolint:contextcheck // deliberate: force-stop must outlive a cancelled caller ctx
+	if !v.waitStopped(forceCtx, forceStopGrace) {
 		return errors.New("vm still running after force stop")
 	}
 	return nil
 }
 
-// waitStopped polls until the VM reaches the stopped state, ctx is cancelled, or
-// timeout elapses. It returns (true, nil) once stopped, (false, nil) on timeout,
-// and (false, ctx.Err()) if ctx is cancelled first.
-func (v *VM) waitStopped(ctx context.Context, timeout time.Duration) (bool, error) {
+// waitStopped polls until the VM is stopped (returns true) or until ctx is done or
+// timeout elapses (returns false). A false from a cancelled ctx is deliberate: the
+// ACPI caller uses it to fall through to a forceful stop, never to abort teardown.
+func (v *VM) waitStopped(ctx context.Context, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
-			return false, ctx.Err()
+			return false
 		default:
 		}
 		if v.vm.State() == vz.VirtualMachineStateStopped {
-			return true, nil
+			return true
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return false, nil
+	return false
 }
 
 // State returns the current VM state.

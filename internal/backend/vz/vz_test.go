@@ -171,6 +171,25 @@ func TestVMStopEscalation(t *testing.T) {
 	}
 }
 
+// TestVMStopForcesDespiteCancelledContext guards the escalation against a cancelled
+// caller context: a short/cancelled deadline must not skip the forceful stop and
+// leave disk.raw held (REPRO Bug 2, via the context back door).
+func TestVMStopForcesDespiteCancelledContext(t *testing.T) {
+	defer swapGrace(10*time.Millisecond, 10*time.Millisecond)()
+
+	f := &fakeVM{state: vz.VirtualMachineStateRunning, canRequestStop: true, stopOnForce: true}
+	v := &VM{vm: f}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := v.Stop(ctx); err != nil {
+		t.Fatalf("Stop(cancelled ctx) = %v, want nil", err)
+	}
+	if f.forceStops != 1 {
+		t.Errorf("force Stop calls = %d, want 1 — escalation must survive a cancelled ctx", f.forceStops)
+	}
+}
+
 // swapGrace shrinks the Stop grace windows for a test and returns a restore func.
 func swapGrace(acpi, force time.Duration) func() {
 	origACPI, origForce := acpiStopGrace, forceStopGrace
