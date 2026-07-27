@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/Code-Hex/go-infinity-channel v1.0.0
-	github.com/diskfs/go-diskfs v1.9.3
+	github.com/diskfs/go-diskfs v1.9.4
 	github.com/google/nftables v0.3.0
 	github.com/lima-vm/go-qcow2reader v0.7.1
 	github.com/pilat/cloudiso v0.1.0
