@@ -7,7 +7,7 @@ require (
 	github.com/diskfs/go-diskfs v1.9.4
 	github.com/google/nftables v0.3.0
 	github.com/lima-vm/go-qcow2reader v0.7.1
-	github.com/pilat/cloudiso v0.1.0
+	github.com/pilat/cloudiso v0.1.1
 	github.com/pilat/go-ext4fs v1.0.2
 	github.com/spf13/cobra v1.10.2
 	github.com/vishvananda/netlink v1.3.1

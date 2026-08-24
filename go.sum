@@ -31,8 +31,8 @@ github.com/mdlayher/socket v0.5.0 h1:ilICZmJcQz70vrWVes1MFera4jGiWNocSkykwwoy3XI
 github.com/mdlayher/socket v0.5.0/go.mod h1:WkcBFfvyG8QENs5+hfQPl1X6Jpd2yeLIYgrGFmJiJxI=
 github.com/pierrec/lz4/v4 v4.1.26 h1:GrpZw1gZttORinvzBdXPUXATeqlJjqUG/D87TKMnhjY=
 github.com/pierrec/lz4/v4 v4.1.26/go.mod h1:EoQMVJgeeEOMsCqCzqFm2O0cJvljX2nGZjcRIPL34O4=
-github.com/pilat/cloudiso v0.1.0 h1:9wfMxFTMo6n9ix7TebFfxKw/cz2odgdmUktXR/tWSs4=
-github.com/pilat/cloudiso v0.1.0/go.mod h1:fEo9KATtTdWFgGfgCL7WfHcUL1joxfcm+OWBJm83kaw=
+github.com/pilat/cloudiso v0.1.1 h1:EXPoGNw/UmcOW8cbWRhzjoxKGFGM3+Wl6+OX2PXWJUo=
+github.com/pilat/cloudiso v0.1.1/go.mod h1:0OEfA9I3EZ+1+Xuy0THw20CvtWKhVKLzDFdQ4XPP1r0=
 github.com/pilat/go-ext4fs v1.0.2 h1:vWyfSvYscyHWOJmbKkE1+RGekqiD58crkObKgTXE8vs=
 github.com/pilat/go-ext4fs v1.0.2/go.mod h1:2Px44qpf7v6XN9VusRucgiXz5ckUoysL+vi90146MAI=
 github.com/pkg/xattr v0.4.12 h1:rRTkSyFNTRElv6pkA3zpjHpQ90p/OdHQC1GmGh1aTjM=
