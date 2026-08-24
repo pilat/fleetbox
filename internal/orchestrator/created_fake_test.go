@@ -33,7 +33,8 @@ func (stubNetwork) Reserve(_, _ string) (ip, mac string, err error) {
 // to reach the point where it stamps createdThisCall and returns the VM.
 type stubBackend struct{ vm backend.VM }
 
-func (b stubBackend) CreateNetwork() (backend.Network, error)                    { return stubNetwork{}, nil }
+func (b stubBackend) CreateNetwork() (backend.Network, error) { return stubNetwork{}, nil }
+
 func (b stubBackend) Create(backend.Config, backend.Network) (backend.VM, error) { return b.vm, nil }
 func (stubBackend) NestedVirtSupported() bool                                    { return false }
 func (stubBackend) SupportsClustering() bool                                     { return true }
