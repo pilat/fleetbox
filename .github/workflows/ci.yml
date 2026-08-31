@@ -25,12 +25,12 @@ jobs:
       - name: Lint (darwin)
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13.1
+          version: v2.13.2
 
       - name: Lint (linux)
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13.1
+          version: v2.13.2
         env:
           GOOS: linux
 
@@ -40,7 +40,7 @@ jobs:
       - name: Lint (fake backend)
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13.1
+          version: v2.13.2
           args: --build-tags fleetbox_fake
 
       - name: Build (darwin, incl. signed VM helper)
